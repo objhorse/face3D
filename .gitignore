@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# 本地密钥与工具缓存
+.env
+.env.*
+.claude/
+
+# 大权重与第三方克隆（需按 README 自行下载/拉取）
+models/
+external/
+# FLAME 官方数据，勿提交到公开仓库（许可与体积）
+FLAME2020/
+
+# 运行产物与中间结果
+output/
+*.db
+
+# 常见大媒体（按需注释掉以纳入版本库）
+*.mp4
+
+# 可选：不提交原始拍摄图（含隐私/体积）。若需一并上传，删除下一行。
+# image20260207_rotated/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

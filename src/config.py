@@ -1,0 +1,87 @@
+"""
+全局配置。所有路径、超参数集中管理。
+修改内参时只需改 MANUAL_INTRINSICS 字段。
+"""
+import os
+from pathlib import Path
+
+# ── 根目录 ──────────────────────────────────────────────────────────────
+ROOT = Path(__file__).parent.parent  # D:/face3D
+
+# ── 模型权重路径 ────────────────────────────────────────────────────────
+MODELS_DIR          = ROOT / "models"
+FLAME_MODEL_PATH    = MODELS_DIR / "FLAME" / "generic_model.pkl"
+FLAME_LANDMARK_PATH = MODELS_DIR / "FLAME" / "landmark_embedding.npy"  # FLAME→68点映射
+DECA_MODEL_PATH     = MODELS_DIR / "DECA" / "deca_model.tar"
+DEPTH_MODEL_DIR     = MODELS_DIR / "depth_anything"
+
+# ── 外部仓库路径 ────────────────────────────────────────────────────────
+EXTERNAL_DIR  = ROOT / "external"
+DECA_REPO_DIR = EXTERNAL_DIR / "DECA"
+DUST3R_DIR    = EXTERNAL_DIR / "dust3r"
+
+# ── 输出目录 ────────────────────────────────────────────────────────────
+OUTPUT_DIR          = ROOT / "output"
+OUTPUT_MESH_DIR     = OUTPUT_DIR / "meshes"
+OUTPUT_TEXTURE_DIR  = OUTPUT_DIR / "textures"
+OUTPUT_DEBUG_DIR    = OUTPUT_DIR / "debug"
+TEST_DATA_DIR       = OUTPUT_DIR / "test_data"   # generate_test_data.py 输出
+
+# ── 输入图像命名约定 ─────────────────────────────────────────────────────
+# key: 视角名, value: 文件名（相对于图像目录）
+DEFAULT_VIEW_NAMES = {
+    "left":   "IMG_0004.jpg",
+    "front":  "IMG_0005.jpg",
+    "right":  "IMG_0006.jpg",
+}
+DEFAULT_IMAGE_DIR = ROOT / "image20260207_rotated"
+
+# ── 相机内参（手动覆盖接口） ──────────────────────────────────────────────
+# 若为 None，则由 Dust3R 预测；若设置则跳过 Dust3R 直接使用
+# 格式: {"fx": float, "fy": float, "cx": float, "cy": float}
+# 或直接传 3×3 numpy array
+MANUAL_INTRINSICS = {"fx": 1200.0, "fy": 1200.0, "cx": 256.0, "cy": 256.0}  # 合成测试数据内参
+# 示例（后续拿到真实内参后在此填写）:
+# MANUAL_INTRINSICS = {
+#     "fx": 2800.0,
+#     "fy": 2800.0,
+#     "cx": 2304.0,
+#     "cy": 1728.0,
+# }
+
+# ── 3DMM 超参数 ────────────────────────────────────────────────────────
+N_SHAPE_PARAMS  = 300   # FLAME 形状参数维度（最大300）
+N_EXP_PARAMS    = 100   # FLAME 表情参数维度（最大100）
+LAMBDA_SHAPE    = 5e-4  # 形状正则化权重（降低=更贴合真实脸型）
+LAMBDA_EXP      = 5e-4  # 表情正则化权重
+LBFGS_MAX_ITER  = 100   # L-BFGS 最大迭代次数（提升拟合精度）
+LBFGS_LR        = 0.05  # 小学习率防止 NaN
+
+# ── 深度估计超参数 ──────────────────────────────────────────────────────
+DEPTH_MODEL_SIZE = "large"       # "small"/"base"/"large"
+DISPLACEMENT_SCALE = 0.002       # 顶点置换最大幅度（米）；降低以减少 Depth-Anything 噪声放大
+
+# ── 硬件 ────────────────────────────────────────────────────────────────
+DEVICE = "cuda"   # "cuda" or "cpu"
+
+# ── 光照图层配置（多光照预留接口） ──────────────────────────────────────
+LIGHTING_TYPES = {
+    "white": {
+        "display_name": "白光",
+        "image_dir": str(DEFAULT_IMAGE_DIR),
+        "views": DEFAULT_VIEW_NAMES,
+    },
+    # 预留接口示例（后续扩展）:
+    # "uv": {
+    #     "display_name": "UV光",
+    #     "image_dir": str(ROOT / "image_uv"),
+    #     "views": {...},
+    # },
+}
+DEFAULT_LIGHTING = "white"
+
+# ── 工具函数 ────────────────────────────────────────────────────────────
+def ensure_dirs():
+    """确保所有输出目录存在"""
+    for d in [OUTPUT_MESH_DIR, OUTPUT_TEXTURE_DIR, OUTPUT_DEBUG_DIR]:
+        d.mkdir(parents=True, exist_ok=True)

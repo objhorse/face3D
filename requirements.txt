@@ -1,0 +1,28 @@
+# Core (已在 gaussian 环境中)
+# torch>=2.4.1+cu118
+# torchvision>=0.19.1
+# numpy>=1.24
+# scipy>=1.10
+# open3d>=0.19
+# trimesh>=4.0
+# Pillow>=10.0
+# tqdm>=4.0
+
+# 需要安装
+mediapipe>=0.10.14
+face-alignment>=1.4.1
+einops>=0.7.0
+PyYAML>=6.0
+
+# DECA 依赖（使用外部仓库时需要）
+# chumpy  # 若 DECA 需要，单独安装
+# smplx
+
+# 外部仓库（手动克隆到 external/）
+# DECA:    https://github.com/YadiraF/DECA
+# Dust3R:  https://github.com/naver/dust3r  (可选，用于内参预测)
+
+# 模型文件（手动下载到 models/）
+# FLAME 2020: https://flame.is.tue.mpg.de/  → models/FLAME/generic_model.pkl
+# DECA weights: https://github.com/YadiraF/DECA → models/DECA/deca_model.tar
+# Depth-Anything-V2-Large: HuggingFace → models/depth_anything/

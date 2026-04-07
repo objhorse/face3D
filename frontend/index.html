@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>face3D — 3D 人脸重建</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+<!-- ── 顶栏 ────────────────────────────────────────────────────────────── -->
+<header id="topbar">
+  <h1>face3D</h1>
+  <div class="sep"></div>
+  <button class="btn" id="btn-upload">＋ 新建重建</button>
+  <button class="btn" id="btn-compare">⊞ 对比模式</button>
+  <span id="compare-info" style="font-size:12px;color:#888;margin-left:4px"></span>
+  <div style="flex:1"></div>
+  <button class="btn" id="btn-refresh" title="刷新列表">↻ 刷新</button>
+</header>
+
+<!-- ── 主体 ────────────────────────────────────────────────────────────── -->
+<div id="main">
+
+  <!-- 侧边栏：会话列表 -->
+  <aside id="sidebar">
+    <div id="sidebar-header">历史会话</div>
+    <div id="session-list"></div>
+  </aside>
+
+  <!-- 查看区 -->
+  <div id="viewer-area">
+
+    <!-- 空白占位 -->
+    <div id="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/>
+        <path d="M12 8v4l3 3"/>
+      </svg>
+      <p>从左侧选择会话，或点击「新建重建」</p>
+    </div>
+
+    <!-- 单视图 -->
+    <canvas id="canvas-single" style="display:none"></canvas>
+
+    <!-- 分屏对比 -->
+    <div id="split-container">
+      <div class="split-panel">
+        <div class="split-label" id="label-a">术前</div>
+        <canvas id="canvas-a"></canvas>
+      </div>
+      <div class="split-panel">
+        <div class="split-label" id="label-b">术后</div>
+        <canvas id="canvas-b"></canvas>
+      </div>
+    </div>
+
+    <!-- 重建进度遮罩 -->
+    <div id="progress-overlay">
+      <div class="progress-title">3D 重建中...</div>
+      <div class="progress-bar-wrap">
+        <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
+      </div>
+      <div class="progress-msg" id="progress-msg">初始化...</div>
+    </div>
+
+  </div><!-- /viewer-area -->
+</div><!-- /main -->
+
+<!-- ── 上传模态框 ────────────────────────────────────────────────────────── -->
+<div id="upload-modal">
+  <div class="modal-box">
+    <h2>新建 3D 重建</h2>
+    <form id="upload-form">
+      <div class="form-row">
+        <label>患者 ID *</label>
+        <input type="text" name="patient_id" placeholder="例：P20260207" required />
+      </div>
+      <div class="form-row">
+        <label>备注（术前 / 术后 / 日期等）</label>
+        <input type="text" name="notes" placeholder="可选" />
+      </div>
+      <div class="form-row">
+        <label>左侧 45° 照片 *</label>
+        <input type="file" name="left_image" accept="image/*" required />
+      </div>
+      <div class="form-row">
+        <label>正面照片 *</label>
+        <input type="file" name="front_image" accept="image/*" required />
+      </div>
+      <div class="form-row">
+        <label>右侧 45° 照片 *</label>
+        <input type="file" name="right_image" accept="image/*" required />
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="btn-cancel-upload">取消</button>
+        <button type="submit" class="btn active">开始重建</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ── Toast ────────────────────────────────────────────────────────────── -->
+<div id="toast"></div>
+
+<!-- ── API base 配置（可根据部署修改） ─────────────────────────────────── -->
+<script>
+  window.API_BASE = '';  // 使用相对路径，避免代理拦截
+</script>
+
+<!-- ── 主应用（ES module） ──────────────────────────────────────────────── -->
+<script type="module" src="js/app.js"></script>
+
+</body>
+</html>
