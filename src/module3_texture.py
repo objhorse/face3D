@@ -371,6 +371,87 @@ def weight_acc_img(texture, vy, vx, has_color, H, W):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 单视角纹理烘焙（使用预融合统一纹理）
+# ══════════════════════════════════════════════════════════════════════════════
+
+def bake_texture_single(
+    vertices: np.ndarray,       # (N, 3)
+    faces: np.ndarray,          # (F, 3)
+    uv_verts: np.ndarray,       # (T, 2)
+    uv_faces: np.ndarray,       # (F, 3)
+    tri_map: np.ndarray,        # (H, W) int32
+    bary_map: np.ndarray,       # (H, W, 3)
+    camera: dict,               # {"K": ..., "R": ..., "t": ...}
+    unified_img: np.ndarray,    # (Hi, Wi, 3) uint8 RGB 预融合统一纹理
+    tex_size: int = 2048,
+) -> np.ndarray:
+    """
+    从单张预融合统一纹理图烘焙到 UV 纹理图。
+    每个 UV 纹素通过重心插值得到 3D 点，再用正面相机投影到统一纹理图采色。
+
+    Returns: (tex_size, tex_size, 3) uint8 RGB 纹理图
+    """
+    H = W = tex_size
+    H_img, W_img = unified_img.shape[:2]
+
+    valid_mask = tri_map >= 0
+    valid_y, valid_x = np.where(valid_mask)
+
+    if len(valid_y) == 0:
+        logger.warning("UV 光栅化结果为空，无有效纹理像素")
+        return np.zeros((H, W, 3), dtype=np.uint8)
+
+    valid_tri  = tri_map[valid_y, valid_x]    # (M,)
+    valid_bary = bary_map[valid_y, valid_x]   # (M, 3)
+
+    # 重心插值 → 3D 坐标
+    g_faces = faces[valid_tri]
+    v0 = vertices[g_faces[:, 0]]
+    v1 = vertices[g_faces[:, 1]]
+    v2 = vertices[g_faces[:, 2]]
+    pts_3d = (valid_bary[:, 0:1] * v0 +
+              valid_bary[:, 1:2] * v1 +
+              valid_bary[:, 2:3] * v2)  # (M, 3)
+
+    K, R, t = camera["K"], camera["R"], camera["t"]
+
+    # Y 轴翻转（与 bake_texture 保持一致）
+    pts_proj = pts_3d.copy()
+    pts_proj[:, 1] *= -1
+
+    v_cam = (R @ pts_proj.T + t[:, None]).T  # (M, 3)
+    z     = v_cam[:, 2]
+    front = z > 1e-4
+
+    proj = np.zeros((len(valid_y), 2), dtype=np.float32)
+    proj[front, 0] = K[0, 0] * v_cam[front, 0] / z[front] + K[0, 2]
+    proj[front, 1] = K[1, 1] * v_cam[front, 1] / z[front] + K[1, 2]
+
+    in_img = (front &
+              (proj[:, 0] >= 0) & (proj[:, 0] < W_img - 1) &
+              (proj[:, 1] >= 0) & (proj[:, 1] < H_img - 1))
+
+    texture = np.zeros((H, W, 3), dtype=np.uint8)
+
+    if in_img.sum() > 0:
+        colors = _bilinear_sample(unified_img, proj[in_img, 0], proj[in_img, 1])
+        texture[valid_y[in_img], valid_x[in_img]] = colors.clip(0, 255).astype(np.uint8)
+        logger.info(f"  单视角烘焙: {in_img.sum()} / {len(valid_y)} 个有效 UV 像素已着色")
+
+    # Inpainting：填充未能投影到的有效 UV 区域（遮挡、UV 边界等）
+    has_color = np.zeros((H, W), dtype=bool)
+    has_color[valid_y[in_img], valid_x[in_img]] = True
+    inpaint_needed = valid_mask & ~has_color
+    if inpaint_needed.any():
+        n_holes = int(inpaint_needed.sum())
+        logger.info(f"  Inpainting 填充 {n_holes} 个空洞像素...")
+        texture = cv2.inpaint(texture, inpaint_needed.astype(np.uint8) * 255,
+                              inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+
+    return texture
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 泊松接缝修复
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -538,6 +619,7 @@ def run_texture_pipeline(
     lighting_type: str = "white",
     lighting_display_name: str = "白光",
     face_masks: Optional[Dict[str, np.ndarray]] = None,
+    unified_texture: Optional[np.ndarray] = None,  # 预融合统一纹理（优先使用）
 ) -> Path:
     """
     完整纹理融合流程。
@@ -560,30 +642,39 @@ def run_texture_pipeline(
     cameras = load_cameras(mesh_dir / "cameras.json")
     logger.info(f"  Mesh: {len(vertices)} 顶点, {len(faces)} 面片, {len(uv_verts)} UV点")
 
-    # 检查相机与图像视角是否一致
-    for view_name in cameras:
-        if view_name not in images:
-            logger.warning(f"  相机 [{view_name}] 无对应图像，跳过")
-    view_images = {k: images[k] for k in cameras if k in images}
-
     # ── UV 光栅化 ─────────────────────────────────────────────────────────
     logger.info("UV 光栅化...")
     tri_map, bary_map = rasterize_uv_map(uv_verts, uv_faces, tex_size)
     valid_mask = tri_map >= 0
 
-    # ── 多视角颜色烘焙 ────────────────────────────────────────────────────
-    logger.info("多视角颜色采样（烘焙）...")
-    texture = bake_texture(
-        vertices, faces, uv_verts, uv_faces,
-        tri_map, bary_map,
-        cameras, view_images,
-        tex_size,
-        face_masks=face_masks,
-    )
-
-    # ── 泊松接缝修复 ──────────────────────────────────────────────────────
-    logger.info("接缝修复...")
-    texture = poisson_seam_fix(texture, valid_mask)
+    # ── 纹理烘焙（统一纹理 or 多视角） ──────────────────────────────────
+    if unified_texture is not None:
+        logger.info("使用预融合统一纹理（单视角正面投影）...")
+        front_cam = cameras.get("front", next(iter(cameras.values())))
+        texture = bake_texture_single(
+            vertices, faces, uv_verts, uv_faces,
+            tri_map, bary_map,
+            front_cam, unified_texture,
+            tex_size,
+        )
+        # 单视角投影不存在接缝，跳过泊松修复
+        logger.info("跳过接缝修复（单视角无拼接）")
+    else:
+        logger.info("多视角颜色采样（烘焙）...")
+        for view_name in cameras:
+            if view_name not in images:
+                logger.warning(f"  相机 [{view_name}] 无对应图像，跳过")
+        view_images = {k: images[k] for k in cameras if k in images}
+        texture = bake_texture(
+            vertices, faces, uv_verts, uv_faces,
+            tri_map, bary_map,
+            cameras, view_images,
+            tex_size,
+            face_masks=face_masks,
+        )
+        # ── 泊松接缝修复 ─────────────────────────────────────────────────
+        logger.info("接缝修复...")
+        texture = poisson_seam_fix(texture, valid_mask)
 
     # ── 保存纹理图 ────────────────────────────────────────────────────────
     tex_path = output_texture_dir / f"albedo_{lighting_type}.png"

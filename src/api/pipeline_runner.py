@@ -71,6 +71,16 @@ def _run_pipeline(
     # 后续所有模块统一使用缩放后的图像（512×512），确保与内参 cx=cy=256 匹配
     images_resized = {k: v["image"] for k, v in view_data.items()}
 
+    # ── 3b. 三视角纹理预融合 ────────────────────────────────────────────────
+    progress("texture_fusion", 28, "三视角纹理预融合...")
+    from src.module1b_texture_fusion import fuse_face_views
+    debug_dir = session_output_dir / "debug"
+    unified_texture = fuse_face_views(
+        preprocessed_views=view_data,
+        debug_save_path=str(debug_dir),
+    )
+    logger.info(f"统一纹理生成完成: shape={unified_texture.shape}")
+
     # ── 4. 3DMM 拟合 + 深度置换 ──────────────────────────────────────────────
     progress("fitting", 35, "3DMM 几何拟合中...")
     from src.module2_geometry import run_geometry_reconstruction
@@ -107,6 +117,7 @@ def _run_pipeline(
         lighting_type="white",
         lighting_display_name="白光",
         face_masks=face_masks,
+        unified_texture=unified_texture,
     )
 
     progress("done", 100, "重建完成")
