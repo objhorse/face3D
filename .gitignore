@@ -16,8 +16,10 @@ env/
 # 大权重与第三方克隆（需按 README 自行下载/拉取）
 models/
 external/
-# FLAME 官方数据，勿提交到公开仓库（许可与体积）
-FLAME2020/
+# FLAME2020/ 已纳入版本库（许可见该目录下 Readme.pdf）
+
+# 教程/杂项（不纳入本仓库）
+claude-howto/
 
 # 运行产物与中间结果
 output/
@@ -28,6 +30,9 @@ output/
 
 # 可选：不提交原始拍摄图（含隐私/体积）。若需一并上传，删除下一行。
 # image20260207_rotated/
+
+# Cursor / 会话续写临时文件
+*-this-session-is-being-continued*.txt
 
 # OS / IDE
 .DS_Store

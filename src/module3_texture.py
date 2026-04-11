@@ -384,10 +384,12 @@ def bake_texture_single(
     camera: dict,               # {"K": ..., "R": ..., "t": ...}
     unified_img: np.ndarray,    # (Hi, Wi, 3) uint8 RGB 预融合统一纹理
     tex_size: int = 2048,
+    face_mask: Optional[np.ndarray] = None,  # (Hi, Wi) uint8, 0=背景 255=人脸
 ) -> np.ndarray:
     """
     从单张预融合统一纹理图烘焙到 UV 纹理图。
     每个 UV 纹素通过重心插值得到 3D 点，再用正面相机投影到统一纹理图采色。
+    face_mask 用于排除背景/支架等干扰区域。
 
     Returns: (tex_size, tex_size, 3) uint8 RGB 纹理图
     """
@@ -415,6 +417,26 @@ def bake_texture_single(
 
     K, R, t = camera["K"], camera["R"], camera["t"]
 
+    # ── 法线可见性剔除（排除后脑、侧面背对相机的面片）────────────────
+    face_normals_all = compute_face_normals(vertices, faces)  # (F, 3)
+    pt_normals = face_normals_all[valid_tri]                  # (M, 3)
+
+    # 相机中心在 FLAME 坐标系（还原 Y 翻转）
+    cam_center_proj = -R.T @ t       # (3,) 投影坐标系
+    cam_center = cam_center_proj.copy()
+    cam_center[1] *= -1              # 还原 Y 翻转 → FLAME 坐标系
+
+    # 视线方向（点 → 相机），在 FLAME 坐标系中计算
+    view_dirs = cam_center - pts_3d  # (M, 3)
+    view_dirs /= np.clip(np.linalg.norm(view_dirs, axis=1, keepdims=True), 1e-8, None)
+    cosines = np.sum(pt_normals * view_dirs, axis=1)          # (M,)
+    front_facing = cosines > 0.05   # 法线朝向相机（小阈值留擦边余量）
+
+    logger.info(
+        f"  法线可见性: {front_facing.sum()} / {len(valid_tri)} 面片朝向相机 "
+        f"({front_facing.mean()*100:.1f}%)"
+    )
+
     # Y 轴翻转（与 bake_texture 保持一致）
     pts_proj = pts_3d.copy()
     pts_proj[:, 1] *= -1
@@ -428,25 +450,79 @@ def bake_texture_single(
     proj[front, 1] = K[1, 1] * v_cam[front, 1] / z[front] + K[1, 2]
 
     in_img = (front &
+              front_facing &
               (proj[:, 0] >= 0) & (proj[:, 0] < W_img - 1) &
               (proj[:, 1] >= 0) & (proj[:, 1] < H_img - 1))
+
+    # face_mask 排除背景/支架：投影落点必须在 mask 内（人脸区域）
+    if face_mask is not None:
+        px_u = np.clip(proj[:, 0].astype(int), 0, face_mask.shape[1] - 1)
+        px_v = np.clip(proj[:, 1].astype(int), 0, face_mask.shape[0] - 1)
+        in_face = face_mask[px_v, px_u] > 127
+        before = in_img.sum()
+        in_img = in_img & in_face
+        logger.info(f"  face_mask 过滤: {before} → {in_img.sum()} 像素（排除 {before - in_img.sum()} 背景点）")
 
     texture = np.zeros((H, W, 3), dtype=np.uint8)
 
     if in_img.sum() > 0:
         colors = _bilinear_sample(unified_img, proj[in_img, 0], proj[in_img, 1])
-        texture[valid_y[in_img], valid_x[in_img]] = colors.clip(0, 255).astype(np.uint8)
-        logger.info(f"  单视角烘焙: {in_img.sum()} / {len(valid_y)} 个有效 UV 像素已着色")
+        colors_u8 = colors.clip(0, 255).astype(np.uint8)
 
-    # Inpainting：填充未能投影到的有效 UV 区域（遮挡、UV 边界等）
+        # 过滤极暗像素（暗背景/黑色区域被错误投影进来）
+        brightness = colors_u8.mean(axis=1)
+        bright_enough = brightness > 20.0
+        in_img_indices = np.where(in_img)[0]
+        good_indices   = in_img_indices[bright_enough]
+
+        texture[valid_y[good_indices], valid_x[good_indices]] = colors_u8[bright_enough]
+        logger.info(
+            f"  单视角烘焙: {len(good_indices)} / {len(valid_y)} 个有效 UV 像素已着色"
+            f"（过滤暗像素 {in_img.sum() - len(good_indices)} 个）"
+        )
+    else:
+        good_indices = np.array([], dtype=int)
+
+    # Inpainting：填充未能投影到的有效 UV 区域（法线背面、越界、遮挡、暗像素）
     has_color = np.zeros((H, W), dtype=bool)
-    has_color[valid_y[in_img], valid_x[in_img]] = True
+    if len(good_indices) > 0:
+        has_color[valid_y[good_indices], valid_x[good_indices]] = True
     inpaint_needed = valid_mask & ~has_color
     if inpaint_needed.any():
         n_holes = int(inpaint_needed.sum())
-        logger.info(f"  Inpainting 填充 {n_holes} 个空洞像素...")
-        texture = cv2.inpaint(texture, inpaint_needed.astype(np.uint8) * 255,
-                              inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+        logger.info(f"  Inpainting 填充 {n_holes} 个空洞像素（多尺度）...")
+        inpaint_mask_u8 = inpaint_needed.astype(np.uint8) * 255
+
+        # Step 1: 计算有效皮肤区域的平均颜色
+        skin_pixels = texture[has_color]
+        if len(skin_pixels) > 0:
+            avg_skin = np.median(skin_pixels, axis=0).astype(np.uint8)
+        else:
+            avg_skin = np.array([200, 170, 150], dtype=np.uint8)
+        logger.info(f"  平均肤色: RGB={avg_skin}")
+
+        # Step 2: 关键——将 mesh 外背景临时填为平均肤色
+        # 防止 TELEA 从纯黑背景取色覆盖后脑等边界区域
+        bg_mask = ~valid_mask
+        texture[bg_mask] = avg_skin
+        texture[inpaint_needed] = avg_skin  # 空洞也预填肤色，提供传播起点
+
+        # Step 3: 缩小到 256×256 做多尺度 TELEA（传播大范围颜色梯度）
+        SCALE = 8
+        tex_s    = cv2.resize(texture,        (W // SCALE, H // SCALE), interpolation=cv2.INTER_AREA)
+        mask_s   = cv2.resize(inpaint_mask_u8,(W // SCALE, H // SCALE), interpolation=cv2.INTER_NEAREST)
+        tex_s_ip = cv2.inpaint(tex_s, mask_s, inpaintRadius=20, flags=cv2.INPAINT_TELEA)
+
+        # Step 4: 上采样回 2048，替换空洞区域（保留直采区域不动）
+        tex_seed = cv2.resize(tex_s_ip, (W, H), interpolation=cv2.INTER_LINEAR)
+        texture[inpaint_needed] = tex_seed[inpaint_needed]
+
+        # Step 5: 原尺寸细化（修复边界锯齿）
+        texture = cv2.inpaint(texture, inpaint_mask_u8, inpaintRadius=8, flags=cv2.INPAINT_TELEA)
+
+        # Step 6: 还原 mesh 外背景为黑色（UI 透明显示需要）
+        texture[bg_mask] = 0
+        logger.info("  Inpainting 完成")
 
     return texture
 
@@ -619,7 +695,9 @@ def run_texture_pipeline(
     lighting_type: str = "white",
     lighting_display_name: str = "白光",
     face_masks: Optional[Dict[str, np.ndarray]] = None,
-    unified_texture: Optional[np.ndarray] = None,  # 预融合统一纹理（优先使用）
+    unified_texture: Optional[np.ndarray] = None,       # 预融合统一纹理（fallback）
+    hires_front_image: Optional[np.ndarray] = None,     # 原始高清正面图（优先）
+    hires_scale_factor: float = 1.0,                     # K 缩放系数（原始分辨率 / 512）
 ) -> Path:
     """
     完整纹理融合流程。
@@ -629,6 +707,8 @@ def run_texture_pipeline(
         images:   {view_name: RGB numpy array}
         output_texture_dir: 纹理输出目录
         output_mesh_dir:    GLB 输出目录
+        hires_front_image:  原始高清正面照片（优先于 unified_texture）
+        hires_scale_factor: 原始分辨率 / 512，用于缩放 K 矩阵
 
     Returns:
         GLB 文件路径
@@ -647,8 +727,57 @@ def run_texture_pipeline(
     tri_map, bary_map = rasterize_uv_map(uv_verts, uv_faces, tex_size)
     valid_mask = tri_map >= 0
 
-    # ── 纹理烘焙（统一纹理 or 多视角） ──────────────────────────────────
-    if unified_texture is not None:
+    # ── 纹理烘焙（高清直采 > 统一纹理 > 多视角） ─────────────────────────
+    if hires_front_image is not None:
+        # ── 高清直采模式（绕过 512×512 分辨率瓶颈）────────────────────
+        logger.info(f"高清直采模式 (scale={hires_scale_factor:.3f})...")
+        front_cam = cameras.get("front", next(iter(cameras.values())))
+
+        # 缩放 K 矩阵匹配高清图分辨率
+        K_hires = front_cam["K"].copy()
+        K_hires[0, :] *= hires_scale_factor  # fx, cx
+        K_hires[1, :] *= hires_scale_factor  # fy, cy
+        hires_cam = {"K": K_hires, "R": front_cam["R"], "t": front_cam["t"]}
+
+        # 等比缩放 + 居中黑边填充到正方形（与 _resize_to_target 逻辑相同）
+        max_size = max(hires_front_image.shape[:2])
+        h, w = hires_front_image.shape[:2]
+        scale = max_size / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(hires_front_image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        canvas = np.zeros((max_size, max_size, 3), dtype=np.uint8)
+        y_off = (max_size - new_h) // 2
+        x_off = (max_size - new_w) // 2
+        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+        hires_img = canvas
+
+        logger.info(
+            f"  高清图: {hires_front_image.shape[1]}×{hires_front_image.shape[0]}"
+            f" → {max_size}×{max_size} (正方形填充)"
+        )
+
+        # 将 512×512 face_mask 按相同倍率缩放到 max_size×max_size
+        # 原理：K_hires = K_512 × scale，投影坐标同比放大，mask 同步放大即可对齐
+        hires_face_mask = None
+        if face_masks is not None and "front" in face_masks:
+            mask_512 = face_masks["front"]
+            hires_face_mask = cv2.resize(
+                mask_512, (max_size, max_size),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            logger.info(f"  face_mask 放大: 512×512 → {max_size}×{max_size}")
+
+        texture = bake_texture_single(
+            vertices, faces, uv_verts, uv_faces,
+            tri_map, bary_map,
+            hires_cam, hires_img,
+            tex_size,
+            face_mask=hires_face_mask,
+        )
+        logger.info("跳过接缝修复（单视角无拼接）")
+
+    elif unified_texture is not None:
+        # ── 预融合统一纹理 fallback ────────────────────────────────────
         logger.info("使用预融合统一纹理（单视角正面投影）...")
         front_cam = cameras.get("front", next(iter(cameras.values())))
         texture = bake_texture_single(
@@ -657,8 +786,8 @@ def run_texture_pipeline(
             front_cam, unified_texture,
             tex_size,
         )
-        # 单视角投影不存在接缝，跳过泊松修复
         logger.info("跳过接缝修复（单视角无拼接）")
+
     else:
         logger.info("多视角颜色采样（烘焙）...")
         for view_name in cameras:
