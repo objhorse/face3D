@@ -55,8 +55,9 @@ def _run_pipeline(
         images[view] = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         logger.info(f"  [{view}] 已加载: {img_bgr.shape[1]}×{img_bgr.shape[0]}")
 
-    # 保存原始正面高清图（预处理缩放之前），用于高清直采
-    original_front = images.get("front", next(iter(images.values()))).copy()
+    # 保存所有视角原始高清图（预处理缩放之前），用于多视角高清直采
+    original_hires = {k: v.copy() for k, v in images.items()}
+    original_front = original_hires.get("front", next(iter(original_hires.values())))
 
     # ── 2. 相机内参 ──────────────────────────────────────────────────────────
     progress("intrinsics", 10, "计算相机内参...")
@@ -74,9 +75,8 @@ def _run_pipeline(
     # 后续所有模块统一使用缩放后的图像（512×512），确保与内参 cx=cy=256 匹配
     images_resized = {k: v["image"] for k, v in view_data.items()}
 
-    # ── 3b. 三视角纹理预融合（高清直采模式下跳过）────────────────────────
-    # 高清直采方案：直接用原始高清正面图投影，无需预融合
-    # module1b_texture_fusion 保留作为 fallback，此处不调用
+    # ── 3b. 三视角纹理预融合（多视角高清直采模式下跳过）──────────────────
+    # 多视角高清直采：直接将原始高清三视角图投影到 UV，无需预融合 module1b
 
     # ── 4. 3DMM 拟合 + 深度置换 ──────────────────────────────────────────────
     progress("fitting", 30, "3DMM 几何拟合中...")
@@ -105,11 +105,9 @@ def _run_pipeline(
     progress("texture", 75, "高清纹理烘焙中...")
     face_masks = {k: v["face_mask"] for k, v in view_data.items()}
 
-    # 计算从 512→原始分辨率的 K 缩放系数
-    scale_factor = max(original_front.shape[:2]) / 512.0
     logger.info(
-        f"高清直采: 原始正面图 {original_front.shape[1]}×{original_front.shape[0]}, "
-        f"scale_factor={scale_factor:.3f}"
+        f"多视角高清直采: 视角={list(original_hires.keys())}, "
+        f"正面图 {original_front.shape[1]}×{original_front.shape[0]}"
     )
 
     from src.module3_texture import run_texture_pipeline
@@ -122,8 +120,7 @@ def _run_pipeline(
         lighting_type="white",
         lighting_display_name="白光",
         face_masks=face_masks,
-        hires_front_image=original_front,
-        hires_scale_factor=scale_factor,
+        hires_images=original_hires,
     )
 
     progress("done", 100, "重建完成")

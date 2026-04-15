@@ -696,8 +696,9 @@ def run_texture_pipeline(
     lighting_display_name: str = "白光",
     face_masks: Optional[Dict[str, np.ndarray]] = None,
     unified_texture: Optional[np.ndarray] = None,       # 预融合统一纹理（fallback）
-    hires_front_image: Optional[np.ndarray] = None,     # 原始高清正面图（优先）
+    hires_front_image: Optional[np.ndarray] = None,     # 原始高清正面图（仅正面，旧接口）
     hires_scale_factor: float = 1.0,                     # K 缩放系数（原始分辨率 / 512）
+    hires_images: Optional[Dict[str, np.ndarray]] = None,  # 多视角高清图（最优先）
 ) -> Path:
     """
     完整纹理融合流程。
@@ -728,7 +729,59 @@ def run_texture_pipeline(
     valid_mask = tri_map >= 0
 
     # ── 纹理烘焙（高清直采 > 统一纹理 > 多视角） ─────────────────────────
-    if hires_front_image is not None:
+    if hires_images is not None:
+        # ── 多视角高清烘焙（覆盖全部 UV，包括侧面耳朵等区域）──────────
+        logger.info(f"多视角高清烘焙模式（{len(hires_images)} 个视角）...")
+        scaled_cameras: Dict[str, dict] = {}
+        processed_hires: Dict[str, np.ndarray] = {}
+        scaled_masks: Dict[str, np.ndarray] = {}
+
+        for view_name, hires_img in hires_images.items():
+            if view_name not in cameras:
+                logger.warning(f"  [{view_name}] 无对应相机，跳过")
+                continue
+
+            # 等比缩放 + 居中填充到正方形（与 _resize_to_target 逻辑一致）
+            h, w = hires_img.shape[:2]
+            max_sz = max(h, w)
+            new_w, new_h = w, h  # max side already == max_sz, no scaling needed
+            canvas = np.zeros((max_sz, max_sz, 3), dtype=np.uint8)
+            y_off = (max_sz - new_h) // 2
+            x_off = (max_sz - new_w) // 2
+            canvas[y_off:y_off + new_h, x_off:x_off + new_w] = hires_img
+            processed_hires[view_name] = canvas
+
+            # 缩放 K 矩阵匹配高清正方形分辨率
+            view_sf = max_sz / 512.0
+            cam = cameras[view_name]
+            K_h = cam["K"].copy()
+            K_h[0, :] *= view_sf   # fx, cx
+            K_h[1, :] *= view_sf   # fy, cy
+            scaled_cameras[view_name] = {"K": K_h, "R": cam["R"], "t": cam["t"]}
+
+            # 缩放 face_mask 到高清分辨率（INTER_NEAREST 保持硬边界）
+            if face_masks is not None and view_name in face_masks:
+                scaled_masks[view_name] = cv2.resize(
+                    face_masks[view_name], (max_sz, max_sz),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+            logger.info(
+                f"  [{view_name}] {w}×{h} → {max_sz}×{max_sz}, K_scale={view_sf:.3f}"
+            )
+
+        texture = bake_texture(
+            vertices, faces, uv_verts, uv_faces,
+            tri_map, bary_map,
+            scaled_cameras,
+            processed_hires,
+            tex_size,
+            face_masks=scaled_masks if scaled_masks else None,
+        )
+        logger.info("接缝修复...")
+        texture = poisson_seam_fix(texture, valid_mask)
+
+    elif hires_front_image is not None:
         # ── 高清直采模式（绕过 512×512 分辨率瓶颈）────────────────────
         logger.info(f"高清直采模式 (scale={hires_scale_factor:.3f})...")
         front_cam = cameras.get("front", next(iter(cameras.values())))
