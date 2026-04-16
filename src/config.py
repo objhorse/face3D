@@ -30,24 +30,19 @@ TEST_DATA_DIR       = OUTPUT_DIR / "test_data"   # generate_test_data.py 输出
 # ── 输入图像命名约定 ─────────────────────────────────────────────────────
 # key: 视角名, value: 文件名（相对于图像目录）
 DEFAULT_VIEW_NAMES = {
-    "left":   "IMG_0004.jpg",
-    "front":  "IMG_0005.jpg",
-    "right":  "IMG_0006.jpg",
+    "left":   "left.jpg",
+    "front":  "front.jpg",
+    "right":  "right.jpg",
 }
-DEFAULT_IMAGE_DIR = ROOT / "image20260207_rotated"
+DEFAULT_IMAGE_DIR = ROOT / "image"
 
 # ── 相机内参（手动覆盖接口） ──────────────────────────────────────────────
 # 若为 None，则由 Dust3R 预测；若设置则跳过 Dust3R 直接使用
 # 格式: {"fx": float, "fy": float, "cx": float, "cy": float}
 # 或直接传 3×3 numpy array
-MANUAL_INTRINSICS = {"fx": 1200.0, "fy": 1200.0, "cx": 256.0, "cy": 256.0}  # 合成测试数据内参
-# 示例（后续拿到真实内参后在此填写）:
-# MANUAL_INTRINSICS = {
-#     "fx": 2800.0,
-#     "fy": 2800.0,
-#     "cx": 2304.0,
-#     "cy": 1728.0,
-# }
+MANUAL_INTRINSICS = {"fx": 341.0, "fy": 341.0, "cx": 256.0, "cy": 256.0}
+# vivo X300 主摄 1x，FocalLength=6.25mm，FocalLengthIn35mmFilm=23mm，3072×4080
+# 推导：crop=3.68，pixel_pitch=0.002302mm，fx_original=2715px，缩放512后fx=341
 
 # ── 3DMM 超参数 ────────────────────────────────────────────────────────
 N_SHAPE_PARAMS  = 300   # FLAME 形状参数维度（最大300）

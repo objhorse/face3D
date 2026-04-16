@@ -356,8 +356,18 @@ def bake_texture(
 
     # 对无颜色的有效区域做 inpainting 填充（遮挡区域）
     texture_uint8 = texture.clip(0, 255).astype(np.uint8)
-    inpaint_mask  = (valid_mask & ~(weight_acc_img(texture_uint8, valid_y, valid_x, has_color, H, W))).astype(np.uint8)
+    has_color_img = weight_acc_img(texture_uint8, valid_y, valid_x, has_color, H, W)
+    inpaint_mask  = (valid_mask & ~has_color_img).astype(np.uint8)
     if inpaint_mask.any():
+        # 用有效像素的中位肤色预填充空洞，避免 TELEA 将边界污染色向内扩散
+        sampled_colors = texture_uint8[valid_y[has_color], valid_x[has_color]]  # (K, 3)
+        if len(sampled_colors) > 0:
+            median_skin = np.median(sampled_colors, axis=0).astype(np.uint8)
+        else:
+            median_skin = np.array([180, 140, 120], dtype=np.uint8)
+        hole_y, hole_x = np.where(inpaint_mask)
+        texture_uint8[hole_y, hole_x] = median_skin
+        # 小半径 inpaint 仅用于平滑预填充边界（不再需要跨越大距离）
         texture_uint8 = cv2.inpaint(texture_uint8, inpaint_mask * 255, 3, cv2.INPAINT_TELEA)
 
     return texture_uint8
