@@ -232,6 +232,79 @@ def _bilinear_sample(image: np.ndarray, u_px: np.ndarray, v_px: np.ndarray) -> n
             c11 * wu       * wv)
 
 
+def _render_camera_depth(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    image_shape: Tuple[int, int],
+) -> np.ndarray:
+    """Render a coarse camera-space z-buffer for visibility filtering."""
+    H, W = image_shape
+    depth = np.full((H, W), np.inf, dtype=np.float32)
+
+    verts_proj = vertices.copy()
+    verts_proj[:, 1] *= -1
+    v_cam = (R @ verts_proj.T + t[:, None]).T
+    z = v_cam[:, 2]
+    valid = z > 1e-4
+    if not np.any(valid):
+        return depth
+
+    proj = np.zeros((len(vertices), 2), dtype=np.float32)
+    proj[valid, 0] = K[0, 0] * v_cam[valid, 0] / z[valid] + K[0, 2]
+    proj[valid, 1] = K[1, 1] * v_cam[valid, 1] / z[valid] + K[1, 2]
+
+    for tri in faces:
+        tri_z = z[tri]
+        if np.any(tri_z <= 1e-4):
+            continue
+        pts = proj[tri]
+        x_min = max(0, int(np.floor(np.min(pts[:, 0]))))
+        x_max = min(W - 1, int(np.ceil(np.max(pts[:, 0]))))
+        y_min = max(0, int(np.floor(np.min(pts[:, 1]))))
+        y_max = min(H - 1, int(np.ceil(np.max(pts[:, 1]))))
+        if x_min > x_max or y_min > y_max:
+            continue
+
+        xs = np.arange(x_min, x_max + 1, dtype=np.float32) + 0.5
+        ys = np.arange(y_min, y_max + 1, dtype=np.float32) + 0.5
+        gx, gy = np.meshgrid(xs, ys)
+        pix = np.stack([gx.ravel(), gy.ravel()], axis=1)
+        bary = _bary_batch(pix, pts[0], pts[1], pts[2])
+        inside = np.all(bary >= -1e-5, axis=1)
+        if not np.any(inside):
+            continue
+
+        pix_in = pix[inside]
+        depth_in = (bary[inside] @ tri_z.astype(np.float32)).astype(np.float32)
+        px = pix_in[:, 0].astype(np.int32)
+        py = pix_in[:, 1].astype(np.int32)
+        np.minimum.at(depth, (py, px), depth_in)
+
+    return depth
+
+
+def _view_region_weight(view_name: str, pts_3d: np.ndarray) -> np.ndarray:
+    """Front view dominates center face; side views only fill their own side."""
+    x = pts_3d[:, 0].astype(np.float32)
+    x_extent = max(float(np.max(np.abs(x))), 1e-6)
+    x_norm = x / x_extent
+
+    if view_name == "front":
+        return 2.5 - 0.7 * np.clip(np.abs(x_norm), 0.0, 1.0)
+
+    edge_boost = np.clip((np.abs(x_norm) - 0.15) / 0.35, 0.0, 1.0)
+    if view_name == "left":
+        side_gate = (x_norm < -0.05).astype(np.float32)
+    elif view_name == "right":
+        side_gate = (x_norm > 0.05).astype(np.float32)
+    else:
+        side_gate = np.ones_like(edge_boost, dtype=np.float32)
+    return side_gate * (0.35 + 1.15 * edge_boost)
+
+
 def bake_texture(
     vertices: np.ndarray,       # (N, 3)
     faces: np.ndarray,          # (F, 3)

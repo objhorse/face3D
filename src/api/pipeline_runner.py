@@ -87,6 +87,7 @@ def _run_pipeline(
         flame_model_path=cfg.FLAME_MODEL_PATH,
         flame_landmark_path=cfg.FLAME_LANDMARK_PATH,
         deca_dir=cfg.DECA_REPO_DIR,
+        deca_checkpoint=cfg.DECA_MODEL_PATH,
         depth_model_dir=cfg.DEPTH_MODEL_DIR,
         output_dir=mesh_dir,
         device=cfg.DEVICE,
@@ -98,6 +99,11 @@ def _run_pipeline(
         lbfgs_lr=cfg.LBFGS_LR,
         depth_model_size=cfg.DEPTH_MODEL_SIZE,
         max_displacement=cfg.DISPLACEMENT_SCALE,
+        init_backend=cfg.INIT_BACKEND,
+        mica_dir=cfg.MICA_DIR,
+        mica_checkpoint=cfg.MICA_CHECKPOINT,
+        emoca_dir=cfg.EMOCA_DIR,
+        emoca_checkpoint=cfg.EMOCA_CHECKPOINT,
     )
     progress("depth", 65, "深度估计完成")
 

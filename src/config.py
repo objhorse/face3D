@@ -13,12 +13,16 @@ MODELS_DIR          = ROOT / "models"
 FLAME_MODEL_PATH    = MODELS_DIR / "FLAME" / "generic_model.pkl"
 FLAME_LANDMARK_PATH = MODELS_DIR / "FLAME" / "landmark_embedding.npy"  # FLAME→68点映射
 DECA_MODEL_PATH     = MODELS_DIR / "DECA" / "deca_model.tar"
+MICA_MODEL_PATH     = MODELS_DIR / "MICA" / "mica.tar"
+EMOCA_MODEL_PATH    = MODELS_DIR / "EMOCA" / "EMOCA_v2_detail_EmotionMW_IDW_0.1"
 DEPTH_MODEL_DIR     = MODELS_DIR / "depth_anything"
 
 # ── 外部仓库路径 ────────────────────────────────────────────────────────
-EXTERNAL_DIR  = ROOT / "external"
-DECA_REPO_DIR = EXTERNAL_DIR / "DECA"
-DUST3R_DIR    = EXTERNAL_DIR / "dust3r"
+EXTERNAL_DIR   = ROOT / "external"
+DECA_REPO_DIR  = EXTERNAL_DIR / "DECA"
+DUST3R_DIR     = EXTERNAL_DIR / "dust3r"
+MICA_REPO_DIR  = EXTERNAL_DIR / "MICA"
+EMOCA_REPO_DIR = EXTERNAL_DIR / "EMOCA"
 
 # ── 输出目录 ────────────────────────────────────────────────────────────
 OUTPUT_DIR          = ROOT / "output"
@@ -44,6 +48,26 @@ MANUAL_INTRINSICS = {"fx": 341.0, "fy": 341.0, "cx": 256.0, "cy": 256.0}
 # vivo X300 主摄 1x，FocalLength=6.25mm，FocalLengthIn35mmFilm=23mm，3072×4080
 # 推导：crop=3.68，pixel_pitch=0.002302mm，fx_original=2715px，缩放512后fx=341
 
+# ── 初始化后端 ────────────────────────────────────────────────────────
+# "face_alignment" : 仅用 face_alignment 68点（原有方案）
+# "deca"           : 仅用 DECA 估计初值（原有方案）
+# "mica_deca"      : MICA 估计共享身份形状 + DECA 估计每视角表情/姿态（推荐）
+# "mica_emoca"     : MICA 估计共享身份形状 + EMOCA 估计每视角表情/姿态
+INIT_BACKEND = "mica_deca"
+
+# ── MICA 配置 ─────────────────────────────────────────────────────────
+# MICA 权重目录（需下载 https://github.com/Zielon/MICA）
+MICA_DIR        = MICA_REPO_DIR
+MICA_CHECKPOINT = MICA_MODEL_PATH
+
+# ── EMOCA 配置 ────────────────────────────────────────────────────────
+# EMOCA 仓库与权重（https://github.com/radekd91/emoca）
+EMOCA_DIR        = EMOCA_REPO_DIR
+EMOCA_CHECKPOINT = EMOCA_MODEL_PATH
+
+# ── DECA 配置 ─────────────────────────────────────────────────────────
+DECA_DIR = DECA_REPO_DIR
+
 # ── 3DMM 超参数 ────────────────────────────────────────────────────────
 N_SHAPE_PARAMS  = 300   # FLAME 形状参数维度（最大300）
 N_EXP_PARAMS    = 100   # FLAME 表情参数维度（最大100）
@@ -54,7 +78,7 @@ LBFGS_LR        = 0.05  # 小学习率防止 NaN
 
 # ── 深度估计超参数 ──────────────────────────────────────────────────────
 DEPTH_MODEL_SIZE = "large"       # "small"/"base"/"large"
-DISPLACEMENT_SCALE = 0.002       # 顶点置换最大幅度（米）；降低以减少 Depth-Anything 噪声放大
+DISPLACEMENT_SCALE = 0.002       # 顶点置换最大幅度（米）
 
 # ── 硬件 ────────────────────────────────────────────────────────────────
 DEVICE = "cuda"   # "cuda" or "cpu"

@@ -28,6 +28,8 @@ from scipy.spatial.transform import Rotation
 
 logger = logging.getLogger(__name__)
 
+_PNP_STABLE_IDX = np.arange(27, 68, dtype=np.int32)
+
 
 def _patch_numpy_compat():
     """
@@ -296,8 +298,8 @@ def estimate_pose_from_landmarks_pnp(
 
     try:
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
-            pts3d,
-            lmks_2d.astype(np.float64),
+            pts3d[_PNP_STABLE_IDX],
+            lmks_2d.astype(np.float64)[_PNP_STABLE_IDX],
             K.astype(np.float64),
             None,
             iterationsCount=200,
@@ -376,6 +378,7 @@ class JointFLAMEOptimizer:
         lmk_vertex_indices: np.ndarray,  # (68,) int — 近似顶点索引（fallback用）
         lambda_shape: float = 1e-3,
         lambda_exp: float = 1e-3,
+        lambda_contour: float = 0.0,
         max_iter: int = 100,
         lr: float = 0.5,
         device: str = "cuda",
@@ -385,6 +388,7 @@ class JointFLAMEOptimizer:
         self.flame   = flame.to(device)
         self.lambda_shape = lambda_shape
         self.lambda_exp   = lambda_exp
+        self.lambda_contour = lambda_contour
         self.max_iter = max_iter
         self.lr       = lr
         self.device   = device
@@ -461,6 +465,27 @@ class JointFLAMEOptimizer:
             name: torch.tensor(views[name]["lmk_2d"], device=dev, dtype=torch.float32)
             for name in view_names
         }
+        contour_rows = {}
+        for name in view_names:
+            mask = views[name].get("face_mask")
+            if name == "front" or mask is None:
+                contour_rows[name] = None
+                continue
+            xmin, xmax, valid = _build_mask_row_bounds(mask)
+            contour_rows[name] = {
+                "xmin": torch.tensor(xmin, device=dev, dtype=torch.float32),
+                "xmax": torch.tensor(xmax, device=dev, dtype=torch.float32),
+                "valid": torch.tensor(valid, device=dev, dtype=torch.bool),
+            }
+        lmk_weights = {}
+        side_risk_idx = np.array(list(range(27)), dtype=np.int64)
+        side_extra_soft_idx = np.array([36, 37, 38, 39, 42, 43, 44, 45], dtype=np.int64)
+        for name in view_names:
+            w = torch.ones(68, device=dev, dtype=torch.float32)
+            if name != "front":
+                w[torch.tensor(side_risk_idx, device=dev)] = 0.35
+                w[torch.tensor(side_extra_soft_idx, device=dev)] = 0.6
+            lmk_weights[name] = w
 
         all_params = (
             [shape_param]
@@ -495,8 +520,32 @@ class JointFLAMEOptimizer:
                 lmk_target_n = lmk_targets[name] / 1000.0
                 lmk_proj_n   = lmk_proj / 1000.0
 
-                lmk_loss = F.mse_loss(lmk_proj_n, lmk_target_n)
+                per_point = F.smooth_l1_loss(
+                    lmk_proj_n, lmk_target_n, reduction="none", beta=0.01
+                ).mean(dim=1)
+                lmk_loss = (per_point * lmk_weights[name]).sum() / lmk_weights[name].sum().clamp_min(1e-6)
                 total_loss = total_loss + lmk_loss
+
+                contour_data = contour_rows.get(name)
+                if contour_data is not None and self.lambda_contour > 0:
+                    jaw_proj = lmk_proj[4:13]
+                    row_idx = torch.round(jaw_proj[:, 1]).long()
+                    row_idx = row_idx.clamp(0, contour_data["valid"].shape[0] - 1)
+                    valid_rows = contour_data["valid"][row_idx]
+                    if torch.any(valid_rows):
+                        jaw_x = jaw_proj[:, 0][valid_rows]
+                        xmin = contour_data["xmin"][row_idx][valid_rows]
+                        xmax = contour_data["xmax"][row_idx][valid_rows]
+                        side_dist = torch.minimum(torch.abs(jaw_x - xmin), torch.abs(jaw_x - xmax))
+                        excess = torch.clamp(side_dist - 6.0, min=0.0)
+                        contour_loss = F.smooth_l1_loss(
+                            excess / 1000.0,
+                            torch.zeros_like(excess),
+                            reduction="mean",
+                            beta=0.004,
+                        )
+                        if torch.isfinite(contour_loss):
+                            total_loss = total_loss + self.lambda_contour * contour_loss
 
             total_loss = total_loss + self.lambda_shape * (shape_param ** 2).mean()
             for name in view_names:
@@ -538,7 +587,7 @@ class JointFLAMEOptimizer:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_depth_model(model_dir: Path, model_size: str = "large", device: str = "cuda"):
-    """从 HuggingFace 加载 Depth-Anything-V2"""
+    """Load Depth-Anything-V2, preferring a local snapshot directory."""
     try:
         from transformers import pipeline
         model_id = {
@@ -546,11 +595,32 @@ def load_depth_model(model_dir: Path, model_size: str = "large", device: str = "
             "base":   "depth-anything/Depth-Anything-V2-Base-hf",
             "large":  "depth-anything/Depth-Anything-V2-Large-hf",
         }[model_size]
-        pipe = pipeline(
-            task="depth-estimation",
-            model=model_id,
-            device=0 if device == "cuda" else -1,
-        )
+
+        local_candidates = [
+            model_dir / f"Depth-Anything-V2-{model_size.title()}-hf",
+            model_dir / model_size,
+            model_dir,
+        ]
+
+        local_model_dir = None
+        for cand in local_candidates:
+            if (cand / "config.json").exists():
+                local_model_dir = cand
+                break
+
+        pipe_kwargs = {
+            "task": "depth-estimation",
+            "device": 0 if device == "cuda" else -1,
+        }
+        if local_model_dir is not None:
+            pipe_kwargs["model"] = str(local_model_dir)
+            pipe_kwargs["local_files_only"] = True
+            logger.info(f"Depth-Anything-V2-{model_size} 使用本地模型: {local_model_dir}")
+        else:
+            pipe_kwargs["model"] = model_id
+            logger.info(f"Depth-Anything-V2-{model_size} 本地模型缺失，回退到 HuggingFace: {model_id}")
+
+        pipe = pipeline(**pipe_kwargs)
         logger.info(f"Depth-Anything-V2-{model_size} 加载成功")
         return pipe
     except ImportError:
@@ -703,6 +773,12 @@ def align_depth_scale_sparse(
     A = np.stack([x, np.ones_like(x)], axis=1)
     res = np.linalg.lstsq(A, y, rcond=None)
     s, t = float(res[0][0]), float(res[0][1])
+    if not np.isfinite(s) or not np.isfinite(t):
+        logger.warning("深度对齐出现非有限尺度，回退到 s=1, t=0")
+        return 1.0, 0.0
+    if s <= 0.0:
+        logger.warning(f"深度对齐出现负尺度 s={s:.4f}，回退到安全值 s=1, t=0")
+        return 1.0, 0.0
     residual = float(np.mean((A @ res[0] - y) ** 2) ** 0.5)
     logger.info(f"  深度对齐（稀疏）: s={s:.4f}, t={t:.4f}, RMSE={residual:.4f} (n={valid.sum()})")
     return s, t
@@ -836,6 +912,37 @@ def export_mesh_obj(
 # 主流程
 # ══════════════════════════════════════════════════════════════════════════════
 
+def export_mesh_glb(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    uv_verts: np.ndarray,
+    uv_faces: np.ndarray,
+    output_path: Path,
+):
+    """Export mesh as GLB for direct preview."""
+    import trimesh
+    from trimesh.visual.texture import TextureVisuals
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    uv_per_vertex = None
+    if len(uv_verts) == len(vertices):
+        uv_per_vertex = uv_verts.astype(np.float32)
+    elif len(uv_faces) == len(faces):
+        uv_per_vertex = np.zeros((len(vertices), 2), dtype=np.float32)
+        uv_written = np.zeros(len(vertices), dtype=bool)
+        for gf, uf in zip(faces, uv_faces):
+            for g_idx, u_idx in zip(gf, uf):
+                if not uv_written[g_idx]:
+                    uv_per_vertex[g_idx] = uv_verts[u_idx]
+                    uv_written[g_idx] = True
+
+    visual = TextureVisuals(uv=uv_per_vertex) if uv_per_vertex is not None else None
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False, visual=visual)
+    mesh.export(str(output_path))
+    logger.info(f"GLB 已导出: {output_path}")
+
+
 def run_geometry_reconstruction(
     preprocessed_views: Dict[str, dict],
     intrinsics: Dict[str, np.ndarray],
@@ -853,12 +960,27 @@ def run_geometry_reconstruction(
     lbfgs_lr: float = 0.5,
     depth_model_size: str = "large",
     max_displacement: float = 0.005,
+    init_backend: str = "face_alignment",
+    mica_dir: Optional[Path] = None,
+    mica_checkpoint: Optional[Path] = None,
+    emoca_dir: Optional[Path] = None,
+    emoca_checkpoint=None,
+    deca_checkpoint: Optional[Path] = None,
 ) -> Path:
     """
     完整几何重建流程。
     Returns: 输出 .obj 文件路径
+
+    init_backend 可选值:
+      "face_alignment" — 原有 baseline
+      "deca"           — DECA 身份 + 表情/姿态
+      "mica_deca"      — MICA 身份 + DECA 表情/姿态（推荐）
+      "mica_emoca"     — MICA 身份 + EMOCA 表情/姿态
     """
+    import json
     output_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = output_dir.parent / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 加载 FLAME ────────────────────────────────────────────────────────
     logger.info("加载 FLAME 模型...")
@@ -868,111 +990,181 @@ def run_geometry_reconstruction(
 
     # ── 加载关键点映射 ─────────────────────────────────────────────────────
     lmk_data = load_flame_landmark_mapping(flame_landmark_path)
-    # 使用 face_alignment 的 68 个 2D 关键点
-    # lmk_vertex_indices: FLAME 顶点 → 68 标准点的对应关系
-    # 若无文件，用 face_alignment 的 3D 点做 PnP 初始化，用前 68 MediaPipe 点做优化
     if lmk_data is not None and "face_idx" in lmk_data:
-        face_idx  = lmk_data["face_idx"]    # (68,) 面片索引
-        bary      = lmk_data["bary_coords"] # (68, 3) 重心坐标
-        # 取重心坐标最大的顶点作为近似代表顶点
+        face_idx  = lmk_data["face_idx"]
+        bary      = lmk_data["bary_coords"]
         lmk_vertex_indices = flame_faces_np[face_idx, np.argmax(bary, axis=1)]  # (68,)
     else:
-        # 无映射文件时的近似处理
         logger.warning("使用近似关键点索引（建议下载 landmark_embedding.npy）")
         lmk_vertex_indices = np.arange(0, 68)
 
-    # ── 获取初值 ──────────────────────────────────────────────────────────
-    logger.info("获取 3DMM 初始参数...")
-    deca_params = get_deca_initial_params(
+    # ── 新初始化后端 ──────────────────────────────────────────────────────
+    logger.info(f"获取 3DMM 初始参数 [backend={init_backend}]...")
+    from src.initializers import get_initializer
+    init_result = get_initializer(
+        backend=init_backend,
+        images={k: v["image"] for k, v in preprocessed_views.items()},
+        flame_verts=flame_verts_np,
+        lmk_vertex_indices=lmk_vertex_indices,
+        intrinsics=intrinsics,
+        device=device,
+        n_shape=n_shape,
+        n_exp=n_exp,
+        deca_dir=deca_dir,
+        deca_checkpoint=deca_checkpoint,
+        mica_dir=mica_dir,
+        mica_checkpoint=mica_checkpoint,
+        emoca_dir=emoca_dir,
+        emoca_checkpoint=emoca_checkpoint,
+    )
+
+    # ── 保存初始形状 debug ────────────────────────────────────────────────
+    init_shape = init_result["shape"]
+    _save_init_shape_debug(init_result, debug_dir)
+
+    # ── 为每个视角准备优化输入，并合并初始化结果 ───────────────────────────
+    view_data = {}
+    init_exps = {}
+
+    # 仍需 face_alignment 2D 关键点作为优化约束目标（无论哪种 backend 都需要）
+    from src.initializers.face_alignment_initializer import get_fa_per_view
+    fa_lmks = get_fa_per_view(
         {k: v["image"] for k, v in preprocessed_views.items()},
-        deca_dir,
         device,
     )
 
-    fa_params = None
-    if deca_params is None:
-        logger.info("使用 face_alignment 获取初始 3D 关键点...")
-        fa_params = get_fa_initial_params(
-            {k: v["image"] for k, v in preprocessed_views.items()},
-            device,
-        )
-
-    # ── 为每个视角准备优化输入 ────────────────────────────────────────────
-    view_data = {}
-    init_exps = {}
-    init_shape_candidates = []
-
     for view_name, pdata in preprocessed_views.items():
-        K_np = intrinsics[view_name]  # (3, 3)
+        K_np = intrinsics[view_name]
 
-        # ── 优先使用 face_alignment 68点（与 FLAME landmark_embedding 约定一致）──
-        fa_lmk = fa_params.get(view_name) if fa_params else None
+        # 2D landmark target for optimizer
+        fa_lmk = fa_lmks.get(view_name)
         if fa_lmk is not None:
-            lmk_68 = fa_lmk[:, :2].astype(np.float32)   # (68, 2) 原图像素坐标
+            lmk_68 = fa_lmk[:, :2].astype(np.float32)
+        elif init_result["fa_lmk_2d"].get(view_name) is not None:
+            lmk_68 = init_result["fa_lmk_2d"][view_name]
         else:
-            # fallback：MediaPipe 近似
             mp_lmk = pdata.get("landmarks")
             if mp_lmk is None:
                 logger.warning(f"  [{view_name}] 无关键点，跳过该视角")
                 continue
             lmk_68 = _mediapipe_to_68(mp_lmk)
 
-        # 初始姿态估计（PnP）
-        flame_68_3d = flame_verts_np[lmk_vertex_indices]  # (68, 3)
-        try:
-            R_init, t_init = estimate_pose_from_landmarks_pnp(lmk_68, flame_68_3d, K_np)
-            logger.info(f"  [{view_name}] PnP 成功, t_z={t_init[2]:.4f}")
-        except Exception as e:
-            logger.warning(f"  [{view_name}] PnP 失败: {e}，使用前向默认姿态")
-            R_init = np.eye(3, dtype=np.float32)
-            t_init = np.array([0.0, 0.0, 0.3], dtype=np.float32)
+        # Pose init from initializer or PnP fallback
+        pv = init_result["per_view"].get(view_name, {})
+        R_init = pv.get("R_init")
+        t_init = pv.get("t_init")
+
+        if R_init is None or t_init is None:
+            flame_68_3d = flame_verts_np[lmk_vertex_indices]
+            try:
+                R_init, t_init = estimate_pose_from_landmarks_pnp(lmk_68, flame_68_3d, K_np)
+                logger.info(f"  [{view_name}] PnP 后备姿态, t_z={t_init[2]:.4f}")
+            except Exception as e:
+                logger.warning(f"  [{view_name}] PnP 失败: {e}，使用默认姿态")
+                R_init = np.eye(3, dtype=np.float32)
+                t_init = np.array([0.0, 0.0, 0.3], dtype=np.float32)
 
         view_data[view_name] = {
-            "lmk_2d": lmk_68,
-            "K":      K_np.astype(np.float32),
-            "R_init": R_init,
-            "t_init": t_init,
+            "lmk_2d":   lmk_68,
+            "K":        K_np.astype(np.float32),
+            "R_init":   R_init,
+            "t_init":   t_init,
+            "face_mask": pdata.get("face_mask"),
         }
-
-        # 初始表情参数
-        if deca_params and deca_params.get(view_name):
-            exp_i   = deca_params[view_name]["exp"][:n_exp]
-            shape_i = deca_params[view_name]["shape"][:n_shape]
-            init_exps[view_name] = exp_i
-            init_shape_candidates.append(shape_i)
-        else:
-            init_exps[view_name] = None
+        init_exps[view_name] = pv.get("exp")
 
     if not view_data:
         raise RuntimeError("所有视角关键点检测失败，无法进行 3DMM 重建")
 
-    # 初始形状：多视角 DECA 结果均值
-    init_shape = None
-    if init_shape_candidates:
-        init_shape = np.mean(init_shape_candidates, axis=0)
-
-    # ── 联合 L-BFGS 优化 ──────────────────────────────────────────────────
-    optimizer = JointFLAMEOptimizer(
+    # ── 保存每视角初始化参数 + 预优化重投影图 ────────────────────────────────
+    lmk_tri_vidx = flame_faces_np[lmk_data["face_idx"]] if lmk_data is not None else None
+    _save_init_per_view_debug(
+        view_data=view_data,
+        init_result=init_result,
+        init_shape=init_shape,
         flame=flame,
         lmk_vertex_indices=lmk_vertex_indices,
-        lambda_shape=lambda_shape,
-        lambda_exp=lambda_exp,
-        max_iter=lbfgs_max_iter,
-        lr=lbfgs_lr,
-        device=device,
-        lmk_face_idx=lmk_data["face_idx"]    if lmk_data is not None else None,
+        lmk_tri_vidx=lmk_tri_vidx,
         lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+        preprocessed_views=preprocessed_views,
+        intrinsics=intrinsics,
+        debug_dir=debug_dir,
+        device=device,
     )
-    shape_opt, per_view_results = optimizer.optimize(view_data, init_shape, init_exps)
 
-    # 用正脸视角生成最终网格
+    # ── 联合 L-BFGS 优化 ──────────────────────────────────────────────────
+    def _make_optimizer():
+        return JointFLAMEOptimizer(
+            flame=flame,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lambda_shape=lambda_shape,
+            lambda_exp=lambda_exp,
+            max_iter=lbfgs_max_iter,
+            lr=lbfgs_lr,
+            device=device,
+            lmk_face_idx=lmk_data["face_idx"] if lmk_data is not None else None,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+        )
+
+    def _run_optimizer_once(pass_idx: int):
+        optimizer = _make_optimizer()
+        shape_run, per_view_run = optimizer.optimize(view_data, init_shape, init_exps)
+        reproj_stats = {}
+        for view_name, view_result in per_view_run.items():
+            with torch.no_grad():
+                verts_view = flame(
+                    torch.tensor(shape_run, device=device),
+                    torch.tensor(view_result["exp"], device=device),
+                ).cpu().numpy()
+            mean_err, max_err = _save_landmark_reprojection_debug(
+                vertices=verts_view,
+                K=intrinsics[view_name],
+                R=view_result["R"],
+                t=view_result["t"],
+                image=preprocessed_views[view_name]["image"],
+                target_landmarks=view_data[view_name]["lmk_2d"],
+                lmk_vertex_indices=lmk_vertex_indices,
+                out_path=debug_dir / f"landmark_reproj_{view_name}.png",
+                lmk_tri_vidx=lmk_tri_vidx,
+                lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            )
+            reproj_stats[view_name] = (mean_err, max_err)
+            logger.info(
+                f"  [pass {pass_idx}] [{view_name}] landmark reprojection error: "
+                f"mean={mean_err:.2f}px, max={max_err:.2f}px"
+            )
+        return shape_run, per_view_run, reproj_stats
+
+    shape_opt, per_view_results, reproj_stats = _run_optimizer_once(pass_idx=1)
+    mean_err_avg = float(np.mean([v[0] for v in reproj_stats.values()])) if reproj_stats else float("inf")
+    if mean_err_avg > 20.0:
+        logger.warning(
+            f"优化结果异常（avg reproj={mean_err_avg:.2f}px），自动重试一次以规避偶发坏解"
+        )
+        shape_retry, per_view_retry, reproj_retry = _run_optimizer_once(pass_idx=2)
+        mean_err_retry = float(np.mean([v[0] for v in reproj_retry.values()])) if reproj_retry else float("inf")
+        if mean_err_retry < mean_err_avg:
+            logger.info(
+                f"重试结果更优：avg reproj {mean_err_avg:.2f}px -> {mean_err_retry:.2f}px，采用重试结果"
+            )
+            shape_opt, per_view_results, reproj_stats = shape_retry, per_view_retry, reproj_retry
+        else:
+            logger.warning(
+                f"重试未改善：avg reproj {mean_err_avg:.2f}px -> {mean_err_retry:.2f}px，保留首次结果"
+            )
+
+    # 用多视角平均表情生成最终基础网格，避免被单一正脸视角绑定
     front_name = "front" if "front" in per_view_results else list(per_view_results.keys())[0]
-    front_result = per_view_results[front_name]
+    exp_stack = [np.asarray(v["exp"], dtype=np.float32) for v in per_view_results.values() if v.get("exp") is not None]
+    if exp_stack:
+        exp_final = np.mean(np.stack(exp_stack, axis=0), axis=0).astype(np.float32)
+    else:
+        exp_final = np.zeros(n_exp, dtype=np.float32)
 
     with torch.no_grad():
         verts_final = flame(
             torch.tensor(shape_opt, device=device),
-            torch.tensor(front_result["exp"], device=device),
+            torch.tensor(exp_final, device=device),
         ).cpu().numpy()  # (N, 3)
 
     # ── 步骤2：Loop Subdivision（增加几何密度，在置换前细分提高精度）────────
@@ -1082,13 +1274,26 @@ def run_geometry_reconstruction(
                 _save_depth_debug(d_pred_v, d_3dmm_dbg, d_aligned_v,
                                   d_aligned_v - d_3dmm_dbg, debug_dir)
 
-        # 融合：加权均值位移
-        disp_final = np.where(
-            weight_accum > 1e-6,
-            disp_accum / weight_accum,
-            0.0,
-        )
+        # 融合：加权均值位移，先用 mask 规避无效除法告警
+        disp_final = np.zeros(N, dtype=np.float64)
+        valid_weight = weight_accum > 1e-6
+        disp_final[valid_weight] = disp_accum[valid_weight] / weight_accum[valid_weight]
         disp_final = np.clip(disp_final, -max_displacement, max_displacement)
+
+        abs_disp = np.abs(disp_final)
+        moved_mask = abs_disp > 1e-8
+        moved_count = int(moved_mask.sum())
+        moved_ratio = float(moved_count) / float(N) if N > 0 else 0.0
+        logger.info(
+            "深度置换统计: moved=%d/%d (%.2f%%), mean_abs=%.6f m, max_abs=%.6f m"
+            % (
+                moved_count,
+                N,
+                moved_ratio * 100.0,
+                float(abs_disp[moved_mask].mean()) if moved_count > 0 else 0.0,
+                float(abs_disp.max()) if N > 0 else 0.0,
+            )
+        )
 
         logger.info(f"应用多视角融合深度置换到 {N} 个顶点...")
         verts_displaced = verts_sub + vertex_normals * disp_final[:, None]
@@ -1109,11 +1314,16 @@ def run_geometry_reconstruction(
         logger.warning(f"Laplacian 平滑失败（{_e}），跳过")
 
     # ── 导出 .obj ─────────────────────────────────────────────────────────
-    output_path = output_dir / "face_mesh.obj"
-    export_mesh_obj(verts_displaced, faces_sub, uv_verts_sub, uv_faces_sub, output_path)
+    base_output_path = output_dir / "face_mesh.obj"
+    depth_output_path = output_dir / "face_mesh_with_depth.obj"
+    base_glb_path = output_dir / "face_mesh.glb"
+    depth_glb_path = output_dir / "face_mesh_with_depth.glb"
+    export_mesh_obj(verts_sub, faces_sub, uv_verts_sub, uv_faces_sub, base_output_path)
+    export_mesh_obj(verts_displaced, faces_sub, uv_verts_sub, uv_faces_sub, depth_output_path)
+    export_mesh_glb(verts_sub, faces_sub, uv_verts_sub, uv_faces_sub, base_glb_path)
+    export_mesh_glb(verts_displaced, faces_sub, uv_verts_sub, uv_faces_sub, depth_glb_path)
 
     # ── 保存相机参数（Phase 3 纹理映射需要）────────────────────────────────
-    import json
     cam_data = {
         "views": {},
         "flame_space": "Y_up_normalized",
@@ -1137,10 +1347,115 @@ def run_geometry_reconstruction(
         per_view_results[front_name]["R"],
         per_view_results[front_name]["t"],
         preprocessed_views[front_name]["image"],
+        preprocessed_views[front_name]["face_mask"],
         output_dir.parent / "debug" / "mesh_projection_front.jpg",
     )
 
-    return output_path
+    return depth_glb_path
+
+
+def _save_init_shape_debug(init_result: dict, debug_dir: Path):
+    """Save MICA/initializer shape summary JSON."""
+    import json
+    shape = init_result.get("shape")
+    data = {
+        "backend":      init_result["backend"],
+        "shape_source": init_result["shape_source"],
+        "view_status":  init_result["view_status"],
+        "shape_norm":   float(np.linalg.norm(shape)) if shape is not None else 0.0,
+        "shape_params": shape.tolist() if shape is not None else [],
+    }
+    out = debug_dir / "init_mica_shape.json"
+    with open(str(out), "w") as f:
+        json.dump(data, f, indent=2)
+    logger.info(f"初始化 shape 摘要已保存: {out}")
+
+
+def _save_init_per_view_debug(
+    view_data: dict,
+    init_result: dict,
+    init_shape,
+    flame,
+    lmk_vertex_indices,
+    lmk_tri_vidx,
+    lmk_bary_coords,
+    preprocessed_views: dict,
+    intrinsics: dict,
+    debug_dir: Path,
+    device: str,
+):
+    """
+    For each view, save:
+      - init_view_{name}.json : initial params
+      - init_reproj_{name}.png : landmark reprojection before optimization
+      - init_mesh_{name}.png  : projected mesh before optimization
+    """
+    import json
+
+    shape_np = init_shape if init_shape is not None else np.zeros(flame.n_shape, dtype=np.float32)
+    model_device = flame.v_template.device
+    model_dtype = flame.v_template.dtype
+
+    for view_name, vd in view_data.items():
+        pv      = init_result["per_view"].get(view_name, {})
+        exp_np  = pv.get("exp")
+        R_init  = vd["R_init"]
+        t_init  = vd["t_init"]
+
+        exp_use = np.zeros(flame.n_exp, dtype=np.float32)
+        if exp_np is not None:
+            exp_arr = np.asarray(exp_np, dtype=np.float32).reshape(-1)
+            exp_use[:min(len(exp_arr), flame.n_exp)] = exp_arr[:flame.n_exp]
+
+        with torch.no_grad():
+            verts_init = flame(
+                torch.as_tensor(shape_np, device=model_device, dtype=model_dtype),
+                torch.as_tensor(exp_use, device=model_device, dtype=model_dtype),
+            ).cpu().numpy()
+
+        # Reprojection debug image
+        mean_err, max_err = _save_landmark_reprojection_debug(
+            vertices=verts_init,
+            K=intrinsics[view_name],
+            R=R_init,
+            t=t_init,
+            image=preprocessed_views[view_name]["image"],
+            target_landmarks=vd["lmk_2d"],
+            lmk_vertex_indices=lmk_vertex_indices,
+            out_path=debug_dir / f"init_reproj_{view_name}.png",
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+        )
+
+        # Mesh projection image
+        face_mask = preprocessed_views[view_name].get("face_mask")
+        if face_mask is not None:
+            _save_projection_debug(
+                verts_init, flame.faces.numpy(),
+                intrinsics[view_name], R_init, t_init,
+                preprocessed_views[view_name]["image"], face_mask,
+                debug_dir / f"init_mesh_{view_name}.png",
+            )
+
+        # JSON summary
+        view_json = {
+            "view":          view_name,
+            "backend":       init_result["backend"],
+            "shape_source":  init_result["shape_source"],
+            "exp_source":    "initializer" if exp_np is not None else "zero",
+            "R_init":        R_init.tolist(),
+            "t_init":        t_init.tolist(),
+            "init_reproj_mean_px": round(mean_err, 3),
+            "init_reproj_max_px":  round(max_err, 3),
+        }
+        out_json = debug_dir / f"init_view_{view_name}.json"
+        with open(str(out_json), "w") as f:
+            json.dump(view_json, f, indent=2)
+
+        logger.info(
+            f"  [{view_name}] 初始重投影误差: mean={mean_err:.2f}px, max={max_err:.2f}px  "
+            f"(saved: {out_json.name}, init_reproj_{view_name}.png)"
+        )
 
 
 def _save_projection_debug(
@@ -1150,14 +1465,15 @@ def _save_projection_debug(
     R: np.ndarray,
     t: np.ndarray,
     image: np.ndarray,
+    face_mask: np.ndarray,
     out_path: Path,
 ):
-    """将 FLAME mesh 轮廓线投影到图像上，保存为调试图"""
+    """Save a full-resolution projection debug image constrained to the face mask."""
     import cv2
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     v_cam = (R @ vertices.T + t[:, None]).T
-    z     = v_cam[:, 2]
+    z = v_cam[:, 2]
     valid = z > 1e-4
     v_hom = (K @ v_cam[valid].T).T
     u = (v_hom[:, 0] / v_cam[valid, 2]).astype(int)
@@ -1166,12 +1482,94 @@ def _save_projection_debug(
     img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     H, W = img.shape[:2]
     for px, py in zip(u, v):
-        if 0 <= px < W and 0 <= py < H:
-            cv2.circle(img, (px, py), 3, (0, 0, 255), -1)
+        if 0 <= px < W and 0 <= py < H and face_mask[py, px] > 0:
+            cv2.circle(img, (px, py), 1, (0, 0, 255), -1)
 
-    small = cv2.resize(img, (int(W * 0.25), int(H * 0.25)))
-    cv2.imwrite(str(out_path), small)
-    logger.info(f"投影调试图: {out_path}")
+    cv2.imwrite(str(out_path), img)
+    logger.info(f"Projection debug image saved: {out_path}")
+
+
+def _build_mask_row_bounds(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    h, w = mask.shape[:2]
+    xmin = np.zeros(h, dtype=np.float32)
+    xmax = np.zeros(h, dtype=np.float32)
+    valid = np.zeros(h, dtype=bool)
+    for y in range(h):
+        xs = np.flatnonzero(mask[y] > 0)
+        if xs.size == 0:
+            continue
+        xmin[y] = float(xs[0])
+        xmax[y] = float(xs[-1])
+        valid[y] = True
+    return xmin, xmax, valid
+
+
+def _save_landmark_reprojection_debug(
+    vertices: np.ndarray,
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    image: np.ndarray,
+    target_landmarks: np.ndarray,
+    lmk_vertex_indices: np.ndarray,
+    out_path: Path,
+    lmk_tri_vidx: Optional[np.ndarray] = None,
+    lmk_bary_coords: Optional[np.ndarray] = None,
+) -> Tuple[float, float]:
+    import cv2
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    v_cam = (R @ vertices.T + t[:, None]).T
+    z = np.clip(v_cam[:, 2], 1e-6, None)
+    v_hom = (K @ v_cam.T).T
+    proj = np.stack([v_hom[:, 0] / z, v_hom[:, 1] / z], axis=1)
+
+    if lmk_tri_vidx is not None and lmk_bary_coords is not None:
+        lmk_proj = (
+            proj[lmk_tri_vidx[:, 0]] * lmk_bary_coords[:, 0:1] +
+            proj[lmk_tri_vidx[:, 1]] * lmk_bary_coords[:, 1:2] +
+            proj[lmk_tri_vidx[:, 2]] * lmk_bary_coords[:, 2:3]
+        )
+    else:
+        lmk_proj = proj[lmk_vertex_indices]
+
+    errors = np.linalg.norm(lmk_proj - target_landmarks, axis=1)
+    img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    for idx, (gt, pred, err) in enumerate(zip(target_landmarks, lmk_proj, errors)):
+        gt_pt = tuple(np.round(gt).astype(int))
+        pred_pt = tuple(np.round(pred).astype(int))
+        cv2.circle(img, gt_pt, 2, (0, 255, 0), -1)
+        cv2.circle(img, pred_pt, 2, (0, 0, 255), -1)
+        cv2.line(img, gt_pt, pred_pt, (0, 255, 255), 1)
+        if err > 8.0:
+            cv2.putText(
+                img,
+                str(idx),
+                (pred_pt[0] + 2, pred_pt[1] - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (255, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    cv2.imwrite(str(out_path), img)
+    top_idx = np.argsort(errors)[-10:][::-1]
+    report_path = out_path.with_suffix(".txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"mean_error_px={float(errors.mean()):.4f}\n")
+        f.write(f"max_error_px={float(errors.max()):.4f}\n")
+        f.write("top10_indices:\n")
+        for idx in top_idx:
+            gt = target_landmarks[idx]
+            pred = lmk_proj[idx]
+            f.write(
+                f"{int(idx)} err={float(errors[idx]):.4f} "
+                f"gt=({float(gt[0]):.2f},{float(gt[1]):.2f}) "
+                f"pred=({float(pred[0]):.2f},{float(pred[1]):.2f})\n"
+            )
+    return float(errors.mean()), float(errors.max())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
