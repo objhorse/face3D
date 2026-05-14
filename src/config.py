@@ -29,22 +29,28 @@ OUTPUT_DIR          = ROOT / "output"
 OUTPUT_MESH_DIR     = OUTPUT_DIR / "meshes"
 OUTPUT_TEXTURE_DIR  = OUTPUT_DIR / "textures"
 OUTPUT_DEBUG_DIR    = OUTPUT_DIR / "debug"
+CAMERA_CALIBRATION_PATH = ROOT / "config" / "camera_calibration.json"
+WORK_IMAGE_SIZE = 1024
+USE_CAMERA_CALIBRATION = True
+UNDISTORT_IMAGES = True
+UNDISTORT_ALPHA = 0.0
+ENABLE_UV_HOLE_FILL_FACES = True
 TEST_DATA_DIR       = OUTPUT_DIR / "test_data"   # generate_test_data.py 输出
 
 # ── 输入图像命名约定 ─────────────────────────────────────────────────────
 # key: 视角名, value: 文件名（相对于图像目录）
 DEFAULT_VIEW_NAMES = {
-    "left":   "left.jpg",
-    "front":  "front.jpg",
-    "right":  "right.jpg",
+    "left":   "camera1_20260511_191302.jpg",
+    "front":  "camera2_20260511_191302.jpg",
+    "right":  "camera3_20260511_191302.jpg",
 }
-DEFAULT_IMAGE_DIR = ROOT / "image"
+DEFAULT_IMAGE_DIR = ROOT / "new_captures" / "lxr_captures"
 
 # ── 相机内参（手动覆盖接口） ──────────────────────────────────────────────
 # 若为 None，则由 Dust3R 预测；若设置则跳过 Dust3R 直接使用
 # 格式: {"fx": float, "fy": float, "cx": float, "cy": float}
 # 或直接传 3×3 numpy array
-MANUAL_INTRINSICS = {"fx": 341.0, "fy": 341.0, "cx": 256.0, "cy": 256.0}
+MANUAL_INTRINSICS = None
 # vivo X300 主摄 1x，FocalLength=6.25mm，FocalLengthIn35mmFilm=23mm，3072×4080
 # 推导：crop=3.68，pixel_pitch=0.002302mm，fx_original=2715px，缩放512后fx=341
 
@@ -78,7 +84,7 @@ LBFGS_LR        = 0.05  # 小学习率防止 NaN
 
 # ── 深度估计超参数 ──────────────────────────────────────────────────────
 DEPTH_MODEL_SIZE = "large"       # "small"/"base"/"large"
-DISPLACEMENT_SCALE = 0.002       # 顶点置换最大幅度（米）
+DISPLACEMENT_SCALE = 0.002         # 顶点置换最大幅度（米）
 
 # ── 硬件 ────────────────────────────────────────────────────────────────
 DEVICE = "cuda"   # "cuda" or "cpu"

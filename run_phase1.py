@@ -37,6 +37,14 @@ def main():
     logger.info("Stage 0: 加载图像")
     from src.module1_preprocess import load_images
     images = load_images(cfg.DEFAULT_IMAGE_DIR, cfg.DEFAULT_VIEW_NAMES)
+    calibration_intrinsics = None
+    if getattr(cfg, "UNDISTORT_IMAGES", True):
+        from src.module0_intrinsics import undistort_images_with_calibration
+        images, calibration_intrinsics = undistort_images_with_calibration(
+            images,
+            calibration_path=cfg.CAMERA_CALIBRATION_PATH,
+            alpha=cfg.UNDISTORT_ALPHA,
+        )
 
     # ── 模块0：相机内参 ───────────────────────────────────────────────────
     logger.info("=" * 50)
@@ -45,6 +53,9 @@ def main():
     intrinsics = get_intrinsics(
         images,
         manual_intrinsics=cfg.MANUAL_INTRINSICS,
+        calibration_path=cfg.CAMERA_CALIBRATION_PATH,
+        calibration_intrinsics=calibration_intrinsics,
+        work_image_size=cfg.WORK_IMAGE_SIZE,
         dust3r_dir=cfg.DUST3R_DIR if cfg.DUST3R_DIR.exists() else None,
         fov_fallback_deg=50.0,
     )
@@ -55,7 +66,7 @@ def main():
     logger.info("=" * 50)
     logger.info("Stage 1: 关键点检测 + 分割")
     from src.module1_preprocess import preprocess_all_views
-    preprocessed = preprocess_all_views(images, debug_dir=cfg.OUTPUT_DEBUG_DIR)
+    preprocessed = preprocess_all_views(images, debug_dir=cfg.OUTPUT_DEBUG_DIR, target_size=cfg.WORK_IMAGE_SIZE)
 
     detected = {k: v for k, v in preprocessed.items() if v["landmarks"] is not None}
     logger.info(f"  成功检测到关键点的视角: {list(detected.keys())}")

@@ -1,4 +1,4 @@
-"""
+﻿"""
 模块3：多视角纹理融合 + GLB 打包
 
 流程：
@@ -154,6 +154,111 @@ def rasterize_uv_map(
     return tri_map, bary_map
 
 
+def add_uv_hole_fill_faces_for_bake(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    uv_verts: np.ndarray,
+    uv_faces: np.ndarray,
+    tex_size: int = 2048,
+    max_area: int = 20000,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Add temporary bake-only fan triangles over small enclosed UV holes."""
+    tri_map, bary_map = rasterize_uv_map(uv_verts, uv_faces, tex_size)
+    valid_mask = tri_map >= 0
+    holes = _small_internal_invalid_uv_holes(valid_mask, max_area=max_area)
+    if not holes.any():
+        return vertices, faces, uv_verts, uv_faces, 0
+
+    valid_y, valid_x = np.where(valid_mask)
+    valid_tri = tri_map[valid_y, valid_x]
+    valid_bary = bary_map[valid_y, valid_x]
+    g_faces = faces[valid_tri]
+    pts_3d = (
+        valid_bary[:, 0:1] * vertices[g_faces[:, 0]]
+        + valid_bary[:, 1:2] * vertices[g_faces[:, 1]]
+        + valid_bary[:, 2:3] * vertices[g_faces[:, 2]]
+    )
+    point_lookup = {(int(x), int(y)): p for x, y, p in zip(valid_x, valid_y, pts_3d)}
+
+    new_vertices = [vertices]
+    new_faces = [faces]
+    new_uv_verts = [uv_verts]
+    new_uv_faces = [uv_faces]
+    vertex_offset = len(vertices)
+    uv_offset = len(uv_verts)
+    added_faces = 0
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(holes.astype(np.uint8), 8)
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area <= 0 or area > max_area:
+            continue
+        hole_mask = labels == label
+        ring_mask = cv2.dilate(hole_mask.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=1).astype(bool)
+        ring_mask &= valid_mask
+        ring_y, ring_x = np.where(ring_mask)
+        if len(ring_x) < 3:
+            continue
+        ring_xy = np.stack([ring_x, ring_y], axis=1).astype(np.float32)
+        ring_vertices = np.asarray([point_lookup[(int(x), int(y))] for x, y in zip(ring_x, ring_y)], dtype=np.float32)
+
+        hole_y, hole_x = np.where(hole_mask)
+        hole_xy = np.stack([hole_x, hole_y], axis=1).astype(np.float32)
+        verts_add = np.empty((len(hole_xy), 3), dtype=np.float32)
+        for idx, xy in enumerate(hole_xy):
+            d2 = np.sum((ring_xy - xy[None, :]) ** 2, axis=1)
+            nearest = np.argsort(d2)[:8]
+            weights = 1.0 / np.maximum(d2[nearest], 1e-3)
+            weights = weights / weights.sum()
+            verts_add[idx] = (ring_vertices[nearest] * weights[:, None]).sum(axis=0)
+        uvs_add = np.stack(
+            [(hole_x.astype(np.float32) + 0.5) / tex_size, (hole_y.astype(np.float32) + 0.5) / tex_size],
+            axis=1,
+        ).astype(np.float32)
+
+        local_index = -np.ones(hole_mask.shape, dtype=np.int32)
+        local_index[hole_y, hole_x] = np.arange(len(hole_x), dtype=np.int32)
+        faces_add = []
+        uv_faces_add = []
+        ys, xs = np.where(hole_mask[:-1, :-1] & hole_mask[:-1, 1:] & hole_mask[1:, :-1] & hole_mask[1:, 1:])
+        for yy, xx in zip(ys, xs):
+            i00 = int(local_index[yy, xx])
+            i10 = int(local_index[yy, xx + 1])
+            i01 = int(local_index[yy + 1, xx])
+            i11 = int(local_index[yy + 1, xx + 1])
+            faces_add.append([vertex_offset + i00, vertex_offset + i10, vertex_offset + i01])
+            faces_add.append([vertex_offset + i10, vertex_offset + i11, vertex_offset + i01])
+            uv_faces_add.append([uv_offset + i00, uv_offset + i10, uv_offset + i01])
+            uv_faces_add.append([uv_offset + i10, uv_offset + i11, uv_offset + i01])
+        if not faces_add:
+            continue
+        faces_add = np.asarray(faces_add, dtype=np.int32)
+        uv_faces_add = np.asarray(uv_faces_add, dtype=np.int32)
+        face_vertices = verts_add[faces_add - vertex_offset]
+        fan_normals = np.cross(face_vertices[:, 1] - face_vertices[:, 0], face_vertices[:, 2] - face_vertices[:, 0])
+        if float(fan_normals[:, 2].mean()) < 0.0:
+            faces_add[:, [1, 2]] = faces_add[:, [2, 1]]
+
+        new_vertices.append(verts_add)
+        new_uv_verts.append(uvs_add)
+        new_faces.append(faces_add)
+        new_uv_faces.append(uv_faces_add)
+        vertex_offset += len(verts_add)
+        uv_offset += len(uvs_add)
+        added_faces += len(faces_add)
+
+    if added_faces == 0:
+        return vertices, faces, uv_verts, uv_faces, 0
+
+    return (
+        np.vstack(new_vertices).astype(np.float32),
+        np.vstack(new_faces).astype(np.int32),
+        np.vstack(new_uv_verts).astype(np.float32),
+        np.vstack(new_uv_faces).astype(np.int32),
+        added_faces,
+    )
+
+
 def _bary_batch(pts: np.ndarray, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     """
     批量计算点 pts(N,2) 相对于三角形 (a,b,c) 的重心坐标。
@@ -287,22 +392,121 @@ def _render_camera_depth(
 
 
 def _view_region_weight(view_name: str, pts_3d: np.ndarray) -> np.ndarray:
-    """Front view dominates center face; side views only fill their own side."""
+    """Softly blend view regions while keeping the front view dominant."""
     x = pts_3d[:, 0].astype(np.float32)
     x_extent = max(float(np.max(np.abs(x))), 1e-6)
     x_norm = x / x_extent
+    abs_x = np.abs(x_norm)
 
     if view_name == "front":
-        return 2.5 - 0.7 * np.clip(np.abs(x_norm), 0.0, 1.0)
+        center = 1.0 - np.clip((abs_x - 0.20) / 0.35, 0.0, 1.0)
+        edge_fade = 1.0 - 0.65 * np.clip((abs_x - 0.35) / 0.45, 0.0, 1.0)
+        return (1.6 + 2.4 * center) * edge_fade
 
-    edge_boost = np.clip((np.abs(x_norm) - 0.15) / 0.35, 0.0, 1.0)
     if view_name == "left":
-        side_gate = (x_norm < -0.05).astype(np.float32)
+        side_preference = np.clip((-x_norm + 0.15) / 0.55, 0.0, 1.0)
     elif view_name == "right":
-        side_gate = (x_norm > 0.05).astype(np.float32)
+        side_preference = np.clip((x_norm + 0.15) / 0.55, 0.0, 1.0)
     else:
-        side_gate = np.ones_like(edge_boost, dtype=np.float32)
-    return side_gate * (0.35 + 1.15 * edge_boost)
+        side_preference = np.ones_like(x_norm, dtype=np.float32)
+    edge_boost = np.clip((abs_x - 0.10) / 0.45, 0.0, 1.0)
+    return 0.18 + 1.25 * edge_boost * side_preference
+
+
+def _masked_color_stats(image: np.ndarray, mask: Optional[np.ndarray]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if mask is None:
+        pixels = image.reshape(-1, 3)
+    else:
+        pixels = image[mask > 127]
+    if len(pixels) < 100:
+        return None
+    brightness = pixels.mean(axis=1)
+    keep = brightness > 25.0
+    if keep.sum() >= 100:
+        pixels = pixels[keep]
+    pixels = pixels.astype(np.float32)
+    return pixels.mean(axis=0), pixels.std(axis=0) + 1e-6
+
+
+def _match_color_stats(
+    colors: np.ndarray,
+    src_stats: Optional[Tuple[np.ndarray, np.ndarray]],
+    ref_stats: Optional[Tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    if src_stats is None or ref_stats is None or len(colors) == 0:
+        return colors
+    src_mean, src_std = src_stats
+    ref_mean, ref_std = ref_stats
+    matched = (colors.astype(np.float32) - src_mean) * (ref_std / src_std) + ref_mean
+    return np.clip(matched, 0.0, 255.0)
+
+
+def _rgb_to_lab_float(colors: np.ndarray) -> np.ndarray:
+    if len(colors) == 0:
+        return colors.astype(np.float32)
+    rgb = np.clip(colors, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+
+
+def _lab_to_rgb_float(colors: np.ndarray) -> np.ndarray:
+    if len(colors) == 0:
+        return colors.astype(np.float32)
+    lab = np.clip(colors, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB).reshape(-1, 3).astype(np.float32)
+
+
+def _robust_color_transform_lab(
+    side_colors: np.ndarray,
+    front_colors: np.ndarray,
+) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
+    if len(side_colors) < 500:
+        return None
+
+    side_rgb = side_colors.astype(np.float32)
+    front_rgb = front_colors.astype(np.float32)
+    side_brightness = side_rgb.mean(axis=1)
+    front_brightness = front_rgb.mean(axis=1)
+    rgb_delta = np.linalg.norm(side_rgb - front_rgb, axis=1)
+    keep = (
+        (side_brightness > 35.0) & (side_brightness < 245.0) &
+        (front_brightness > 35.0) & (front_brightness < 245.0) &
+        (rgb_delta < 95.0)
+    )
+    if keep.sum() < 500:
+        keep = (
+            (side_brightness > 25.0) & (side_brightness < 250.0) &
+            (front_brightness > 25.0) & (front_brightness < 250.0)
+        )
+    if keep.sum() < 500:
+        return None
+
+    side_lab = _rgb_to_lab_float(side_rgb[keep])
+    front_lab = _rgb_to_lab_float(front_rgb[keep])
+
+    side_mean = np.median(side_lab, axis=0)
+    front_mean = np.median(front_lab, axis=0)
+    side_std = np.percentile(side_lab, 75, axis=0) - np.percentile(side_lab, 25, axis=0)
+    front_std = np.percentile(front_lab, 75, axis=0) - np.percentile(front_lab, 25, axis=0)
+    # Keep this as a gentle white-balance/exposure correction. The overlap can
+    # include brows, hair, shadows, or slightly mismatched anatomy, so a strong
+    # affine match easily creates yellow/orange side patches.
+    raw_scale = np.clip(front_std / np.maximum(side_std, 1.0), 0.90, 1.10)
+    scale = 1.0 + (raw_scale - 1.0) * 0.45
+    bias_limits = np.array([10.0, 5.0, 5.0], dtype=np.float32)
+    raw_bias = front_mean - side_mean * scale
+    bias = np.clip(raw_bias, -bias_limits, bias_limits) * 0.45
+    scale[1:] = 1.0
+    bias[1:] = 0.0
+    return scale.astype(np.float32), bias.astype(np.float32), int(keep.sum())
+
+
+def _apply_lab_transform(colors: np.ndarray, transform: Optional[Tuple[np.ndarray, np.ndarray, int]]) -> np.ndarray:
+    if transform is None or len(colors) == 0:
+        return colors.astype(np.float32)
+    scale, bias, _ = transform
+    lab = _rgb_to_lab_float(colors)
+    matched = lab * scale[None, :] + bias[None, :]
+    return np.clip(_lab_to_rgb_float(matched), 0.0, 255.0)
 
 
 def bake_texture(
@@ -316,6 +520,7 @@ def bake_texture(
     images: Dict[str, np.ndarray],
     tex_size: int = 2048,
     face_masks: Optional[Dict[str, np.ndarray]] = None,  # {view: (H,W) uint8 mask 0/255}
+    force_front_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     将3张照片的颜色烘焙到 UV 纹理图。
@@ -346,15 +551,38 @@ def bake_texture(
     # 累积颜色与权重
     color_acc  = np.zeros((len(valid_y), 3), dtype=np.float64)
     weight_acc = np.zeros(len(valid_y), dtype=np.float64)
+    x_coords = pts_3d[:, 0].astype(np.float32)
+    x_extent = max(float(np.max(np.abs(x_coords))), 1e-6)
+    center_face = np.abs(x_coords / x_extent) < 0.35
+    internal_uv_holes = _small_internal_invalid_uv_holes(valid_mask, max_area=20000)
+    uv_hole_neighborhood_img = cv2.dilate(
+        internal_uv_holes.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=16,
+    ).astype(bool) & valid_mask
+    uv_hole_neighborhood = uv_hole_neighborhood_img[valid_y, valid_x]
+    force_front = force_front_mask[valid_y, valid_x] if force_front_mask is not None else np.zeros(len(valid_y), dtype=bool)
 
     view_names = list(cameras.keys())
+    ref_stats = _masked_color_stats(
+        images["front"], face_masks.get("front") if face_masks is not None else None
+    ) if "front" in images else None
+    color_stats = {
+        name: _masked_color_stats(
+            images[name], face_masks.get(name) if face_masks is not None else None
+        )
+        for name in view_names
+        if name in images
+    }
     logger.info(f"  对 {len(view_names)} 个视角进行颜色采样（{len(valid_y)} 个有效纹理像素）...")
 
+    view_samples = {}
     for view_name in view_names:
         cam    = cameras[view_name]
         K, R, t = cam["K"], cam["R"], cam["t"]
         image  = images[view_name]              # (H_img, W_img, 3) RGB
         H_img, W_img = image.shape[:2]
+        depth_map = _render_camera_depth(vertices, faces, K, R, t, (H_img, W_img))
 
         # PnP 时翻转了 FLAME 的 Y 轴，投影时需保持一致
         pts_3d_proj = pts_3d.copy()
@@ -399,6 +627,27 @@ def bake_texture(
         else:
             valid_pts = in_img & (weights > 0.05)
 
+        effective_weights = weights.copy()
+        if valid_pts.any():
+            px_u_int = np.clip(proj[:, 0].astype(int), 0, W_img - 1)
+            px_v_int = np.clip(proj[:, 1].astype(int), 0, H_img - 1)
+            z_ref = depth_map[px_v_int, px_u_int]
+            visible = z <= (z_ref + 3e-3)
+            if view_name == "front":
+                # FLAME's UV atlas contains small internal holes/seams. Faces around
+                # those seams can have inward normals even when they project to skin,
+                # so keep normal as a soft weight instead of a hard reject there.
+                center_fallback = (uv_hole_neighborhood | force_front) & center_face & in_img & (np.abs(cosines) > 0.05)
+                if face_masks is not None and view_name in face_masks:
+                    center_fallback &= in_mask
+                effective_weights[center_fallback] = np.maximum(
+                    effective_weights[center_fallback],
+                    np.abs(cosines[center_fallback]) ** 2,
+                )
+                valid_pts = (valid_pts & visible) | center_fallback
+            else:
+                valid_pts &= visible & ~force_front
+
         if valid_pts.sum() == 0:
             continue
 
@@ -409,18 +658,79 @@ def bake_texture(
         )  # (K, 3)
 
         # 额外过滤极暗像素（残余背景）
-        brightness = colors.mean(axis=1)
-        fg_mask    = brightness > 15.0
-
         vp_idx = np.where(valid_pts)[0]
-        fg_idx = vp_idx[fg_mask]
+        view_weights = _view_region_weight(view_name, pts_3d)[vp_idx]
+        sample_weights = effective_weights[vp_idx] * view_weights
 
-        color_acc[fg_idx]  += colors[fg_mask] * weights[fg_idx, None]
-        weight_acc[fg_idx] += weights[fg_idx]
+        view_samples[view_name] = {
+            "idx": vp_idx,
+            "colors": colors.astype(np.float32),
+            "weights": sample_weights.astype(np.float32),
+        }
+        fg_mask = np.ones(len(vp_idx), dtype=bool)
 
         logger.info(f"    [{view_name}] 采样 {fg_mask.sum()} 个前景像素（共{valid_pts.sum()}有效）")
 
     # 归一化
+    front_present = None
+    front_colors_full = None
+    front_weights_full = None
+    if "front" in view_samples:
+        front_present = np.zeros(len(valid_y), dtype=bool)
+        front_colors_full = np.zeros((len(valid_y), 3), dtype=np.float32)
+        front_weights_full = np.zeros(len(valid_y), dtype=np.float32)
+        front_idx = view_samples["front"]["idx"]
+        front_present[front_idx] = True
+        front_colors_full[front_idx] = view_samples["front"]["colors"]
+        front_weights_full[front_idx] = view_samples["front"]["weights"]
+
+    for view_name in view_names:
+        sample = view_samples.get(view_name)
+        if sample is None:
+            continue
+        vp_idx = sample["idx"]
+        colors = sample["colors"]
+        sample_weights = sample["weights"]
+
+        local_transform = None
+        if view_name != "front" and front_present is not None:
+            overlap = (
+                front_present[vp_idx] &
+                (sample_weights > 1e-4) &
+                (front_weights_full[vp_idx] > 1e-4)
+            )
+            if overlap.any():
+                side_w = sample_weights[overlap]
+                front_w = front_weights_full[vp_idx[overlap]]
+                blend_ratio = side_w / np.maximum(side_w + front_w, 1e-6)
+                seam_overlap = overlap.copy()
+                overlap_positions = np.where(overlap)[0]
+                seam_positions = overlap_positions[(blend_ratio > 0.08) & (blend_ratio < 0.92)]
+                if len(seam_positions) >= 500:
+                    seam_overlap[:] = False
+                    seam_overlap[seam_positions] = True
+
+                local_transform = _robust_color_transform_lab(
+                    colors[seam_overlap],
+                    front_colors_full[vp_idx[seam_overlap]],
+                )
+                if local_transform is not None:
+                    scale, bias, n_used = local_transform
+                    logger.info(
+                        f"    [{view_name}] local LAB match to front: "
+                        f"n={n_used}, scale={scale.round(3).tolist()}, bias={bias.round(2).tolist()}"
+                    )
+                else:
+                    logger.info(f"    [{view_name}] local LAB match skipped: overlap={int(overlap.sum())}")
+
+        if local_transform is not None:
+            matched_colors = _apply_lab_transform(colors, local_transform)
+        else:
+            matched_colors = _match_color_stats(colors, color_stats.get(view_name), ref_stats)
+
+        color_acc[vp_idx]  += matched_colors * sample_weights[:, None]
+        weight_acc[vp_idx] += sample_weights
+
     has_color = weight_acc > 0
     texture = np.zeros((H, W, 3), dtype=np.float32)
     texture[valid_y[has_color], valid_x[has_color]] = (
@@ -430,20 +740,36 @@ def bake_texture(
     # 对无颜色的有效区域做 inpainting 填充（遮挡区域）
     texture_uint8 = texture.clip(0, 255).astype(np.uint8)
     has_color_img = weight_acc_img(texture_uint8, valid_y, valid_x, has_color, H, W)
-    inpaint_mask  = (valid_mask & ~has_color_img).astype(np.uint8)
-    if inpaint_mask.any():
+    missing_valid_mask = (valid_mask & ~has_color_img).astype(np.uint8)
+    if missing_valid_mask.any():
         # 用有效像素的中位肤色预填充空洞，避免 TELEA 将边界污染色向内扩散
         sampled_colors = texture_uint8[valid_y[has_color], valid_x[has_color]]  # (K, 3)
         if len(sampled_colors) > 0:
             median_skin = np.median(sampled_colors, axis=0).astype(np.uint8)
         else:
             median_skin = np.array([180, 140, 120], dtype=np.uint8)
-        hole_y, hole_x = np.where(inpaint_mask)
+        hole_y, hole_x = np.where(missing_valid_mask)
         texture_uint8[hole_y, hole_x] = median_skin
         # 小半径 inpaint 仅用于平滑预填充边界（不再需要跨越大距离）
-        texture_uint8 = cv2.inpaint(texture_uint8, inpaint_mask * 255, 3, cv2.INPAINT_TELEA)
+        texture_uint8 = cv2.inpaint(texture_uint8, missing_valid_mask * 255, 3, cv2.INPAINT_TELEA)
+    if internal_uv_holes.sum() > 8:
+        texture_uint8 = cv2.inpaint(texture_uint8, internal_uv_holes.astype(np.uint8) * 255, 7, cv2.INPAINT_TELEA)
 
     return texture_uint8
+
+
+def _small_internal_invalid_uv_holes(valid_mask: np.ndarray, max_area: int = 20000) -> np.ndarray:
+    """Find small enclosed UV holes; keep the exterior transparent/black."""
+    invalid = (~valid_mask).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(invalid, 8)
+    holes = np.zeros_like(valid_mask, dtype=bool)
+    h, w = valid_mask.shape
+    for label in range(1, num_labels):
+        x, y, comp_w, comp_h, area = stats[label]
+        touches_border = x == 0 or y == 0 or x + comp_w >= w or y + comp_h >= h
+        if not touches_border and area <= max_area:
+            holes[labels == label] = True
+    return holes
 
 
 def weight_acc_img(texture, vy, vx, has_color, H, W):
@@ -652,6 +978,29 @@ def poisson_seam_fix(
 # GLB 打包
 # ══════════════════════════════════════════════════════════════════════════════
 
+def poisson_seam_fix_local(
+    texture: np.ndarray,
+    valid_mask: np.ndarray,
+    repair_roi: np.ndarray,
+) -> np.ndarray:
+    """Apply seam smoothing only inside a caller-provided repair region."""
+    roi = repair_roi & valid_mask
+    if not roi.any():
+        return texture
+    lab = cv2.cvtColor(texture, cv2.COLOR_RGB2LAB).astype(np.float32)
+    diff_x = np.abs(np.roll(lab, 1, axis=1) - lab).sum(axis=2)
+    diff_y = np.abs(np.roll(lab, 1, axis=0) - lab).sum(axis=2)
+    seam_mask = ((diff_x + diff_y) > 30) & roi
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    seam_dilated = cv2.dilate(seam_mask.astype(np.uint8) * 255, kernel)
+    seam_dilated = (seam_dilated > 0) & roi
+    if not seam_dilated.any():
+        return texture
+    result = cv2.inpaint(texture, seam_dilated.astype(np.uint8) * 255, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    logger.info(f"  Local seam repair: {int(seam_dilated.sum())} pixels")
+    return result
+
+
 def export_glb(
     vertices: np.ndarray,       # (N, 3)
     faces: np.ndarray,          # (F, 3)
@@ -781,7 +1130,8 @@ def run_texture_pipeline(
     unified_texture: Optional[np.ndarray] = None,       # 预融合统一纹理（fallback）
     hires_front_image: Optional[np.ndarray] = None,     # 原始高清正面图（仅正面，旧接口）
     hires_scale_factor: float = 1.0,                     # K 缩放系数（原始分辨率 / 512）
-    hires_images: Optional[Dict[str, np.ndarray]] = None,  # 多视角高清图（最优先）
+    hires_images: Optional[Dict[str, np.ndarray]] = None,  # 多视角高清图（最优先）
+    working_image_size: Optional[int] = None,
 ) -> Path:
     """
     完整纹理融合流程。
@@ -799,17 +1149,44 @@ def run_texture_pipeline(
     """
     output_texture_dir.mkdir(parents=True, exist_ok=True)
     output_mesh_dir.mkdir(parents=True, exist_ok=True)
+    if working_image_size is None:
+        try:
+            from src import config as cfg
+            working_image_size = int(getattr(cfg, "WORK_IMAGE_SIZE", 512))
+        except Exception:
+            working_image_size = 512
 
     # ── 加载 Mesh 和相机 ──────────────────────────────────────────────────
     logger.info("加载 Mesh 和相机参数...")
     vertices, faces, uv_verts, uv_faces = load_mesh_obj(mesh_dir / "face_mesh.obj")
     cameras = load_cameras(mesh_dir / "cameras.json")
+    try:
+        from src import config as cfg
+        enable_uv_hole_fill_faces = bool(getattr(cfg, "ENABLE_UV_HOLE_FILL_FACES", False))
+    except Exception:
+        enable_uv_hole_fill_faces = False
+    if enable_uv_hole_fill_faces:
+        bake_vertices, bake_faces, bake_uv_verts, bake_uv_faces, added_uv_faces = add_uv_hole_fill_faces_for_bake(
+            vertices, faces, uv_verts, uv_faces, tex_size
+        )
+        if added_uv_faces:
+            logger.info(f"  UV hole fill bake mesh: added {added_uv_faces} temporary faces")
+    else:
+        bake_vertices, bake_faces, bake_uv_verts, bake_uv_faces = vertices, faces, uv_verts, uv_faces
+        added_uv_faces = 0
+        logger.info("  UV hole fill bake mesh disabled; internal holes will use texture inpaint")
     logger.info(f"  Mesh: {len(vertices)} 顶点, {len(faces)} 面片, {len(uv_verts)} UV点")
 
     # ── UV 光栅化 ─────────────────────────────────────────────────────────
     logger.info("UV 光栅化...")
-    tri_map, bary_map = rasterize_uv_map(uv_verts, uv_faces, tex_size)
+    tri_map, bary_map = rasterize_uv_map(bake_uv_verts, bake_uv_faces, tex_size)
     valid_mask = tri_map >= 0
+    filled_uv_holes = (tri_map >= len(uv_faces)) if added_uv_faces else _small_internal_invalid_uv_holes(valid_mask)
+    uv_hole_repair_roi = cv2.dilate(
+        filled_uv_holes.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        iterations=4,
+    ).astype(bool) & valid_mask
 
     # ── 纹理烘焙（高清直采 > 统一纹理 > 多视角） ─────────────────────────
     if hires_images is not None:
@@ -835,7 +1212,7 @@ def run_texture_pipeline(
             processed_hires[view_name] = canvas
 
             # 缩放 K 矩阵匹配高清正方形分辨率
-            view_sf = max_sz / 512.0
+            view_sf = max_sz / float(working_image_size)
             cam = cameras[view_name]
             K_h = cam["K"].copy()
             K_h[0, :] *= view_sf   # fx, cx
@@ -854,15 +1231,22 @@ def run_texture_pipeline(
             )
 
         texture = bake_texture(
-            vertices, faces, uv_verts, uv_faces,
+            bake_vertices, bake_faces, bake_uv_verts, bake_uv_faces,
             tri_map, bary_map,
             scaled_cameras,
             processed_hires,
             tex_size,
             face_masks=scaled_masks if scaled_masks else None,
+            force_front_mask=uv_hole_repair_roi,
         )
         logger.info("接缝修复...")
-        texture = poisson_seam_fix(texture, valid_mask)
+        if added_uv_faces:
+            debug_dir = output_texture_dir.parent / "debug" / "uv_hole_fill"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(debug_dir / "before_poisson.png"), cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
+        texture = poisson_seam_fix_local(texture, valid_mask, uv_hole_repair_roi)
+        if added_uv_faces:
+            cv2.imwrite(str(debug_dir / "after_poisson.png"), cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
 
     elif hires_front_image is not None:
         # ── 高清直采模式（绕过 512×512 分辨率瓶颈）────────────────────
@@ -904,7 +1288,7 @@ def run_texture_pipeline(
             logger.info(f"  face_mask 放大: 512×512 → {max_size}×{max_size}")
 
         texture = bake_texture_single(
-            vertices, faces, uv_verts, uv_faces,
+            bake_vertices, bake_faces, bake_uv_verts, bake_uv_faces,
             tri_map, bary_map,
             hires_cam, hires_img,
             tex_size,
@@ -917,7 +1301,7 @@ def run_texture_pipeline(
         logger.info("使用预融合统一纹理（单视角正面投影）...")
         front_cam = cameras.get("front", next(iter(cameras.values())))
         texture = bake_texture_single(
-            vertices, faces, uv_verts, uv_faces,
+            bake_vertices, bake_faces, bake_uv_verts, bake_uv_faces,
             tri_map, bary_map,
             front_cam, unified_texture,
             tex_size,
@@ -931,15 +1315,22 @@ def run_texture_pipeline(
                 logger.warning(f"  相机 [{view_name}] 无对应图像，跳过")
         view_images = {k: images[k] for k in cameras if k in images}
         texture = bake_texture(
-            vertices, faces, uv_verts, uv_faces,
+            bake_vertices, bake_faces, bake_uv_verts, bake_uv_faces,
             tri_map, bary_map,
             cameras, view_images,
             tex_size,
             face_masks=face_masks,
+            force_front_mask=uv_hole_repair_roi,
         )
         # ── 泊松接缝修复 ─────────────────────────────────────────────────
         logger.info("接缝修复...")
-        texture = poisson_seam_fix(texture, valid_mask)
+        if added_uv_faces:
+            debug_dir = output_texture_dir.parent / "debug" / "uv_hole_fill"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(debug_dir / "before_poisson.png"), cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
+        texture = poisson_seam_fix_local(texture, valid_mask, uv_hole_repair_roi)
+        if added_uv_faces:
+            cv2.imwrite(str(debug_dir / "after_poisson.png"), cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
 
     # ── 保存纹理图 ────────────────────────────────────────────────────────
     tex_path = output_texture_dir / f"albedo_{lighting_type}.png"
@@ -958,3 +1349,5 @@ def run_texture_pipeline(
     )
 
     return glb_path
+
+

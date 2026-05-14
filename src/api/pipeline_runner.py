@@ -56,6 +56,16 @@ def _run_pipeline(
         logger.info(f"  [{view}] 已加载: {img_bgr.shape[1]}×{img_bgr.shape[0]}")
 
     # 保存所有视角原始高清图（预处理缩放之前），用于多视角高清直采
+    calibration_intrinsics = None
+    if getattr(cfg, "UNDISTORT_IMAGES", True):
+        progress("calibration", 8, "calibrated undistortion...")
+        from src.module0_intrinsics import undistort_images_with_calibration
+        images, calibration_intrinsics = undistort_images_with_calibration(
+            images,
+            calibration_path=cfg.CAMERA_CALIBRATION_PATH,
+            alpha=cfg.UNDISTORT_ALPHA,
+        )
+
     original_hires = {k: v.copy() for k, v in images.items()}
     original_front = original_hires.get("front", next(iter(original_hires.values())))
 
@@ -65,13 +75,16 @@ def _run_pipeline(
     K = get_intrinsics(
         images=images,
         manual_intrinsics=manual_intrinsics or cfg.MANUAL_INTRINSICS,
+        calibration_path=cfg.CAMERA_CALIBRATION_PATH,
+        calibration_intrinsics=calibration_intrinsics,
+        work_image_size=cfg.WORK_IMAGE_SIZE,
         dust3r_dir=cfg.DUST3R_DIR,
     )
 
     # ── 3. 关键点检测 ────────────────────────────────────────────────────────
     progress("landmarks", 20, "检测面部关键点...")
     from src.module1_preprocess import preprocess_all_views
-    view_data = preprocess_all_views(images)
+    view_data = preprocess_all_views(images, target_size=cfg.WORK_IMAGE_SIZE)
     # 后续所有模块统一使用缩放后的图像（512×512），确保与内参 cx=cy=256 匹配
     images_resized = {k: v["image"] for k, v in view_data.items()}
 
@@ -127,6 +140,7 @@ def _run_pipeline(
         lighting_display_name="白光",
         face_masks=face_masks,
         hires_images=original_hires,
+        working_image_size=cfg.WORK_IMAGE_SIZE,
     )
 
     progress("done", 100, "重建完成")

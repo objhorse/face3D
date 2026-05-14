@@ -10,7 +10,11 @@ logger = logging.getLogger(__name__)
 _PARSING_MODEL = None
 _PARSING_DEVICE = None
 
-TARGET_SIZE = 512
+try:
+    from src import config as cfg
+    TARGET_SIZE = int(getattr(cfg, "WORK_IMAGE_SIZE", 512))
+except Exception:
+    TARGET_SIZE = 512
 FACE_OVAL = [
     10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
     397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
@@ -353,17 +357,18 @@ def _resize_to_target(image: np.ndarray, target: int = TARGET_SIZE) -> np.ndarra
 def preprocess_all_views(
     images: Dict[str, np.ndarray],
     debug_dir: Optional[Path] = None,
+    target_size: int = TARGET_SIZE,
 ) -> Dict[str, dict]:
     results = {}
     for view_name, image in images.items():
         logger.info(f"Preprocess {view_name}, original size {image.shape[1]}x{image.shape[0]}")
         original_image = image
-        scale, _, _, x_off, y_off = _compute_resize_params(original_image.shape, TARGET_SIZE)
+        scale, _, _, x_off, y_off = _compute_resize_params(original_image.shape, target_size)
 
-        # Detect on the original image, then map to the 512 canvas.
+        # Detect on the original image, then map to the working canvas.
         lmks_orig, vis = detect_landmarks_mediapipe(original_image, view_name)
 
-        image = _resize_to_target(original_image, TARGET_SIZE)
+        image = _resize_to_target(original_image, target_size)
         bg_mask = segment_face_black_bg(image)
         parser_mask = segment_face_with_parser(image)
         if parser_mask is not None:

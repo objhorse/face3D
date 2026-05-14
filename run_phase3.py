@@ -40,6 +40,13 @@ def main():
     logger.info("加载原始图像...")
     from src.module1_preprocess import load_images
     images = load_images(cfg.DEFAULT_IMAGE_DIR, cfg.DEFAULT_VIEW_NAMES)
+    if getattr(cfg, "UNDISTORT_IMAGES", True):
+        from src.module0_intrinsics import undistort_images_with_calibration
+        images, _ = undistort_images_with_calibration(
+            images,
+            calibration_path=cfg.CAMERA_CALIBRATION_PATH,
+            alpha=cfg.UNDISTORT_ALPHA,
+        )
 
     # 计算高清 face mask（GrabCut 精确分割，与 hires_images 画布对齐）
     logger.info("计算人脸分割 Mask（GrabCut 模式）...")
@@ -116,6 +123,7 @@ def main():
         lighting_type="white",
         lighting_display_name="白光",
         face_masks=face_masks,
+        working_image_size=cfg.WORK_IMAGE_SIZE,
     )
 
     elapsed = time.time() - t0

@@ -1,0 +1,1107 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-05-12T21:46:59",
+  "captures_dir": "captures",
+  "reference_camera": "camera2",
+  "units": "meters",
+  "board": {
+    "type": "ChArUco",
+    "squares_x": 11,
+    "squares_y": 8,
+    "square_size_m": 0.015,
+    "marker_size_m": 0.011,
+    "dictionary": "DICT_4X4_50",
+    "legacy_pattern": true,
+    "source_pdf": "calib.io_charuco_200x150_8x11_15_11_DICT_4X4.pdf"
+  },
+  "view_aliases": {
+    "camera1": "left",
+    "camera2": "front",
+    "camera3": "right"
+  },
+  "cameras": {
+    "camera1": {
+      "view": "left",
+      "image_size": [
+        4896,
+        3672
+      ],
+      "rms": 1.335650409115262,
+      "K": [
+        [
+          3316.914361376963,
+          0.0,
+          2574.4573295885825
+        ],
+        [
+          0.0,
+          3324.66826249482,
+          1806.484963057515
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "dist_coeffs": [
+        0.07774554481942056,
+        -0.15999886152968226,
+        -0.006003351302916889,
+        -0.0006479263053866451,
+        0.08536890157148101
+      ],
+      "usable_frames": 37,
+      "rig_to_camera": {
+        "R": [
+          [
+            0.6829704720539159,
+            -0.0049128445024413684,
+            -0.7304294615233877
+          ],
+          [
+            0.001560828430261738,
+            0.9999849140426829,
+            -0.005266450575042552
+          ],
+          [
+            0.730444315548463,
+            0.002456755165438953,
+            0.6829678368978985
+          ]
+        ],
+        "t": [
+          0.130874853956298,
+          0.004092720457990802,
+          0.09590344498638143
+        ]
+      },
+      "camera_to_rig": {
+        "R": [
+          [
+            0.6829704720539159,
+            0.001560828430261738,
+            0.730444315548463
+          ],
+          [
+            -0.0049128445024413684,
+            0.9999849140426829,
+            0.002456755165438953
+          ],
+          [
+            -0.7304294615233877,
+            -0.005266450575042552,
+            0.6829678368978985
+          ]
+        ],
+        "t": [
+          -0.15944217505278513,
+          -0.0036853021924713285,
+          0.030117434838854706
+        ]
+      },
+      "extrinsic_source": "stereo:camera2->camera1",
+      "stereo_rms": 44.78216314613298
+    },
+    "camera2": {
+      "view": "front",
+      "image_size": [
+        4896,
+        3672
+      ],
+      "rms": 1.1660322353415145,
+      "K": [
+        [
+          3367.7251934734118,
+          0.0,
+          2319.6806723039927
+        ],
+        [
+          0.0,
+          3361.6026022218643,
+          1625.7771639896223
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "dist_coeffs": [
+        0.07008730654758527,
+        -0.12755399704546258,
+        -0.0035700598038594347,
+        -0.00021763406839417915,
+        0.06022067969423797
+      ],
+      "usable_frames": 36,
+      "rig_to_camera": {
+        "R": [
+          [
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "t": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "camera_to_rig": {
+        "R": [
+          [
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            1.0
+          ]
+        ],
+        "t": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "extrinsic_source": "reference",
+      "stereo_rms": 0.0
+    },
+    "camera3": {
+      "view": "right",
+      "image_size": [
+        4896,
+        3672
+      ],
+      "rms": 1.2276191436248067,
+      "K": [
+        [
+          3345.218628469387,
+          0.0,
+          2341.8916596808845
+        ],
+        [
+          0.0,
+          3354.49797113585,
+          1800.8008041631558
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "dist_coeffs": [
+        0.07993484588919485,
+        -0.14571753331700887,
+        -0.004059505613853693,
+        -0.0006988151531584266,
+        0.07569367262209536
+      ],
+      "usable_frames": 37,
+      "rig_to_camera": {
+        "R": [
+          [
+            0.6736880103011099,
+            -0.005751694993490581,
+            0.7389934930574379
+          ],
+          [
+            0.017217661610104094,
+            0.9998204412956448,
+            -0.007914372752270697
+          ],
+          [
+            -0.7388152792851618,
+            0.018055557927790337,
+            0.6736660744929232
+          ]
+        ],
+        "t": [
+          -0.12509496878770798,
+          0.005258182026255494,
+          0.10752019572272775
+        ]
+      },
+      "camera_to_rig": {
+        "R": [
+          [
+            0.6736880103011099,
+            0.017217661610104094,
+            -0.7388152792851618
+          ],
+          [
+            -0.005751694993490581,
+            0.9998204412956448,
+            0.018055557927790337
+          ],
+          [
+            0.7389934930574379,
+            -0.007914372752270697,
+            0.6736660744929232
+          ]
+        ],
+        "t": [
+          0.1636220104541404,
+          -0.007918083101869783,
+          0.020053274979653785
+        ]
+      },
+      "extrinsic_source": "stereo:camera2->camera3",
+      "stereo_rms": 49.52691873346765
+    }
+  },
+  "stereo_pairs": {
+    "camera2_camera1": {
+      "rms": 44.78216314613298,
+      "frames": [
+        "20260511_202522.jpg",
+        "20260511_202534.jpg",
+        "20260511_202547.jpg",
+        "20260511_202559.jpg",
+        "20260511_202624.jpg",
+        "20260511_202637.jpg",
+        "20260511_202649.jpg",
+        "20260511_202702.jpg",
+        "20260511_203004.jpg",
+        "20260511_203016.jpg",
+        "20260511_203029.jpg",
+        "20260511_203041.jpg",
+        "20260511_203054.jpg",
+        "20260511_203106.jpg",
+        "20260511_203119.jpg",
+        "20260511_203131.jpg",
+        "20260511_203143.jpg",
+        "20260511_203155.jpg",
+        "20260511_203208.jpg",
+        "20260511_203220.jpg",
+        "20260511_203232.jpg",
+        "20260511_203245.jpg",
+        "20260511_203258.jpg",
+        "20260511_203310.jpg",
+        "20260511_203323.jpg",
+        "20260511_203335.jpg",
+        "20260511_203348.jpg",
+        "20260511_203400.jpg",
+        "20260511_204343.jpg",
+        "20260511_204355.jpg",
+        "20260511_204407.jpg",
+        "20260511_204419.jpg",
+        "20260511_204432.jpg",
+        "20260511_204444.jpg",
+        "20260511_204457.jpg",
+        "20260511_204509.jpg"
+      ],
+      "R_a_to_b": [
+        [
+          0.6829704720539159,
+          -0.0049128445024413684,
+          -0.7304294615233877
+        ],
+        [
+          0.001560828430261738,
+          0.9999849140426829,
+          -0.005266450575042552
+        ],
+        [
+          0.730444315548463,
+          0.002456755165438953,
+          0.6829678368978985
+        ]
+      ],
+      "t_a_to_b": [
+        0.130874853956298,
+        0.004092720457990802,
+        0.09590344498638143
+      ]
+    },
+    "camera2_camera3": {
+      "rms": 49.52691873346765,
+      "frames": [
+        "20260511_202522.jpg",
+        "20260511_202534.jpg",
+        "20260511_202547.jpg",
+        "20260511_202559.jpg",
+        "20260511_202624.jpg",
+        "20260511_202637.jpg",
+        "20260511_202649.jpg",
+        "20260511_202702.jpg",
+        "20260511_203004.jpg",
+        "20260511_203016.jpg",
+        "20260511_203029.jpg",
+        "20260511_203041.jpg",
+        "20260511_203054.jpg",
+        "20260511_203106.jpg",
+        "20260511_203119.jpg",
+        "20260511_203131.jpg",
+        "20260511_203143.jpg",
+        "20260511_203155.jpg",
+        "20260511_203208.jpg",
+        "20260511_203220.jpg",
+        "20260511_203232.jpg",
+        "20260511_203245.jpg",
+        "20260511_203258.jpg",
+        "20260511_203310.jpg",
+        "20260511_203323.jpg",
+        "20260511_203335.jpg",
+        "20260511_203348.jpg",
+        "20260511_203400.jpg",
+        "20260511_204343.jpg",
+        "20260511_204355.jpg",
+        "20260511_204407.jpg",
+        "20260511_204419.jpg",
+        "20260511_204432.jpg",
+        "20260511_204444.jpg",
+        "20260511_204457.jpg",
+        "20260511_204509.jpg"
+      ],
+      "R_a_to_b": [
+        [
+          0.6736880103011099,
+          -0.005751694993490581,
+          0.7389934930574379
+        ],
+        [
+          0.017217661610104094,
+          0.9998204412956448,
+          -0.007914372752270697
+        ],
+        [
+          -0.7388152792851618,
+          0.018055557927790337,
+          0.6736660744929232
+        ]
+      ],
+      "t_a_to_b": [
+        -0.12509496878770798,
+        0.005258182026255494,
+        0.10752019572272775
+      ]
+    }
+  },
+  "pose_consistency": {
+    "camera2_camera1": {
+      "reference_sample": "20260511_202522.jpg",
+      "translation_mean_m": [
+        0.1316766976879153,
+        0.004197444485240116,
+        0.09852909073194185
+      ],
+      "translation_std_m": [
+        0.0076235890914998624,
+        0.014392213956315493,
+        0.01067023020592125
+      ],
+      "rotation_delta_mean_deg": 3.3587773923314748,
+      "rotation_delta_max_deg": 19.248261397524068
+    },
+    "camera2_camera3": {
+      "reference_sample": "20260511_202522.jpg",
+      "translation_mean_m": [
+        -0.12609940966650474,
+        0.001279080888958035,
+        0.10436720803284423
+      ],
+      "translation_std_m": [
+        0.008500077169625836,
+        0.009014197828603366,
+        0.006178054737851772
+      ],
+      "rotation_delta_mean_deg": 2.6369497831590603,
+      "rotation_delta_max_deg": 9.839768330132518
+    }
+  },
+  "detection_summary": {
+    "camera1": [
+      {
+        "file": "20260511_202522.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202534.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202547.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202559.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202612.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202624.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202637.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202649.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202702.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203004.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203016.jpg",
+        "markers": 41,
+        "charuco_corners": 65,
+        "usable": true
+      },
+      {
+        "file": "20260511_203029.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203041.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203054.jpg",
+        "markers": 39,
+        "charuco_corners": 62,
+        "usable": true
+      },
+      {
+        "file": "20260511_203106.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203119.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203131.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203143.jpg",
+        "markers": 37,
+        "charuco_corners": 58,
+        "usable": true
+      },
+      {
+        "file": "20260511_203155.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203208.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203220.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203232.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203245.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203258.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203310.jpg",
+        "markers": 43,
+        "charuco_corners": 69,
+        "usable": true
+      },
+      {
+        "file": "20260511_203323.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203335.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203348.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203400.jpg",
+        "markers": 41,
+        "charuco_corners": 60,
+        "usable": true
+      },
+      {
+        "file": "20260511_204343.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204355.jpg",
+        "markers": 34,
+        "charuco_corners": 52,
+        "usable": true
+      },
+      {
+        "file": "20260511_204407.jpg",
+        "markers": 16,
+        "charuco_corners": 21,
+        "usable": true
+      },
+      {
+        "file": "20260511_204419.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204432.jpg",
+        "markers": 28,
+        "charuco_corners": 42,
+        "usable": true
+      },
+      {
+        "file": "20260511_204444.jpg",
+        "markers": 24,
+        "charuco_corners": 35,
+        "usable": true
+      },
+      {
+        "file": "20260511_204457.jpg",
+        "markers": 43,
+        "charuco_corners": 69,
+        "usable": true
+      },
+      {
+        "file": "20260511_204509.jpg",
+        "markers": 43,
+        "charuco_corners": 69,
+        "usable": true
+      }
+    ],
+    "camera2": [
+      {
+        "file": "20260511_202522.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202534.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202547.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202559.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202612.jpg",
+        "markers": 41,
+        "charuco_corners": 0,
+        "usable": false
+      },
+      {
+        "file": "20260511_202624.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202637.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202649.jpg",
+        "markers": 42,
+        "charuco_corners": 64,
+        "usable": true
+      },
+      {
+        "file": "20260511_202702.jpg",
+        "markers": 42,
+        "charuco_corners": 64,
+        "usable": true
+      },
+      {
+        "file": "20260511_203004.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203016.jpg",
+        "markers": 39,
+        "charuco_corners": 61,
+        "usable": true
+      },
+      {
+        "file": "20260511_203029.jpg",
+        "markers": 41,
+        "charuco_corners": 64,
+        "usable": true
+      },
+      {
+        "file": "20260511_203041.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203054.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203106.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203119.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203131.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203143.jpg",
+        "markers": 38,
+        "charuco_corners": 60,
+        "usable": true
+      },
+      {
+        "file": "20260511_203155.jpg",
+        "markers": 42,
+        "charuco_corners": 67,
+        "usable": true
+      },
+      {
+        "file": "20260511_203208.jpg",
+        "markers": 37,
+        "charuco_corners": 57,
+        "usable": true
+      },
+      {
+        "file": "20260511_203220.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203232.jpg",
+        "markers": 33,
+        "charuco_corners": 51,
+        "usable": true
+      },
+      {
+        "file": "20260511_203245.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203258.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203310.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203323.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203335.jpg",
+        "markers": 43,
+        "charuco_corners": 68,
+        "usable": true
+      },
+      {
+        "file": "20260511_203348.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203400.jpg",
+        "markers": 42,
+        "charuco_corners": 67,
+        "usable": true
+      },
+      {
+        "file": "20260511_204343.jpg",
+        "markers": 33,
+        "charuco_corners": 50,
+        "usable": true
+      },
+      {
+        "file": "20260511_204355.jpg",
+        "markers": 22,
+        "charuco_corners": 30,
+        "usable": true
+      },
+      {
+        "file": "20260511_204407.jpg",
+        "markers": 28,
+        "charuco_corners": 40,
+        "usable": true
+      },
+      {
+        "file": "20260511_204419.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204432.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204444.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204457.jpg",
+        "markers": 32,
+        "charuco_corners": 36,
+        "usable": true
+      },
+      {
+        "file": "20260511_204509.jpg",
+        "markers": 37,
+        "charuco_corners": 56,
+        "usable": true
+      }
+    ],
+    "camera3": [
+      {
+        "file": "20260511_202522.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202534.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202547.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202559.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202612.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202624.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202637.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202649.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_202702.jpg",
+        "markers": 31,
+        "charuco_corners": 48,
+        "usable": true
+      },
+      {
+        "file": "20260511_203004.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203016.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203029.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203041.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203054.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203106.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203119.jpg",
+        "markers": 36,
+        "charuco_corners": 56,
+        "usable": true
+      },
+      {
+        "file": "20260511_203131.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203143.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203155.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203208.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203220.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203232.jpg",
+        "markers": 43,
+        "charuco_corners": 68,
+        "usable": true
+      },
+      {
+        "file": "20260511_203245.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203258.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203310.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203323.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_203335.jpg",
+        "markers": 31,
+        "charuco_corners": 48,
+        "usable": true
+      },
+      {
+        "file": "20260511_203348.jpg",
+        "markers": 41,
+        "charuco_corners": 65,
+        "usable": true
+      },
+      {
+        "file": "20260511_203400.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204343.jpg",
+        "markers": 16,
+        "charuco_corners": 22,
+        "usable": true
+      },
+      {
+        "file": "20260511_204355.jpg",
+        "markers": 31,
+        "charuco_corners": 46,
+        "usable": true
+      },
+      {
+        "file": "20260511_204407.jpg",
+        "markers": 43,
+        "charuco_corners": 68,
+        "usable": true
+      },
+      {
+        "file": "20260511_204419.jpg",
+        "markers": 21,
+        "charuco_corners": 30,
+        "usable": true
+      },
+      {
+        "file": "20260511_204432.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204444.jpg",
+        "markers": 44,
+        "charuco_corners": 70,
+        "usable": true
+      },
+      {
+        "file": "20260511_204457.jpg",
+        "markers": 40,
+        "charuco_corners": 63,
+        "usable": true
+      },
+      {
+        "file": "20260511_204509.jpg",
+        "markers": 12,
+        "charuco_corners": 15,
+        "usable": true
+      }
+    ]
+  }
+}
