@@ -35,6 +35,9 @@ USE_CAMERA_CALIBRATION = True
 UNDISTORT_IMAGES = True
 UNDISTORT_ALPHA = 0.0
 ENABLE_UV_HOLE_FILL_FACES = True
+ENABLE_VISIBLE_FACE_CROP = True
+VISIBLE_FACE_CROP_DILATE_RINGS = 2
+VISIBLE_FACE_CROP_Z_TOL = 0.006
 TEST_DATA_DIR       = OUTPUT_DIR / "test_data"   # generate_test_data.py 输出
 
 # ── 输入图像命名约定 ─────────────────────────────────────────────────────

@@ -18,6 +18,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src import config as cfg
+from src.coordinates import (
+    camera_center_for_texture_visibility,
+    project_texture_points_to_image,
+)
 from src.module3_texture import (
     _bary_batch,
     _render_camera_depth,
@@ -151,19 +155,10 @@ def main() -> None:
         image = padded[view_name]
         h_img, w_img = image.shape[:2]
 
-        pts_proj = pts_3d.copy()
-        pts_proj[:, 1] *= -1
-        v_cam = (R @ pts_proj.T + t[:, None]).T
-        z = v_cam[:, 2]
-        front = z > 1e-4
-        proj = np.zeros((len(valid_y), 2), dtype=np.float32)
-        proj[front, 0] = K[0, 0] * v_cam[front, 0] / z[front] + K[0, 2]
-        proj[front, 1] = K[1, 1] * v_cam[front, 1] / z[front] + K[1, 2]
+        v_cam, z, proj, front = project_texture_points_to_image(pts_3d, K, R, t)
         in_img = front & (proj[:, 0] >= 0) & (proj[:, 0] < w_img - 1) & (proj[:, 1] >= 0) & (proj[:, 1] < h_img - 1)
 
-        cam_center_proj = -R.T @ t
-        cam_center = cam_center_proj.copy()
-        cam_center[1] *= -1
+        cam_center = camera_center_for_texture_visibility(R, t)
         view_dirs = cam_center - pts_3d
         view_dirs /= np.clip(np.linalg.norm(view_dirs, axis=1, keepdims=True), 1e-8, None)
         cosines = np.sum(pt_normals * view_dirs, axis=1)

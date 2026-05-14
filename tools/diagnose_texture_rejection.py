@@ -20,6 +20,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src import config as cfg  # noqa: E402
+from src.coordinates import (  # noqa: E402
+    camera_center_for_texture_visibility,
+    project_texture_points_to_image,
+)
 from src.module3_texture import (  # noqa: E402
     _render_camera_depth,
     _small_internal_invalid_uv_holes,
@@ -57,6 +61,36 @@ def save_rgb(path: Path, image: np.ndarray) -> None:
 def save_gray(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), image)
+
+
+def save_rgb_pair(
+    paths: Dict[str, Path],
+    label: str,
+    image: np.ndarray,
+    raw_path: Path,
+    include_flipped: bool = True,
+) -> None:
+    save_rgb(raw_path, image)
+    paths[f"{label} raw UV"] = raw_path
+    if include_flipped:
+        flipped_path = raw_path.with_name(raw_path.stem + "_vflipped" + raw_path.suffix)
+        save_rgb(flipped_path, np.flipud(image))
+        paths[f"{label} V-flipped"] = flipped_path
+
+
+def save_gray_pair(
+    paths: Dict[str, Path],
+    label: str,
+    image: np.ndarray,
+    raw_path: Path,
+    include_flipped: bool = True,
+) -> None:
+    save_gray(raw_path, image)
+    paths[f"{label} raw UV"] = raw_path
+    if include_flipped:
+        flipped_path = raw_path.with_name(raw_path.stem + "_vflipped" + raw_path.suffix)
+        save_gray(flipped_path, np.flipud(image))
+        paths[f"{label} V-flipped"] = flipped_path
 
 
 def atlas_from_valid(valid_y: np.ndarray, valid_x: np.ndarray, values: np.ndarray) -> np.ndarray:
@@ -172,6 +206,12 @@ def colorize_combined(combined: np.ndarray, valid_y: np.ndarray, valid_x: np.nda
     return out
 
 
+def mask_rgb_outside(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    out = image.copy()
+    out[~mask] = 0
+    return out
+
+
 def count_keys(values: np.ndarray, keys: list[str], selector: np.ndarray | None = None) -> Dict[str, int]:
     if selector is None:
         selector = np.ones(len(values), dtype=bool)
@@ -250,23 +290,14 @@ def main() -> None:
         h_img, w_img = image.shape[:2]
         k, r, t = cam["K"], cam["R"], cam["t"]
 
-        pts_proj = pts_3d.copy()
-        pts_proj[:, 1] *= -1
-        v_cam = (r @ pts_proj.T + t[:, None]).T
-        z = v_cam[:, 2]
-        front = z > 1e-4
-        proj = np.zeros((len(valid_y), 2), dtype=np.float32)
-        proj[front, 0] = k[0, 0] * v_cam[front, 0] / z[front] + k[0, 2]
-        proj[front, 1] = k[1, 1] * v_cam[front, 1] / z[front] + k[1, 2]
+        v_cam, z, proj, front = project_texture_points_to_image(pts_3d, k, r, t)
         in_img = front & (proj[:, 0] >= 0) & (proj[:, 0] < w_img - 1) & (proj[:, 1] >= 0) & (proj[:, 1] < h_img - 1)
 
         px_u = np.clip(proj[:, 0].astype(int), 0, w_img - 1)
         px_v = np.clip(proj[:, 1].astype(int), 0, h_img - 1)
         in_mask = mask[px_v, px_u] > 127
 
-        cam_center_proj = -r.T @ t
-        cam_center = cam_center_proj.copy()
-        cam_center[1] *= -1
+        cam_center = camera_center_for_texture_visibility(r, t)
         view_dirs = cam_center - pts_3d
         view_dirs /= np.clip(np.linalg.norm(view_dirs, axis=1, keepdims=True), 1e-8, None)
         cosines = np.sum(pt_normals * view_dirs, axis=1)
@@ -327,9 +358,8 @@ def main() -> None:
             "mesh_pixels_missing_from_face_mask": int((sil_bool & ~mask_bool).sum()),
         }
 
-        reason_path = OUT_DIR / f"{view_name}_reject_reason_uv.png"
-        save_rgb(reason_path, colorize_reason(reason, valid_y, valid_x))
-        contact_paths[f"{view_name} reject"] = reason_path
+        reason_img = colorize_reason(reason, valid_y, valid_x)
+        save_rgb_pair(contact_paths, f"{view_name} reject", reason_img, OUT_DIR / f"{view_name}_reject_reason_uv.png")
 
         overlay_path = OUT_DIR / f"{view_name}_projection_reason_overlay.jpg"
         draw_projected_reason_overlay(image, mask, mesh_silhouette, proj, reason, reason_code, overlay_path)
@@ -352,6 +382,10 @@ def main() -> None:
         any_normal_ok |= m["normal_ok"]
         any_z_ok |= m["z_ok"]
 
+    face_candidate_roi = any_in_mask
+    face_candidate_roi_img = np.zeros((TEX_SIZE, TEX_SIZE), dtype=bool)
+    face_candidate_roi_img[valid_y[face_candidate_roi], valid_x[face_candidate_roi]] = True
+
     combined = np.full(len(valid_y), "sampled", dtype=object)
     combined[unsampled & ~any_in_img] = "no_view_projects_inside_image"
     combined[unsampled & any_in_img & ~any_in_mask] = "face_mask_rejects_all_candidate_views"
@@ -373,29 +407,41 @@ def main() -> None:
 
     center_unsampled_selector = center_face & unsampled
     hole_roi_selector = force_front & unsampled
+    face_candidate_unsampled_selector = face_candidate_roi & unsampled
 
     unsampled_atlas = np.zeros((TEX_SIZE, TEX_SIZE), dtype=np.uint8)
     unsampled_atlas[valid_y[unsampled], valid_x[unsampled]] = 255
-    save_gray(OUT_DIR / "combined_unsampled_holes.png", unsampled_atlas)
-    contact_paths["combined holes"] = OUT_DIR / "combined_unsampled_holes.png"
+    save_gray_pair(contact_paths, "combined holes", unsampled_atlas, OUT_DIR / "combined_unsampled_holes.png")
 
     combined_reason_path = OUT_DIR / "combined_unsampled_root_cause_uv.png"
-    save_rgb(combined_reason_path, colorize_combined(combined, valid_y, valid_x))
-    contact_paths["combined reasons"] = combined_reason_path
+    combined_reason_img = colorize_combined(combined, valid_y, valid_x)
+    save_rgb_pair(contact_paths, "combined reasons", combined_reason_img, combined_reason_path)
+
+    roi_reason_path = OUT_DIR / "combined_unsampled_root_cause_face_candidate_roi.png"
+    save_rgb_pair(
+        contact_paths,
+        "face ROI reasons",
+        mask_rgb_outside(combined_reason_img, face_candidate_roi_img),
+        roi_reason_path,
+    )
 
     view_count = np.zeros(len(valid_y), dtype=np.uint8)
     for accepted in accepted_by_view.values():
         view_count += accepted.astype(np.uint8)
-    save_gray(OUT_DIR / "combined_sample_count.png", atlas_from_valid(valid_y, valid_x, np.clip(view_count * 85, 0, 255)))
-    contact_paths["sample count"] = OUT_DIR / "combined_sample_count.png"
+    save_gray_pair(
+        contact_paths,
+        "sample count",
+        atlas_from_valid(valid_y, valid_x, np.clip(view_count * 85, 0, 255)),
+        OUT_DIR / "combined_sample_count.png",
+    )
 
     hole_img = np.zeros((TEX_SIZE, TEX_SIZE), dtype=np.uint8)
     hole_img[internal_holes_original] = 255
-    save_gray(OUT_DIR / "original_internal_uv_holes.png", hole_img)
-    contact_paths["original UV holes"] = OUT_DIR / "original_internal_uv_holes.png"
+    save_gray_pair(contact_paths, "original UV holes", hole_img, OUT_DIR / "original_internal_uv_holes.png")
 
     summary = {
         "tex_size": TEX_SIZE,
+        "display_note": "raw UV images use the exact texture/GLB coordinate convention; *_vflipped files are visual aids only and are not used by the pipeline.",
         "uv_hole_fill_faces_enabled": enable_fill,
         "uv_hole_fill_faces_added": int(added_faces),
         "valid_texels_current_bake": int(valid_mask.sum()),
@@ -414,6 +460,16 @@ def main() -> None:
             combined,
             combined_keys,
             hole_roi_selector,
+        ),
+        "combined_unsampled_root_cause_counts_face_candidate_roi": count_keys(
+            combined,
+            combined_keys,
+            face_candidate_unsampled_selector,
+        ),
+        "face_candidate_roi_texels": int(face_candidate_roi.sum()),
+        "face_candidate_roi_unsampled_texels": int(face_candidate_unsampled_selector.sum()),
+        "face_candidate_roi_unsampled_percent": float(
+            face_candidate_unsampled_selector.sum() * 100.0 / max(int(face_candidate_roi.sum()), 1)
         ),
         "views": view_summary,
     }

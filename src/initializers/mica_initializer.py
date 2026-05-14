@@ -72,6 +72,10 @@ def get_mica_shape(
         return np.zeros(n_shape, dtype=np.float32), False
 
     shape_fused = np.mean(shape_candidates, axis=0).astype(np.float32)
+    if not np.isfinite(shape_fused).all():
+        logger.warning("MICA 融合结果含 NaN，回退到零初始化")
+        return np.zeros(n_shape, dtype=np.float32), False
+
     logger.info(
         f"MICA 共享形状融合: {len(shape_candidates)} 视角均值, "
         f"norm={float(np.linalg.norm(shape_fused)):.4f}"
@@ -148,6 +152,9 @@ def _run_mica_single(model, app, img_rgb: np.ndarray, device: str, n_shape: int)
         opdict = model.decode(codedict)
 
     shape_np = opdict["pred_shape_code"].squeeze(0).cpu().numpy().flatten()
+
+    if not np.isfinite(shape_np).all():
+        raise RuntimeError("MICA 输出包含 NaN/Inf（可能权重未加载），跳过该视角")
 
     if len(shape_np) >= n_shape:
         return shape_np[:n_shape].astype(np.float32)

@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from src.coordinates import flame_points_to_opencv_world
+
 logger = logging.getLogger(__name__)
 
 _PNP_STABLE_IDX = np.arange(27, 68, dtype=np.int32)
@@ -57,8 +59,7 @@ def fa_pose_from_lmk(
     K: np.ndarray,             # (3, 3)
 ) -> Tuple[np.ndarray, np.ndarray]:
     """PnP pose estimation from 2D-3D landmark correspondences."""
-    pts3d = flame_68_3d.copy().astype(np.float64)
-    pts3d[:, 1] *= -1  # FLAME Y-up → OpenCV Y-down
+    pts3d = flame_points_to_opencv_world(flame_68_3d).astype(np.float64)
 
     try:
         success, rvec, tvec, _ = cv2.solvePnPRansac(

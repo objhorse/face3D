@@ -305,6 +305,19 @@ async def delete_session(session_id: int, db: AsyncSession = Depends(get_db)):
 # REST 端点：手动相机内参
 # ══════════════════════════════════════════════════════════════════════════════
 
+@app.get("/api/calibration", status_code=200)
+async def get_calibration():
+    path = ROOT / "config" / "camera_calibration.json"
+    file_calibration = None
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            file_calibration = json.load(f)
+    return {
+        "manual_intrinsics": _manual_intrinsics,
+        "file_calibration": file_calibration,
+    }
+
+
 @app.post("/api/calibration", status_code=200)
 async def set_calibration(req: CalibrationRequest):
     """

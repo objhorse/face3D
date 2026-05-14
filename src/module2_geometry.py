@@ -26,6 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 
+from src.coordinates import flame_points_to_opencv_world, image_uv_to_obj_uv
+
 logger = logging.getLogger(__name__)
 
 _PNP_STABLE_IDX = np.arange(27, 68, dtype=np.int32)
@@ -292,9 +294,8 @@ def estimate_pose_from_landmarks_pnp(
     FLAME 坐标系 Y 轴朝上，OpenCV/图像 Y 轴朝下，PnP 前需翻转。
     同时检测退化解（t_z ≤ 0）并回退到基于尺寸的估计。
     """
-    # FLAME Y 轴翻转以匹配 OpenCV 约定（Y 朝下）
-    pts3d = lmks_3d_model.copy().astype(np.float64)
-    pts3d[:, 1] *= -1
+    # PnP expects OpenCV camera convention (Y down); FLAME stores Y up.
+    pts3d = flame_points_to_opencv_world(lmks_3d_model).astype(np.float64)
 
     try:
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -896,8 +897,8 @@ def export_mesh_obj(
         f.write("# 3D Face Reconstruction - FLAME Mesh\n")
         for v in vertices:
             f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-        for uv in uv_verts:
-            f.write(f"vt {uv[0]:.6f} {1.0 - uv[1]:.6f}\n")   # 翻转V轴（OBJ约定）
+        for uv in image_uv_to_obj_uv(uv_verts):
+            f.write(f"vt {uv[0]:.6f} {uv[1]:.6f}\n")
         for n in normals:
             f.write(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
         # 面片：几何/UV/法线（法线索引与几何顶点索引相同）
@@ -1020,6 +1021,10 @@ def run_geometry_reconstruction(
 
     # ── 保存初始形状 debug ────────────────────────────────────────────────
     init_shape = init_result["shape"]
+    if not np.isfinite(init_shape).all():
+        logger.warning("init_shape 含 NaN/Inf，重置为零向量（中性脸初始化）")
+        init_shape = np.zeros_like(init_shape)
+        init_result["shape"] = init_shape
     _save_init_shape_debug(init_result, debug_dir)
 
     # ── 为每个视角准备优化输入，并合并初始化结果 ───────────────────────────

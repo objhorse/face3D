@@ -7,9 +7,13 @@ tools/generate_test_data.py — 用 FLAME 模型生成合成测试数据
 输出目录（每个 subject）:
     output/test_data/subject_{i}/
     ├── images/
-    │   ├── left.jpg    # 左侧 45° 视角
+    │   ├── left.jpg    # 左侧 45° 视角（带肤色纹理）
     │   ├── front.jpg   # 正面视角
     │   └── right.jpg   # 右侧 45° 视角
+    ├── depth/
+    │   ├── left.npy    # pyrender 深度缓冲区（米，float32，inf=背景）
+    │   ├── front.npy
+    │   └── right.npy
     ├── ground_truth/
     │   ├── mesh.obj    # FLAME 网格（用于评估）
     │   └── flame_params.npz  # shape/exp 参数（用于参数对比）
@@ -103,38 +107,83 @@ def make_camera_pose(azimuth_deg: float, distance: float):
     return pose
 
 
+def compute_vertex_colors(vertices: np.ndarray) -> np.ndarray:
+    """
+    根据顶点3D位置计算每顶点颜色，模拟基础肤色 + 嘴唇 + 眉毛。
+    FLAME 坐标系：Y轴朝上，Z轴朝前（鼻尖为+Z）。
+    阈值由 FLAME generic_model.pkl 模板顶点实测得出。
+    返回 (N, 4) uint8 RGBA。
+    """
+    n = len(vertices)
+    # 基础肤色（中性偏暖）
+    colors = np.tile([204, 153, 117, 255], (n, 1)).astype(np.uint8)
+
+    x = vertices[:, 0]
+    y = vertices[:, 1]
+    z = vertices[:, 2]
+
+    # 嘴唇：仅最前突部分（Z>0.058），127顶点
+    lip = (z > 0.058) & (np.abs(x) < 0.028) & (y < -0.015) & (y > -0.060)
+    colors[lip] = [190, 100, 90, 255]
+
+    # 眉毛：左右分别限定，各约25-40顶点
+    brow = (
+        (np.abs(x) > 0.012) & (np.abs(x) < 0.048) &
+        (y > 0.025) & (y < 0.065) &
+        (z > 0.038) & (z < 0.050)
+    )
+    colors[brow] = [75, 52, 38, 255]
+
+    return colors
+
+
 def render_views(vertices: np.ndarray, faces: np.ndarray):
     """
-    用 pyrender 渲染三视角，返回 {view_name: (H,W,3) uint8 RGB}
+    用 pyrender 渲染三视角。
+    返回:
+        colors: {view_name: (H,W,3) uint8 RGB}
+        depths: {view_name: (H,W) float32，单位米，背景为 inf}
+        K:      (3,3) 内参矩阵
     """
     import pyrender
     import trimesh
 
-    # 构建 pyrender mesh（自动计算法线）
-    tri = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    # 顶点颜色：肤色 + 嘴唇 + 眉毛
+    vertex_colors = compute_vertex_colors(vertices)
+    tri = trimesh.Trimesh(vertices=vertices, faces=faces,
+                          vertex_colors=vertex_colors, process=False)
     mesh_pr = pyrender.Mesh.from_trimesh(tri, smooth=True)
 
     K = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
     camera = pyrender.IntrinsicsCamera(fx=FX, fy=FY, cx=CX, cy=CY,
-                                        znear=0.01, zfar=10.0)
-    light = pyrender.DirectionalLight(color=np.ones(3), intensity=3.0)
+                                       znear=0.01, zfar=10.0)
 
     renderer = pyrender.OffscreenRenderer(IMG_W, IMG_H)
-    results = {}
+    color_results = {}
+    depth_results = {}
 
     for view_name, azimuth in VIEW_AZIMUTHS.items():
-        scene = pyrender.Scene(bg_color=[0, 0, 0, 255], ambient_light=[0.3, 0.3, 0.3])
+        scene = pyrender.Scene(bg_color=[0, 0, 0, 255], ambient_light=[0.4, 0.4, 0.4])
         scene.add(mesh_pr)
 
         cam_pose = make_camera_pose(azimuth, CAM_DISTANCE)
         scene.add(camera, pose=cam_pose)
-        scene.add(light, pose=cam_pose)   # 光源跟相机走
 
-        color, _ = renderer.render(scene)
-        results[view_name] = color   # (H, W, 3) uint8
+        # 主光：跟相机同向（正脸补光）
+        scene.add(pyrender.DirectionalLight(color=np.ones(3), intensity=2.5), pose=cam_pose)
+        # 补光：从右上45°，防止另一侧过暗
+        fill_pose = make_camera_pose(azimuth + 40.0, CAM_DISTANCE)
+        scene.add(pyrender.DirectionalLight(color=np.ones(3), intensity=1.0), pose=fill_pose)
+
+        color, raw_depth = renderer.render(scene)
+        color_results[view_name] = color  # (H, W, 3) uint8
+
+        # pyrender 已直接返回米单位深度；0 表示背景，置为 inf
+        depth_m = np.where(raw_depth > 0, raw_depth, np.inf).astype(np.float32)
+        depth_results[view_name] = depth_m
 
     renderer.delete()
-    return results, K
+    return color_results, depth_results, K
 
 
 def save_cameras_json(out_path: Path, K: np.ndarray):
@@ -162,20 +211,25 @@ def generate_subject(subject_dir: Path, shape_params: np.ndarray, exp_params: np
 
     subject_dir.mkdir(parents=True, exist_ok=True)
     (subject_dir / "images").mkdir(exist_ok=True)
+    (subject_dir / "depth").mkdir(exist_ok=True)
     (subject_dir / "ground_truth").mkdir(exist_ok=True)
 
     # 生成顶点
     verts = generate_vertices(v_template, shape_basis, exp_basis, shape_params, exp_params)
 
-    # 渲染
+    # 渲染（含深度缓冲区）
     print(f"  渲染视角...", flush=True)
-    images, K = render_views(verts, faces)
+    images, depths, K = render_views(verts, faces)
 
-    # 保存图像
+    # 保存彩色图像
     for view_name, img_rgb in images.items():
         img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         cv2.imwrite(str(subject_dir / "images" / f"{view_name}.jpg"), img_bgr,
                     [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    # 保存深度图（float32 npy，inf=背景，单位米）
+    for view_name, depth_m in depths.items():
+        np.save(str(subject_dir / "depth" / f"{view_name}.npy"), depth_m)
 
     # 保存 ground truth mesh
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)

@@ -1,4 +1,4 @@
-﻿"""
+"""
 模块3：多视角纹理融合 + GLB 打包
 
 流程：
@@ -26,6 +26,13 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from src.coordinates import (
+    camera_center_for_texture_visibility,
+    image_uv_to_obj_uv,
+    obj_uv_to_image_uv,
+    project_texture_points_to_image,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +59,7 @@ def load_mesh_obj(obj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, n
             elif parts[0] == "vt":
                 u = float(parts[1])
                 v = float(parts[2])
-                uv_verts.append([u, 1.0 - v])   # 翻转 V 轴还原（导出时做了 1-v）
+                uv_verts.append([u, v])
             elif parts[0] == "f":
                 gf, uf = [], []
                 for token in parts[1:4]:
@@ -65,7 +72,7 @@ def load_mesh_obj(obj_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, n
     return (
         np.array(vertices, dtype=np.float32),
         np.array(faces, dtype=np.int32),
-        np.array(uv_verts, dtype=np.float32),
+        obj_uv_to_image_uv(np.array(uv_verts, dtype=np.float32)),
         np.array(uv_faces, dtype=np.int32),
     )
 
@@ -349,17 +356,9 @@ def _render_camera_depth(
     H, W = image_shape
     depth = np.full((H, W), np.inf, dtype=np.float32)
 
-    verts_proj = vertices.copy()
-    verts_proj[:, 1] *= -1
-    v_cam = (R @ verts_proj.T + t[:, None]).T
-    z = v_cam[:, 2]
-    valid = z > 1e-4
+    v_cam, z, proj, valid = project_texture_points_to_image(vertices, K, R, t)
     if not np.any(valid):
         return depth
-
-    proj = np.zeros((len(vertices), 2), dtype=np.float32)
-    proj[valid, 0] = K[0, 0] * v_cam[valid, 0] / z[valid] + K[0, 2]
-    proj[valid, 1] = K[1, 1] * v_cam[valid, 1] / z[valid] + K[1, 2]
 
     for tri in faces:
         tri_z = z[tri]
@@ -389,6 +388,88 @@ def _render_camera_depth(
         np.minimum.at(depth, (py, px), depth_in)
 
     return depth
+
+
+def _expand_face_selection(faces: np.ndarray, keep_faces: np.ndarray, rings: int) -> np.ndarray:
+    expanded = keep_faces.copy()
+    for _ in range(max(0, int(rings))):
+        keep_vertices = np.zeros(int(faces.max()) + 1, dtype=bool)
+        keep_vertices[faces[expanded].ravel()] = True
+        expanded |= np.any(keep_vertices[faces], axis=1)
+    return expanded
+
+
+def _save_visible_face_crop_debug(
+    uv_verts: np.ndarray,
+    uv_faces: np.ndarray,
+    keep_faces: np.ndarray,
+    out_dir: Path,
+    tex_size: int = 1024,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tri_map, _ = rasterize_uv_map(uv_verts, uv_faces, tex_size)
+    image = np.zeros((tex_size, tex_size, 3), dtype=np.uint8)
+    valid = tri_map >= 0
+    image[valid & keep_faces[np.clip(tri_map, 0, len(keep_faces) - 1)]] = (70, 220, 110)
+    image[valid & ~keep_faces[np.clip(tri_map, 0, len(keep_faces) - 1)]] = (255, 70, 70)
+    cv2.imwrite(str(out_dir / "visible_face_crop_uv_keep_delete.png"), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+
+
+def crop_mesh_to_visible_face(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    uv_verts: np.ndarray,
+    uv_faces: np.ndarray,
+    cameras: Dict[str, dict],
+    images: Dict[str, np.ndarray],
+    face_masks: Optional[Dict[str, np.ndarray]],
+    debug_dir: Path,
+    dilate_rings: int = 2,
+    z_tol: float = 0.006,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Keep mesh faces that are visible through at least one face-mask view."""
+    if face_masks is None:
+        return faces, uv_faces, np.ones(len(faces), dtype=bool)
+
+    face_centers = vertices[faces].mean(axis=1).astype(np.float32)
+    face_keep = np.zeros(len(faces), dtype=bool)
+
+    for view_name, cam in cameras.items():
+        if view_name not in images or view_name not in face_masks:
+            continue
+        image = images[view_name]
+        mask = face_masks[view_name]
+        h_img, w_img = image.shape[:2]
+        k, r, t = cam["K"], cam["R"], cam["t"]
+
+        depth_map = _render_camera_depth(vertices, faces, k, r, t, (h_img, w_img))
+        _, z, proj, front = project_texture_points_to_image(face_centers, k, r, t)
+        in_img = (
+            front
+            & (proj[:, 0] >= 0)
+            & (proj[:, 0] < w_img - 1)
+            & (proj[:, 1] >= 0)
+            & (proj[:, 1] < h_img - 1)
+        )
+        px = np.clip(proj[:, 0].astype(np.int32), 0, w_img - 1)
+        py = np.clip(proj[:, 1].astype(np.int32), 0, h_img - 1)
+        in_mask = mask[py, px] > 127
+        z_ref = depth_map[py, px]
+        z_ok = z <= (z_ref + float(z_tol))
+        face_keep |= in_img & in_mask & z_ok
+
+    if not np.any(face_keep):
+        logger.warning("Visible face crop found no faces; keeping the full mesh")
+        return faces, uv_faces, np.ones(len(faces), dtype=bool)
+
+    face_keep = _expand_face_selection(faces, face_keep, dilate_rings)
+    kept = int(face_keep.sum())
+    logger.info(
+        f"  Visible face crop: keep {kept}/{len(faces)} faces "
+        f"({kept * 100.0 / max(len(faces), 1):.1f}%), delete {len(faces) - kept}"
+    )
+    _save_visible_face_crop_debug(uv_verts, uv_faces, face_keep, debug_dir)
+    return faces[face_keep], uv_faces[face_keep], face_keep
 
 
 def _view_region_weight(view_name: str, pts_3d: np.ndarray) -> np.ndarray:
@@ -583,19 +664,7 @@ def bake_texture(
         image  = images[view_name]              # (H_img, W_img, 3) RGB
         H_img, W_img = image.shape[:2]
         depth_map = _render_camera_depth(vertices, faces, K, R, t, (H_img, W_img))
-
-        # PnP 时翻转了 FLAME 的 Y 轴，投影时需保持一致
-        pts_3d_proj = pts_3d.copy()
-        pts_3d_proj[:, 1] *= -1
-
-        # 投影到图像空间
-        v_cam = (R @ pts_3d_proj.T + t[:, None]).T  # (M, 3)
-        z     = v_cam[:, 2]
-        front = z > 1e-4                        # 只处理在相机前方的点
-
-        proj = np.zeros((len(valid_y), 2), dtype=np.float32)
-        proj[front, 0] = (K[0,0] * v_cam[front,0] / z[front] + K[0,2])
-        proj[front, 1] = (K[1,1] * v_cam[front,1] / z[front] + K[1,2])
+        v_cam, z, proj, front = project_texture_points_to_image(pts_3d, K, R, t)
 
         # 在图像范围内的点
         in_img = (front &
@@ -603,10 +672,8 @@ def bake_texture(
                   (proj[:, 1] >= 0) & (proj[:, 1] < H_img - 1))
 
         # 计算权重：面法线 · 相机方向（使用 Y 翻转后的坐标系）
-        cam_center_proj = -R.T @ t              # (3,) 相机中心在投影坐标系
         # 还原回 FLAME 坐标系（翻转 Y）
-        cam_center = cam_center_proj.copy()
-        cam_center[1] *= -1
+        cam_center = camera_center_for_texture_visibility(R, t)
         view_dirs  = cam_center - pts_3d        # (M, 3) 点→相机方向
         norms_vd   = np.linalg.norm(view_dirs, axis=1, keepdims=True)
         view_dirs  /= np.clip(norms_vd, 1e-8, None)
@@ -831,11 +898,9 @@ def bake_texture_single(
     pt_normals = face_normals_all[valid_tri]                  # (M, 3)
 
     # 相机中心在 FLAME 坐标系（还原 Y 翻转）
-    cam_center_proj = -R.T @ t       # (3,) 投影坐标系
-    cam_center = cam_center_proj.copy()
-    cam_center[1] *= -1              # 还原 Y 翻转 → FLAME 坐标系
 
     # 视线方向（点 → 相机），在 FLAME 坐标系中计算
+    cam_center = camera_center_for_texture_visibility(R, t)
     view_dirs = cam_center - pts_3d  # (M, 3)
     view_dirs /= np.clip(np.linalg.norm(view_dirs, axis=1, keepdims=True), 1e-8, None)
     cosines = np.sum(pt_normals * view_dirs, axis=1)          # (M,)
@@ -845,18 +910,7 @@ def bake_texture_single(
         f"  法线可见性: {front_facing.sum()} / {len(valid_tri)} 面片朝向相机 "
         f"({front_facing.mean()*100:.1f}%)"
     )
-
-    # Y 轴翻转（与 bake_texture 保持一致）
-    pts_proj = pts_3d.copy()
-    pts_proj[:, 1] *= -1
-
-    v_cam = (R @ pts_proj.T + t[:, None]).T  # (M, 3)
-    z     = v_cam[:, 2]
-    front = z > 1e-4
-
-    proj = np.zeros((len(valid_y), 2), dtype=np.float32)
-    proj[front, 0] = K[0, 0] * v_cam[front, 0] / z[front] + K[0, 2]
-    proj[front, 1] = K[1, 1] * v_cam[front, 1] / z[front] + K[1, 2]
+    v_cam, z, proj, front = project_texture_points_to_image(pts_3d, K, R, t)
 
     in_img = (front &
               front_facing &
@@ -1023,6 +1077,14 @@ def export_glb(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    geom_used, geom_inverse = np.unique(faces.reshape(-1), return_inverse=True)
+    vertices = vertices[geom_used]
+    faces = geom_inverse.reshape(faces.shape).astype(np.int32)
+
+    uv_used, uv_inverse = np.unique(uv_faces.reshape(-1), return_inverse=True)
+    uv_verts = uv_verts[uv_used]
+    uv_faces = uv_inverse.reshape(uv_faces.shape).astype(np.int32)
+
     # module2 已完成 Loop Subdivision（~160K faces）+ Laplacian，此处仅做最终精修
     # ── Step 1：轻度 Laplacian 平滑（2次，修复 per-face-vertex 展开前的微小锯齿）
     shared_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
@@ -1033,7 +1095,7 @@ def export_glb(
     flat_geom_idx = faces.flatten()
     flat_uv_idx   = uv_faces.flatten()
     exp_verts = smooth_verts[flat_geom_idx]
-    exp_uv    = uv_verts[flat_uv_idx]
+    exp_uv    = image_uv_to_obj_uv(uv_verts[flat_uv_idx])
     exp_faces = np.arange(len(exp_verts)).reshape(-1, 3)
 
     # ── Step 3：重算平滑顶点法线 ────────────────────────────────────────────
@@ -1130,7 +1192,8 @@ def run_texture_pipeline(
     unified_texture: Optional[np.ndarray] = None,       # 预融合统一纹理（fallback）
     hires_front_image: Optional[np.ndarray] = None,     # 原始高清正面图（仅正面，旧接口）
     hires_scale_factor: float = 1.0,                     # K 缩放系数（原始分辨率 / 512）
-    hires_images: Optional[Dict[str, np.ndarray]] = None,  # 多视角高清图（最优先）
+    hires_images: Optional[Dict[str, np.ndarray]] = None,  # 多视角高清图（最优先）
+
     working_image_size: Optional[int] = None,
 ) -> Path:
     """
@@ -1160,6 +1223,59 @@ def run_texture_pipeline(
     logger.info("加载 Mesh 和相机参数...")
     vertices, faces, uv_verts, uv_faces = load_mesh_obj(mesh_dir / "face_mesh.obj")
     cameras = load_cameras(mesh_dir / "cameras.json")
+    try:
+        from src import config as cfg
+        enable_visible_face_crop = bool(getattr(cfg, "ENABLE_VISIBLE_FACE_CROP", False))
+        visible_face_crop_rings = int(getattr(cfg, "VISIBLE_FACE_CROP_DILATE_RINGS", 2))
+        visible_face_crop_z_tol = float(getattr(cfg, "VISIBLE_FACE_CROP_Z_TOL", 0.006))
+    except Exception:
+        enable_visible_face_crop = False
+        visible_face_crop_rings = 2
+        visible_face_crop_z_tol = 0.006
+    if enable_visible_face_crop:
+        crop_cameras = cameras
+        crop_images = images
+        crop_masks = face_masks
+        if hires_images is not None:
+            crop_cameras = {}
+            crop_images = {}
+            crop_masks = {} if face_masks is not None else None
+            for view_name, hires_img in hires_images.items():
+                if view_name not in cameras:
+                    continue
+                h, w = hires_img.shape[:2]
+                max_sz = max(h, w)
+                canvas = np.zeros((max_sz, max_sz, 3), dtype=np.uint8)
+                y_off = (max_sz - h) // 2
+                x_off = (max_sz - w) // 2
+                canvas[y_off:y_off + h, x_off:x_off + w] = hires_img
+                crop_images[view_name] = canvas
+
+                view_sf = max_sz / float(working_image_size)
+                cam = cameras[view_name]
+                k_crop = cam["K"].copy()
+                k_crop[0, :] *= view_sf
+                k_crop[1, :] *= view_sf
+                crop_cameras[view_name] = {"K": k_crop, "R": cam["R"], "t": cam["t"]}
+
+                if crop_masks is not None and view_name in face_masks:
+                    crop_masks[view_name] = cv2.resize(
+                        face_masks[view_name],
+                        (max_sz, max_sz),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+        faces, uv_faces, _ = crop_mesh_to_visible_face(
+            vertices,
+            faces,
+            uv_verts,
+            uv_faces,
+            crop_cameras,
+            crop_images,
+            crop_masks,
+            output_texture_dir.parent / "debug" / "visible_face_crop",
+            dilate_rings=visible_face_crop_rings,
+            z_tol=visible_face_crop_z_tol,
+        )
     try:
         from src import config as cfg
         enable_uv_hole_fill_faces = bool(getattr(cfg, "ENABLE_UV_HOLE_FILL_FACES", False))
@@ -1349,5 +1465,4 @@ def run_texture_pipeline(
     )
 
     return glb_path
-
 

@@ -22,6 +22,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src import config as cfg  # noqa: E402
+from src.coordinates import (  # noqa: E402
+    camera_center_for_texture_visibility,
+    project_texture_points_to_image,
+)
 from src.module1_preprocess import (  # noqa: E402
     create_face_mask_from_landmarks,
     detect_landmarks_mediapipe,
@@ -324,16 +328,6 @@ def scale_cameras_for_padded_images(cameras: Dict[str, dict], images: Dict[str, 
     return scaled
 
 
-def flame_to_cv(points: np.ndarray) -> np.ndarray:
-    converted = points.copy()
-    converted[..., 1] *= -1
-    return converted
-
-
-def cv_to_flame(points: np.ndarray) -> np.ndarray:
-    return flame_to_cv(points)
-
-
 def render_texture_visibility(
     padded: Dict[str, np.ndarray],
     masks: Dict[str, np.ndarray],
@@ -376,19 +370,13 @@ def render_texture_visibility(
         k, r, t = cam["K"], cam["R"], cam["t"]
 
         depth_map = _render_camera_depth(vertices, faces, k, r, t, (h_img, w_img))
-        pts_proj = flame_to_cv(pts_3d)
-        v_cam = (r @ pts_proj.T + t[:, None]).T
-        z = v_cam[:, 2]
-        front = z > 1e-4
-        proj = np.zeros((len(valid_y), 2), dtype=np.float32)
-        proj[front, 0] = k[0, 0] * v_cam[front, 0] / z[front] + k[0, 2]
-        proj[front, 1] = k[1, 1] * v_cam[front, 1] / z[front] + k[1, 2]
+        v_cam, z, proj, front = project_texture_points_to_image(pts_3d, k, r, t)
         in_img = front & (proj[:, 0] >= 0) & (proj[:, 0] < w_img - 1) & (proj[:, 1] >= 0) & (proj[:, 1] < h_img - 1)
 
         px_u = np.clip(proj[:, 0].astype(int), 0, w_img - 1)
         px_v = np.clip(proj[:, 1].astype(int), 0, h_img - 1)
         in_mask = mask[px_v, px_u] > 127
-        cam_center = cv_to_flame(-r.T @ t)
+        cam_center = camera_center_for_texture_visibility(r, t)
         view_dirs = cam_center - pts_3d
         view_dirs /= np.clip(np.linalg.norm(view_dirs, axis=1, keepdims=True), 1e-8, None)
         weights = np.maximum(0.0, np.sum(pt_normals * view_dirs, axis=1)) ** 2
