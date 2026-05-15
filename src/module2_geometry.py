@@ -26,11 +26,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.spatial.transform import Rotation
 
-from src.coordinates import flame_points_to_opencv_world, image_uv_to_obj_uv
+from src.coordinates import image_uv_to_obj_uv
 
 logger = logging.getLogger(__name__)
 
 _PNP_STABLE_IDX = np.arange(27, 68, dtype=np.int32)
+INIT_POSE_MEAN_BAD_PX = 25.0
+INIT_POSE_MAX_BAD_PX = 100.0
+INIT_POSE_MIN_IMPROVE_PX = 1.0
+LMK_CONTOUR_IDX = np.arange(0, 17, dtype=np.int64)
+LMK_BROW_IDX = np.arange(17, 27, dtype=np.int64)
+LMK_NOSE_IDX = np.arange(27, 36, dtype=np.int64)
+LMK_EYE_IDX = np.arange(36, 48, dtype=np.int64)
+LMK_MOUTH_IDX = np.arange(48, 68, dtype=np.int64)
+LMK_ERROR_GROUPS = (
+    ("轮廓", LMK_CONTOUR_IDX),
+    ("眉毛", LMK_BROW_IDX),
+    ("鼻子", LMK_NOSE_IDX),
+    ("眼睛", LMK_EYE_IDX),
+    ("嘴巴", LMK_MOUTH_IDX),
+)
 
 
 def _patch_numpy_compat():
@@ -286,16 +301,15 @@ def get_fa_initial_params(
 
 def estimate_pose_from_landmarks_pnp(
     lmks_2d: np.ndarray,       # (68, 2) 图像像素坐标（Y 朝下）
-    lmks_3d_model: np.ndarray, # (68, 3) FLAME 模板顶点（Y 朝上）
+    lmks_3d_model: np.ndarray, # (68, 3) FLAME 模板顶点
     K: np.ndarray,             # (3, 3)
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     PnP 估计初始 R, t。
-    FLAME 坐标系 Y 轴朝上，OpenCV/图像 Y 轴朝下，PnP 前需翻转。
+    PnP 和后续 optimizer 使用同一套 FLAME 坐标，不在这里额外翻转 Y。
     同时检测退化解（t_z ≤ 0）并回退到基于尺寸的估计。
     """
-    # PnP expects OpenCV camera convention (Y down); FLAME stores Y up.
-    pts3d = flame_points_to_opencv_world(lmks_3d_model).astype(np.float64)
+    pts3d = np.asarray(lmks_3d_model, dtype=np.float64)
 
     try:
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -1083,6 +1097,19 @@ def run_geometry_reconstruction(
 
     # ── 保存每视角初始化参数 + 预优化重投影图 ────────────────────────────────
     lmk_tri_vidx = flame_faces_np[lmk_data["face_idx"]] if lmk_data is not None else None
+    _audit_and_repair_initial_poses(
+        view_data=view_data,
+        init_result=init_result,
+        init_exps=init_exps,
+        init_shape=init_shape,
+        flame=flame,
+        lmk_vertex_indices=lmk_vertex_indices,
+        lmk_tri_vidx=lmk_tri_vidx,
+        lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+        preprocessed_views=preprocessed_views,
+        intrinsics=intrinsics,
+        debug_dir=debug_dir,
+    )
     _save_init_per_view_debug(
         view_data=view_data,
         init_result=init_result,
@@ -1157,6 +1184,20 @@ def run_geometry_reconstruction(
             logger.warning(
                 f"重试未改善：avg reproj {mean_err_avg:.2f}px -> {mean_err_retry:.2f}px，保留首次结果"
             )
+
+    _save_optimized_pose_quality_debug(
+        shape_opt=shape_opt,
+        per_view_results=per_view_results,
+        flame=flame,
+        lmk_vertex_indices=lmk_vertex_indices,
+        lmk_tri_vidx=lmk_tri_vidx,
+        lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+        view_data=view_data,
+        preprocessed_views=preprocessed_views,
+        intrinsics=intrinsics,
+        debug_dir=debug_dir,
+        device=device,
+    )
 
     # 用多视角平均表情生成最终基础网格，避免被单一正脸视角绑定
     front_name = "front" if "front" in per_view_results else list(per_view_results.keys())[0]
@@ -1376,6 +1417,493 @@ def _save_init_shape_debug(init_result: dict, debug_dir: Path):
     logger.info(f"初始化 shape 摘要已保存: {out}")
 
 
+def _flame_vertices_for_init(flame, shape_np, exp_np: Optional[np.ndarray]) -> np.ndarray:
+    shape_use = shape_np if shape_np is not None else np.zeros(flame.n_shape, dtype=np.float32)
+    exp_use = np.zeros(flame.n_exp, dtype=np.float32)
+    if exp_np is not None:
+        exp_arr = np.asarray(exp_np, dtype=np.float32).reshape(-1)
+        exp_use[:min(len(exp_arr), flame.n_exp)] = exp_arr[:flame.n_exp]
+
+    model_device = flame.v_template.device
+    model_dtype = flame.v_template.dtype
+    with torch.no_grad():
+        return flame(
+            torch.as_tensor(shape_use, device=model_device, dtype=model_dtype),
+            torch.as_tensor(exp_use, device=model_device, dtype=model_dtype),
+        ).cpu().numpy()
+
+
+def _landmark_points_3d(
+    vertices: np.ndarray,
+    lmk_vertex_indices: np.ndarray,
+    lmk_tri_vidx: Optional[np.ndarray] = None,
+    lmk_bary_coords: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    if lmk_tri_vidx is not None and lmk_bary_coords is not None:
+        return (
+            vertices[lmk_tri_vidx[:, 0]] * lmk_bary_coords[:, 0:1] +
+            vertices[lmk_tri_vidx[:, 1]] * lmk_bary_coords[:, 1:2] +
+            vertices[lmk_tri_vidx[:, 2]] * lmk_bary_coords[:, 2:3]
+        )
+    return vertices[lmk_vertex_indices]
+
+
+def _audit_and_repair_initial_poses(
+    view_data: dict,
+    init_result: dict,
+    init_exps: dict,
+    init_shape,
+    flame,
+    lmk_vertex_indices,
+    lmk_tri_vidx,
+    lmk_bary_coords,
+    preprocessed_views: dict,
+    intrinsics: dict,
+    debug_dir: Path,
+):
+    import json
+
+    out_dir = debug_dir / "init_pose_quality"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+
+    for view_name, vd in view_data.items():
+        image = preprocessed_views[view_name]["image"]
+        target_lmk = vd["lmk_2d"]
+        K = intrinsics[view_name]
+        verts_init = _flame_vertices_for_init(flame, init_shape, init_exps.get(view_name))
+
+        orig_R = np.asarray(vd["R_init"], dtype=np.float64)
+        orig_t = np.asarray(vd["t_init"], dtype=np.float64).reshape(3)
+        orig_mean, orig_max, orig_errors = _save_landmark_reprojection_debug(
+            vertices=verts_init,
+            K=K,
+            R=orig_R,
+            t=orig_t,
+            image=image,
+            target_landmarks=target_lmk,
+            lmk_vertex_indices=lmk_vertex_indices,
+            out_path=out_dir / f"{view_name}_01_original.png",
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+            return_errors=True,
+        )
+
+        is_bad = (orig_mean > INIT_POSE_MEAN_BAD_PX) or (orig_max > INIT_POSE_MAX_BAD_PX)
+        pnp_mean = None
+        pnp_max = None
+        pnp_errors = None
+        selected = "原始初值"
+        action = "通过"
+        reason = "原始初值误差在阈值内，未重算 PnP。"
+
+        if is_bad:
+            try:
+                flame_lmk_3d = _landmark_points_3d(
+                    verts_init,
+                    lmk_vertex_indices,
+                    lmk_tri_vidx,
+                    lmk_bary_coords,
+                )
+                pnp_R, pnp_t = estimate_pose_from_landmarks_pnp(target_lmk, flame_lmk_3d, K)
+                pnp_R = np.asarray(pnp_R, dtype=np.float64)
+                pnp_t = np.asarray(pnp_t, dtype=np.float64).reshape(3)
+                pnp_mean, pnp_max, pnp_errors = _save_landmark_reprojection_debug(
+                    vertices=verts_init,
+                    K=K,
+                    R=pnp_R,
+                    t=pnp_t,
+                    image=image,
+                    target_landmarks=target_lmk,
+                    lmk_vertex_indices=lmk_vertex_indices,
+                    out_path=out_dir / f"{view_name}_02_recomputed_pnp.png",
+                    lmk_tri_vidx=lmk_tri_vidx,
+                    lmk_bary_coords=lmk_bary_coords,
+                    return_errors=True,
+                )
+                orig_stable_score = _stable_landmark_score(orig_errors)
+                pnp_stable_score = _stable_landmark_score(pnp_errors)
+                orig_groups = _landmark_group_stats(orig_errors)
+                pnp_groups = _landmark_group_stats(pnp_errors)
+                nose_ok = pnp_groups["鼻子"]["mean_px"] <= orig_groups["鼻子"]["mean_px"] + 5.0
+                stable_ok = pnp_stable_score < (orig_stable_score - INIT_POSE_MIN_IMPROVE_PX)
+                if np.isfinite(pnp_mean) and stable_ok and nose_ok:
+                    vd["R_init"] = pnp_R.astype(np.float32)
+                    vd["t_init"] = pnp_t.astype(np.float32)
+                    pv = init_result["per_view"].setdefault(view_name, {})
+                    pv["R_init"] = vd["R_init"]
+                    pv["t_init"] = vd["t_init"]
+                    selected = "重算 PnP"
+                    action = "已替换"
+                    reason = f"原始初值超阈值，重算 PnP 后稳定区域误差降低 {orig_stable_score - pnp_stable_score:.2f}px。"
+                else:
+                    action = "保留原始"
+                    reason = "原始初值超阈值，但重算 PnP 没有同时满足稳定区域变好、鼻子不明显变坏。"
+            except Exception as exc:
+                action = "重算失败"
+                reason = f"原始初值超阈值，但重算 PnP 失败：{exc}"
+        else:
+            _save_landmark_reprojection_debug(
+                vertices=verts_init,
+                K=K,
+                R=orig_R,
+                t=orig_t,
+                image=image,
+                target_landmarks=target_lmk,
+                lmk_vertex_indices=lmk_vertex_indices,
+                out_path=out_dir / f"{view_name}_02_recomputed_pnp.png",
+                lmk_tri_vidx=lmk_tri_vidx,
+                lmk_bary_coords=lmk_bary_coords,
+            )
+
+        final_R = np.asarray(vd["R_init"], dtype=np.float64)
+        final_t = np.asarray(vd["t_init"], dtype=np.float64).reshape(3)
+        final_mean, final_max, final_errors = _save_landmark_reprojection_debug(
+            vertices=verts_init,
+            K=K,
+            R=final_R,
+            t=final_t,
+            image=image,
+            target_landmarks=target_lmk,
+            lmk_vertex_indices=lmk_vertex_indices,
+            out_path=out_dir / f"{view_name}_03_selected.png",
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+            return_errors=True,
+        )
+        face_mask = preprocessed_views[view_name].get("face_mask")
+        mesh_image = f"{view_name}_04_selected_mesh.png"
+        if face_mask is not None:
+            _save_projection_debug(
+                verts_init,
+                flame.faces.numpy(),
+                K,
+                final_R,
+                final_t,
+                image,
+                face_mask,
+                out_dir / mesh_image,
+            )
+
+        records.append({
+            "view": view_name,
+            "original_mean_px": round(orig_mean, 3),
+            "original_max_px": round(orig_max, 3),
+            "bad_initial_pose": bool(is_bad),
+            "pnp_mean_px": None if pnp_mean is None else round(float(pnp_mean), 3),
+            "pnp_max_px": None if pnp_max is None else round(float(pnp_max), 3),
+            "selected": selected,
+            "final_mean_px": round(final_mean, 3),
+            "final_max_px": round(final_max, 3),
+            "action": action,
+            "reason": reason,
+            "group_stats": {
+                "original": _landmark_group_stats(orig_errors),
+                "pnp": None if pnp_errors is None else _landmark_group_stats(pnp_errors),
+                "final": _landmark_group_stats(final_errors),
+            },
+            "images": {
+                "original": f"{view_name}_01_original.png",
+                "pnp": f"{view_name}_02_recomputed_pnp.png",
+                "selected": f"{view_name}_03_selected.png",
+                "mesh": mesh_image,
+            },
+        })
+        logger.info(
+            f"  [{view_name}] init pose audit: original mean={orig_mean:.2f}px max={orig_max:.2f}px, "
+            f"selected={selected}, final mean={final_mean:.2f}px max={final_max:.2f}px"
+        )
+
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    _write_init_pose_quality_html(records, out_dir)
+
+
+def _write_init_pose_quality_html(records: list, out_dir: Path):
+    import html
+
+    def fmt(v):
+        return "未计算" if v is None else f"{float(v):.2f}"
+
+    def fmt_group(stage_stats, group_name):
+        if not stage_stats:
+            return "未计算"
+        return fmt(stage_stats[group_name]["mean_px"])
+
+    def make_group_table(rec):
+        group_stats = rec.get("group_stats", {})
+        body = []
+        final_stats = group_stats.get("final") or {}
+        for group_name, _idx in LMK_ERROR_GROUPS:
+            final_mean = final_stats.get(group_name, {}).get("mean_px", 0.0)
+            cls = "bad" if final_mean > 25.0 else ("warn" if final_mean > 12.0 else "ok")
+            body.append(
+                "<tr>"
+                f"<td>{html.escape(group_name)}</td>"
+                f"<td>{fmt_group(group_stats.get('original'), group_name)}</td>"
+                f"<td>{fmt_group(group_stats.get('pnp'), group_name)}</td>"
+                f"<td class='{cls}'>{fmt_group(group_stats.get('final'), group_name)}</td>"
+                "</tr>"
+            )
+        return (
+            "<table class='group-table'>"
+            "<thead><tr><th>关键点类别</th><th>原始平均误差</th><th>PnP平均误差</th><th>最终平均误差</th></tr></thead>"
+            f"<tbody>{''.join(body)}</tbody></table>"
+        )
+
+    rows = []
+    cards = []
+    for rec in records:
+        status_cls = "bad" if rec["bad_initial_pose"] else "ok"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(rec['view'])}</td>"
+            f"<td class='{status_cls}'>{'坏初值' if rec['bad_initial_pose'] else '通过'}</td>"
+            f"<td>{fmt(rec['original_mean_px'])} / {fmt(rec['original_max_px'])}</td>"
+            f"<td>{fmt(rec['pnp_mean_px'])} / {fmt(rec['pnp_max_px'])}</td>"
+            f"<td>{html.escape(rec['selected'])}</td>"
+            f"<td>{fmt(rec['final_mean_px'])} / {fmt(rec['final_max_px'])}</td>"
+            f"<td>{html.escape(rec['reason'])}</td>"
+            "</tr>"
+        )
+        imgs = rec["images"]
+        groups_html = make_group_table(rec)
+        cards.append(
+            f"""
+            <section class="view-block">
+              <h2>{html.escape(rec['view'])} 视角</h2>
+              <p><b>结论：</b>{html.escape(rec['action'])}。{html.escape(rec['reason'])}</p>
+              {groups_html}
+              <div class="image-grid">
+                <figure><img src="{html.escape(imgs['original'])}"><figcaption>1. 原始初值重投影</figcaption></figure>
+                <figure><img src="{html.escape(imgs['pnp'])}"><figcaption>2. 重算 PnP 候选</figcaption></figure>
+                <figure><img src="{html.escape(imgs['selected'])}"><figcaption>3. 最终采用结果</figcaption></figure>
+                <figure><img src="{html.escape(imgs['mesh'])}"><figcaption>4. 最终初始 mesh 投影</figcaption></figure>
+              </div>
+            </section>
+            """
+        )
+
+    doc = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>初始位姿质量检查</title>
+  <style>
+    body {{ margin: 0; font-family: "Microsoft YaHei", Arial, sans-serif; background: #f6f7f9; color: #1f2933; }}
+    header {{ padding: 28px 36px 18px; background: #18212f; color: white; }}
+    h1 {{ margin: 0 0 10px; font-size: 28px; }}
+    header p {{ margin: 6px 0; color: #d8dee8; line-height: 1.6; }}
+    main {{ padding: 24px 36px 48px; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; margin-bottom: 28px; }}
+    th, td {{ padding: 10px 12px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; font-size: 14px; }}
+    th {{ background: #eef2f7; font-weight: 700; }}
+    .ok {{ color: #047857; font-weight: 700; }}
+    .warn {{ color: #b7791f; font-weight: 700; }}
+    .bad {{ color: #b42318; font-weight: 700; }}
+    .view-block {{ margin: 0 0 34px; padding: 22px 0 0; border-top: 2px solid #d8dee8; }}
+    h2 {{ margin: 0 0 8px; font-size: 22px; }}
+    .view-block p {{ margin: 0 0 14px; line-height: 1.6; }}
+    .group-table {{ margin: 0 0 16px; }}
+    .group-table th, .group-table td {{ font-size: 13px; padding: 8px 10px; }}
+    .image-grid {{ display: grid; grid-template-columns: repeat(2, minmax(320px, 1fr)); gap: 18px; }}
+    figure {{ margin: 0; background: white; border: 1px solid #d7dde6; }}
+    img {{ display: block; width: 100%; height: auto; }}
+    figcaption {{ padding: 9px 12px; font-size: 14px; color: #4b5563; background: #fbfcfe; }}
+    .legend {{ margin-top: 8px; font-size: 14px; }}
+    @media (max-width: 900px) {{ .image-grid {{ grid-template-columns: 1fr; }} main {{ padding: 18px; }} header {{ padding: 22px 18px; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>初始位姿质量检查 + 坏初值自动重算 PnP</h1>
+    <p>判断规则：平均重投影误差 &gt; {INIT_POSE_MEAN_BAD_PX:.0f}px，或最大误差 &gt; {INIT_POSE_MAX_BAD_PX:.0f}px，就标记为坏初值。</p>
+    <p>替换规则：只有重算 PnP 后平均误差至少降低 {INIT_POSE_MIN_IMPROVE_PX:.0f}px，才会替换当前初始位姿。</p>
+    <p class="legend">图中绿色点是真实 2D 关键点，红色点是模型投影点，黄色线表示误差距离。</p>
+  </header>
+  <main>
+    <table>
+      <thead>
+        <tr><th>视角</th><th>状态</th><th>原始 mean/max(px)</th><th>PnP mean/max(px)</th><th>最终采用</th><th>最终 mean/max(px)</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+    {''.join(cards)}
+  </main>
+</body>
+</html>
+"""
+    with open(out_dir / "index.html", "w", encoding="utf-8") as f:
+        f.write(doc)
+    logger.info(f"Initial pose quality HTML saved: {out_dir / 'index.html'}")
+
+
+def _save_optimized_pose_quality_debug(
+    shape_opt: np.ndarray,
+    per_view_results: dict,
+    flame,
+    lmk_vertex_indices,
+    lmk_tri_vidx,
+    lmk_bary_coords,
+    view_data: dict,
+    preprocessed_views: dict,
+    intrinsics: dict,
+    debug_dir: Path,
+    device: str,
+):
+    import json
+
+    out_dir = debug_dir / "optimized_pose_quality"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    model_device = flame.v_template.device
+    model_dtype = flame.v_template.dtype
+
+    for view_name, view_result in per_view_results.items():
+        with torch.no_grad():
+            verts_view = flame(
+                torch.as_tensor(shape_opt, device=model_device, dtype=model_dtype),
+                torch.as_tensor(view_result["exp"], device=model_device, dtype=model_dtype),
+            ).cpu().numpy()
+
+        mean_err, max_err, errors = _save_landmark_reprojection_debug(
+            vertices=verts_view,
+            K=intrinsics[view_name],
+            R=view_result["R"],
+            t=view_result["t"],
+            image=preprocessed_views[view_name]["image"],
+            target_landmarks=view_data[view_name]["lmk_2d"],
+            lmk_vertex_indices=lmk_vertex_indices,
+            out_path=out_dir / f"{view_name}_optimized_reprojection.png",
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+            return_errors=True,
+        )
+
+        face_mask = preprocessed_views[view_name].get("face_mask")
+        mesh_image = f"{view_name}_optimized_mesh.png"
+        if face_mask is not None:
+            _save_projection_debug(
+                verts_view,
+                flame.faces.cpu().numpy(),
+                intrinsics[view_name],
+                view_result["R"],
+                view_result["t"],
+                preprocessed_views[view_name]["image"],
+                face_mask,
+                out_dir / mesh_image,
+            )
+
+        records.append({
+            "view": view_name,
+            "mean_px": round(float(mean_err), 3),
+            "max_px": round(float(max_err), 3),
+            "group_stats": _landmark_group_stats(errors),
+            "images": {
+                "reprojection": f"{view_name}_optimized_reprojection.png",
+                "mesh": mesh_image,
+            },
+        })
+
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    _write_optimized_pose_quality_html(records, out_dir)
+
+
+def _write_optimized_pose_quality_html(records: list, out_dir: Path):
+    import html
+
+    def fmt(v):
+        return f"{float(v):.2f}"
+
+    rows = []
+    cards = []
+    for rec in records:
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(rec['view'])}</td>"
+            f"<td>{fmt(rec['mean_px'])}</td>"
+            f"<td>{fmt(rec['max_px'])}</td>"
+            "</tr>"
+        )
+        group_rows = []
+        for group_name, _idx in LMK_ERROR_GROUPS:
+            stat = rec["group_stats"][group_name]
+            cls = "bad" if stat["mean_px"] > 25.0 else ("warn" if stat["mean_px"] > 12.0 else "ok")
+            group_rows.append(
+                "<tr>"
+                f"<td>{html.escape(group_name)}</td>"
+                f"<td class='{cls}'>{fmt(stat['mean_px'])}</td>"
+                f"<td>{fmt(stat['max_px'])}</td>"
+                "</tr>"
+            )
+        imgs = rec["images"]
+        cards.append(
+            f"""
+            <section class="view-block">
+              <h2>{html.escape(rec['view'])} 视角</h2>
+              <table class="group-table">
+                <thead><tr><th>关键点类别</th><th>平均误差(px)</th><th>最大误差(px)</th></tr></thead>
+                <tbody>{''.join(group_rows)}</tbody>
+              </table>
+              <div class="image-grid">
+                <figure><img src="{html.escape(imgs['reprojection'])}"><figcaption>优化后关键点重投影</figcaption></figure>
+                <figure><img src="{html.escape(imgs['mesh'])}"><figcaption>优化后 mesh 投影</figcaption></figure>
+              </div>
+            </section>
+            """
+        )
+
+    doc = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>优化后关键点质量检查</title>
+  <style>
+    body {{ margin: 0; font-family: "Microsoft YaHei", Arial, sans-serif; background: #f6f7f9; color: #1f2933; }}
+    header {{ padding: 28px 36px 18px; background: #17324d; color: white; }}
+    h1 {{ margin: 0 0 10px; font-size: 28px; }}
+    header p {{ margin: 6px 0; color: #e7eef8; line-height: 1.6; }}
+    main {{ padding: 24px 36px 48px; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; margin-bottom: 22px; }}
+    th, td {{ padding: 10px 12px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; font-size: 14px; }}
+    th {{ background: #eef2f7; font-weight: 700; }}
+    .ok {{ color: #047857; font-weight: 700; }}
+    .warn {{ color: #b7791f; font-weight: 700; }}
+    .bad {{ color: #b42318; font-weight: 700; }}
+    .view-block {{ margin: 0 0 34px; padding: 22px 0 0; border-top: 2px solid #d8dee8; }}
+    h2 {{ margin: 0 0 8px; font-size: 22px; }}
+    .group-table th, .group-table td {{ font-size: 13px; padding: 8px 10px; }}
+    .image-grid {{ display: grid; grid-template-columns: repeat(2, minmax(320px, 1fr)); gap: 18px; }}
+    figure {{ margin: 0; background: white; border: 1px solid #d7dde6; }}
+    img {{ display: block; width: 100%; height: auto; }}
+    figcaption {{ padding: 9px 12px; font-size: 14px; color: #4b5563; background: #fbfcfe; }}
+    @media (max-width: 900px) {{ .image-grid {{ grid-template-columns: 1fr; }} main {{ padding: 18px; }} header {{ padding: 22px 18px; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>优化后关键点质量检查</h1>
+    <p>这个页面展示 L-BFGS 优化完成后的结果，用来判断初始阶段的大误差是否已经被修回来。</p>
+    <p>图中绿色点是真实 2D 关键点，红色点是模型投影点，黄色线表示误差距离。</p>
+  </header>
+  <main>
+    <table>
+      <thead><tr><th>视角</th><th>平均误差(px)</th><th>最大误差(px)</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+    {''.join(cards)}
+  </main>
+</body>
+</html>
+"""
+    with open(out_dir / "index.html", "w", encoding="utf-8") as f:
+        f.write(doc)
+    logger.info(f"Optimized pose quality HTML saved: {out_dir / 'index.html'}")
+
+
 def _save_init_per_view_debug(
     view_data: dict,
     init_result: dict,
@@ -1509,22 +2037,38 @@ def _build_mask_row_bounds(mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np
     return xmin, xmax, valid
 
 
-def _save_landmark_reprojection_debug(
+def _landmark_group_stats(errors: np.ndarray) -> dict:
+    errors = np.asarray(errors, dtype=np.float64)
+    stats = {}
+    for name, idx in LMK_ERROR_GROUPS:
+        vals = errors[idx]
+        stats[name] = {
+            "count": int(len(vals)),
+            "mean_px": round(float(vals.mean()), 3),
+            "max_px": round(float(vals.max()), 3),
+        }
+    return stats
+
+
+def _stable_landmark_score(errors: np.ndarray) -> float:
+    errors = np.asarray(errors, dtype=np.float64)
+    weights = np.zeros(68, dtype=np.float64)
+    weights[LMK_NOSE_IDX] = 1.4
+    weights[LMK_EYE_IDX] = 1.0
+    weights[LMK_MOUTH_IDX] = 1.0
+    return float((errors * weights).sum() / np.clip(weights.sum(), 1e-6, None))
+
+
+def _landmark_reprojection_details(
     vertices: np.ndarray,
     K: np.ndarray,
     R: np.ndarray,
     t: np.ndarray,
-    image: np.ndarray,
     target_landmarks: np.ndarray,
     lmk_vertex_indices: np.ndarray,
-    out_path: Path,
     lmk_tri_vidx: Optional[np.ndarray] = None,
     lmk_bary_coords: Optional[np.ndarray] = None,
-) -> Tuple[float, float]:
-    import cv2
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
+) -> Tuple[np.ndarray, np.ndarray]:
     v_cam = (R @ vertices.T + t[:, None]).T
     z = np.clip(v_cam[:, 2], 1e-6, None)
     v_hom = (K @ v_cam.T).T
@@ -1540,6 +2084,36 @@ def _save_landmark_reprojection_debug(
         lmk_proj = proj[lmk_vertex_indices]
 
     errors = np.linalg.norm(lmk_proj - target_landmarks, axis=1)
+    return lmk_proj, errors
+
+
+def _save_landmark_reprojection_debug(
+    vertices: np.ndarray,
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    image: np.ndarray,
+    target_landmarks: np.ndarray,
+    lmk_vertex_indices: np.ndarray,
+    out_path: Path,
+    lmk_tri_vidx: Optional[np.ndarray] = None,
+    lmk_bary_coords: Optional[np.ndarray] = None,
+    return_errors: bool = False,
+):
+    import cv2
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lmk_proj, errors = _landmark_reprojection_details(
+        vertices=vertices,
+        K=K,
+        R=R,
+        t=t,
+        target_landmarks=target_landmarks,
+        lmk_vertex_indices=lmk_vertex_indices,
+        lmk_tri_vidx=lmk_tri_vidx,
+        lmk_bary_coords=lmk_bary_coords,
+    )
     img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     for idx, (gt, pred, err) in enumerate(zip(target_landmarks, lmk_proj, errors)):
         gt_pt = tuple(np.round(gt).astype(int))
@@ -1574,7 +2148,11 @@ def _save_landmark_reprojection_debug(
                 f"gt=({float(gt[0]):.2f},{float(gt[1]):.2f}) "
                 f"pred=({float(pred[0]):.2f},{float(pred[1]):.2f})\n"
             )
-    return float(errors.mean()), float(errors.max())
+    mean_err = float(errors.mean())
+    max_err = float(errors.max())
+    if return_errors:
+        return mean_err, max_err, errors
+    return mean_err, max_err
 
 
 # ══════════════════════════════════════════════════════════════════════════════
