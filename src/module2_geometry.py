@@ -39,12 +39,22 @@ LMK_BROW_IDX = np.arange(17, 27, dtype=np.int64)
 LMK_NOSE_IDX = np.arange(27, 36, dtype=np.int64)
 LMK_EYE_IDX = np.arange(36, 48, dtype=np.int64)
 LMK_MOUTH_IDX = np.arange(48, 68, dtype=np.int64)
+LMK_GEOMETRY_IDX = np.concatenate([LMK_CONTOUR_IDX, LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX])
 LMK_ERROR_GROUPS = (
     ("轮廓", LMK_CONTOUR_IDX),
     ("眉毛", LMK_BROW_IDX),
     ("鼻子", LMK_NOSE_IDX),
     ("眼睛", LMK_EYE_IDX),
     ("嘴巴", LMK_MOUTH_IDX),
+)
+LMK_GEOMETRY_GROUPS = (
+    ("轮廓", LMK_CONTOUR_IDX),
+    ("鼻子", LMK_NOSE_IDX),
+    ("眼睛", LMK_EYE_IDX),
+    ("嘴巴", LMK_MOUTH_IDX),
+)
+LMK_APPEARANCE_GROUPS = (
+    ("眉毛", LMK_BROW_IDX),
 )
 
 
@@ -1781,6 +1791,8 @@ def _save_optimized_pose_quality_debug(
             lmk_bary_coords=lmk_bary_coords,
             return_errors=True,
         )
+        geometry_stats = _landmark_subset_stats(errors, LMK_GEOMETRY_IDX)
+        group_stats = _landmark_group_stats(errors)
 
         face_mask = preprocessed_views[view_name].get("face_mask")
         mesh_image = f"{view_name}_optimized_mesh.png"
@@ -1800,7 +1812,11 @@ def _save_optimized_pose_quality_debug(
             "view": view_name,
             "mean_px": round(float(mean_err), 3),
             "max_px": round(float(max_err), 3),
-            "group_stats": _landmark_group_stats(errors),
+            "geometry_mean_px": geometry_stats["mean_px"],
+            "geometry_max_px": geometry_stats["max_px"],
+            "geometry_group_stats": _landmark_named_stats(errors, LMK_GEOMETRY_GROUPS),
+            "appearance_group_stats": _landmark_named_stats(errors, LMK_APPEARANCE_GROUPS),
+            "group_stats": group_stats,
             "images": {
                 "reprojection": f"{view_name}_optimized_reprojection.png",
                 "mesh": mesh_image,
@@ -1818,21 +1834,40 @@ def _write_optimized_pose_quality_html(records: list, out_dir: Path):
     def fmt(v):
         return f"{float(v):.2f}"
 
+    def err_class(mean_px: float):
+        return "bad" if mean_px > 25.0 else ("warn" if mean_px > 12.0 else "ok")
+
     rows = []
     cards = []
     for rec in records:
+        brow_stats = rec["appearance_group_stats"]["眉毛"]
+        geom_cls = err_class(rec["geometry_mean_px"])
+        brow_cls = err_class(brow_stats["mean_px"])
         rows.append(
             "<tr>"
             f"<td>{html.escape(rec['view'])}</td>"
+            f"<td class='{geom_cls}'>{fmt(rec['geometry_mean_px'])}</td>"
+            f"<td>{fmt(rec['geometry_max_px'])}</td>"
+            f"<td class='{brow_cls}'>{fmt(brow_stats['mean_px'])}</td>"
             f"<td>{fmt(rec['mean_px'])}</td>"
-            f"<td>{fmt(rec['max_px'])}</td>"
             "</tr>"
         )
-        group_rows = []
-        for group_name, _idx in LMK_ERROR_GROUPS:
-            stat = rec["group_stats"][group_name]
-            cls = "bad" if stat["mean_px"] > 25.0 else ("warn" if stat["mean_px"] > 12.0 else "ok")
-            group_rows.append(
+        geometry_rows = []
+        for group_name, _idx in LMK_GEOMETRY_GROUPS:
+            stat = rec["geometry_group_stats"][group_name]
+            cls = err_class(stat["mean_px"])
+            geometry_rows.append(
+                "<tr>"
+                f"<td>{html.escape(group_name)}</td>"
+                f"<td class='{cls}'>{fmt(stat['mean_px'])}</td>"
+                f"<td>{fmt(stat['max_px'])}</td>"
+                "</tr>"
+            )
+        appearance_rows = []
+        for group_name, _idx in LMK_APPEARANCE_GROUPS:
+            stat = rec["appearance_group_stats"][group_name]
+            cls = err_class(stat["mean_px"])
+            appearance_rows.append(
                 "<tr>"
                 f"<td>{html.escape(group_name)}</td>"
                 f"<td class='{cls}'>{fmt(stat['mean_px'])}</td>"
@@ -1844,9 +1879,15 @@ def _write_optimized_pose_quality_html(records: list, out_dir: Path):
             f"""
             <section class="view-block">
               <h2>{html.escape(rec['view'])} 视角</h2>
+              <h3>几何拟合质量（不含眉毛）</h3>
               <table class="group-table">
                 <thead><tr><th>关键点类别</th><th>平均误差(px)</th><th>最大误差(px)</th></tr></thead>
-                <tbody>{''.join(group_rows)}</tbody>
+                <tbody>{''.join(geometry_rows)}</tbody>
+              </table>
+              <h3>外观/纹理关注项</h3>
+              <table class="group-table appearance-table">
+                <thead><tr><th>区域</th><th>平均误差(px)</th><th>最大误差(px)</th></tr></thead>
+                <tbody>{''.join(appearance_rows)}</tbody>
               </table>
               <div class="image-grid">
                 <figure><img src="{html.escape(imgs['reprojection'])}"><figcaption>优化后关键点重投影</figcaption></figure>
@@ -1875,7 +1916,9 @@ def _write_optimized_pose_quality_html(records: list, out_dir: Path):
     .bad {{ color: #b42318; font-weight: 700; }}
     .view-block {{ margin: 0 0 34px; padding: 22px 0 0; border-top: 2px solid #d8dee8; }}
     h2 {{ margin: 0 0 8px; font-size: 22px; }}
+    h3 {{ margin: 16px 0 8px; font-size: 16px; color: #263648; }}
     .group-table th, .group-table td {{ font-size: 13px; padding: 8px 10px; }}
+    .appearance-table th {{ background: #f5efe6; }}
     .image-grid {{ display: grid; grid-template-columns: repeat(2, minmax(320px, 1fr)); gap: 18px; }}
     figure {{ margin: 0; background: white; border: 1px solid #d7dde6; }}
     img {{ display: block; width: 100%; height: auto; }}
@@ -1885,13 +1928,14 @@ def _write_optimized_pose_quality_html(records: list, out_dir: Path):
 </head>
 <body>
   <header>
-    <h1>优化后关键点质量检查</h1>
-    <p>这个页面展示 L-BFGS 优化完成后的结果，用来判断初始阶段的大误差是否已经被修回来。</p>
+    <h1>优化后几何/外观质量检查</h1>
+    <p>这个页面展示 L-BFGS 优化完成后的结果。几何拟合质量现在不再把眉毛算进主分数，避免把纹理/外观问题误判成脸型几何问题。</p>
+    <p>眉毛单独作为“外观/纹理关注项”保留，用来后续检查纹理融合、眉毛颜色和局部贴图对齐。</p>
     <p>图中绿色点是真实 2D 关键点，红色点是模型投影点，黄色线表示误差距离。</p>
   </header>
   <main>
     <table>
-      <thead><tr><th>视角</th><th>平均误差(px)</th><th>最大误差(px)</th></tr></thead>
+      <thead><tr><th>视角</th><th>几何平均误差，不含眉毛(px)</th><th>几何最大误差(px)</th><th>眉毛外观平均误差(px)</th><th>全部点平均误差，仅供参考(px)</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
     {''.join(cards)}
@@ -2041,13 +2085,22 @@ def _landmark_group_stats(errors: np.ndarray) -> dict:
     errors = np.asarray(errors, dtype=np.float64)
     stats = {}
     for name, idx in LMK_ERROR_GROUPS:
-        vals = errors[idx]
-        stats[name] = {
-            "count": int(len(vals)),
-            "mean_px": round(float(vals.mean()), 3),
-            "max_px": round(float(vals.max()), 3),
-        }
+        stats[name] = _landmark_subset_stats(errors, idx)
     return stats
+
+
+def _landmark_subset_stats(errors: np.ndarray, idx: np.ndarray) -> dict:
+    errors = np.asarray(errors, dtype=np.float64)
+    vals = errors[idx]
+    return {
+        "count": int(len(vals)),
+        "mean_px": round(float(vals.mean()), 3),
+        "max_px": round(float(vals.max()), 3),
+    }
+
+
+def _landmark_named_stats(errors: np.ndarray, groups: tuple) -> dict:
+    return {name: _landmark_subset_stats(errors, idx) for name, idx in groups}
 
 
 def _stable_landmark_score(errors: np.ndarray) -> float:
