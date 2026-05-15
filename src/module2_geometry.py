@@ -56,6 +56,14 @@ LMK_GEOMETRY_GROUPS = (
 LMK_APPEARANCE_GROUPS = (
     ("眉毛", LMK_BROW_IDX),
 )
+LMK_LEFT_EYE_IDX = np.arange(36, 42, dtype=np.int64)
+LMK_RIGHT_EYE_IDX = np.arange(42, 48, dtype=np.int64)
+LMK_EYE_CLOSE_PAIRS = (
+    (37, 41),
+    (38, 40),
+    (43, 47),
+    (44, 46),
+)
 
 
 def _patch_numpy_compat():
@@ -388,6 +396,160 @@ def _estimate_pose_from_size(
     return R, t
 
 
+def _closed_eye_landmark_loss(lmk_proj_n: torch.Tensor, lmk_target_n: torch.Tensor) -> torch.Tensor:
+    losses = []
+    for upper_idx, lower_idx in LMK_EYE_CLOSE_PAIRS:
+        target_mid = 0.5 * (lmk_target_n[upper_idx] + lmk_target_n[lower_idx])
+        proj_pair = torch.stack([lmk_proj_n[upper_idx], lmk_proj_n[lower_idx]], dim=0)
+        losses.append(
+            F.smooth_l1_loss(
+                proj_pair,
+                target_mid.unsqueeze(0).expand_as(proj_pair),
+                reduction="mean",
+                beta=0.004,
+            )
+        )
+        proj_gap = torch.abs(lmk_proj_n[upper_idx, 1] - lmk_proj_n[lower_idx, 1])
+        losses.append(
+            F.smooth_l1_loss(
+                proj_gap,
+                torch.zeros_like(proj_gap),
+                reduction="mean",
+                beta=0.002,
+            )
+        )
+    return torch.stack(losses).mean()
+
+
+def _force_close_eye_geometry(
+    vertices: np.ndarray,
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    target_landmarks: np.ndarray,
+    faces: Optional[np.ndarray] = None,
+    vertex_normals: Optional[np.ndarray] = None,
+    image_shape: Optional[Tuple[int, int]] = None,
+    strength: float = 0.95,
+    debug_image: Optional[np.ndarray] = None,
+    debug_path: Optional[Path] = None,
+) -> np.ndarray:
+    verts = np.asarray(vertices, dtype=np.float64).copy()
+    target_landmarks = np.asarray(target_landmarks, dtype=np.float64)
+    K = np.asarray(K, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64).reshape(3)
+
+    v_cam = (R @ verts.T + t[:, None]).T
+    z = v_cam[:, 2]
+    front = z > 1e-4
+    proj = np.zeros((len(verts), 2), dtype=np.float64)
+    proj[front, 0] = K[0, 0] * v_cam[front, 0] / z[front] + K[0, 2]
+    proj[front, 1] = K[1, 1] * v_cam[front, 1] / z[front] + K[1, 2]
+
+    if image_shape is None and debug_image is not None:
+        image_shape = debug_image.shape[:2]
+    in_frame = front.copy()
+    if image_shape is not None:
+        H, W = image_shape
+        in_frame &= (
+            (proj[:, 0] >= 0.0)
+            & (proj[:, 0] < float(W))
+            & (proj[:, 1] >= 0.0)
+            & (proj[:, 1] < float(H))
+        )
+
+    normal_ok = np.ones(len(verts), dtype=bool)
+    if vertex_normals is not None:
+        normals = np.asarray(vertex_normals, dtype=np.float64)
+        if normals.shape == verts.shape:
+            view_dir_world = -R[2, :]
+            normal_ok = (normals @ view_dir_world) > 0.05
+
+    depth_ok = np.ones(len(verts), dtype=bool)
+    if image_shape is not None:
+        H, W = image_shape
+        depth_points = np.full((H, W), np.inf, dtype=np.float32)
+        px = np.rint(proj[:, 0]).astype(np.int64)
+        py = np.rint(proj[:, 1]).astype(np.int64)
+        valid_px = in_frame & (px >= 0) & (px < W) & (py >= 0) & (py < H)
+        np.minimum.at(depth_points, (py[valid_px], px[valid_px]), z[valid_px].astype(np.float32))
+        depth_ok[:] = False
+        visible_indices = np.flatnonzero(valid_px)
+        for idx in visible_indices:
+            x = px[idx]
+            y = py[idx]
+            local = depth_points[max(0, y - 3):min(H, y + 4), max(0, x - 3):min(W, x + 4)]
+            nearest_z = float(np.min(local))
+            depth_ok[idx] = np.isfinite(nearest_z) and (z[idx] <= nearest_z + 0.004)
+
+    selected_all = np.zeros(len(verts), dtype=bool)
+    for eye_idx, corner_a, corner_b in (
+        (LMK_LEFT_EYE_IDX, 36, 39),
+        (LMK_RIGHT_EYE_IDX, 42, 45),
+    ):
+        eye_lmks = target_landmarks[eye_idx]
+        x_min = float(eye_lmks[:, 0].min())
+        x_max = float(eye_lmks[:, 0].max())
+        width = max(x_max - x_min, 1.0)
+        x_margin = max(5.0, width * 0.10)
+        y_center = float(np.median(eye_lmks[:, 1]))
+        y_margin = max(7.0, width * 0.18)
+        x0, x1 = target_landmarks[corner_a, 0], target_landmarks[corner_b, 0]
+        y0, y1 = target_landmarks[corner_a, 1], target_landmarks[corner_b, 1]
+
+        in_eye = (
+            in_frame
+            & normal_ok
+            & depth_ok
+            & (proj[:, 0] >= x_min - x_margin)
+            & (proj[:, 0] <= x_max + x_margin)
+            & (proj[:, 1] >= y_center - y_margin)
+            & (proj[:, 1] <= y_center + y_margin)
+        )
+        if not np.any(in_eye):
+            continue
+
+        if abs(float(x1 - x0)) < 1e-6:
+            target_y = np.full(in_eye.sum(), y_center, dtype=np.float64)
+        else:
+            alpha = np.clip((proj[in_eye, 0] - x0) / (x1 - x0), 0.0, 1.0)
+            target_y = (1.0 - alpha) * y0 + alpha * y1
+            target_y = 0.65 * target_y + 0.35 * y_center
+
+        dist = np.abs(proj[in_eye, 1] - target_y)
+        local_weight = np.clip(1.0 - dist / y_margin, 0.0, 1.0) ** 0.5
+        new_y = proj[in_eye, 1] + np.clip(strength, 0.0, 1.0) * local_weight * (target_y - proj[in_eye, 1])
+        v_cam[in_eye, 1] = (new_y - K[1, 2]) * z[in_eye] / K[1, 1]
+        selected_all |= in_eye
+
+    closed_verts = (R.T @ (v_cam - t[None, :]).T).T
+
+    if debug_image is not None and debug_path is not None:
+        after_cam = (R @ closed_verts.T + t[:, None]).T
+        after_z = after_cam[:, 2]
+        after_front = after_z > 1e-4
+        after = np.zeros_like(proj)
+        after[after_front, 0] = K[0, 0] * after_cam[after_front, 0] / after_z[after_front] + K[0, 2]
+        after[after_front, 1] = K[1, 1] * after_cam[after_front, 1] / after_z[after_front] + K[1, 2]
+        img = cv2.cvtColor(debug_image.copy(), cv2.COLOR_RGB2BGR)
+        pts_before = proj[selected_all]
+        pts_after = after[selected_all]
+        if len(pts_before) > 6000:
+            take = np.linspace(0, len(pts_before) - 1, 6000).astype(np.int64)
+            pts_before = pts_before[take]
+            pts_after = pts_after[take]
+        for x, y in pts_before:
+            cv2.circle(img, (int(round(x)), int(round(y))), 1, (0, 200, 255), -1)
+        for x, y in pts_after:
+            cv2.circle(img, (int(round(x)), int(round(y))), 1, (0, 255, 0), -1)
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(debug_path), img)
+        logger.info(f"Closed-eye geometry debug saved: {debug_path} ({int(selected_all.sum())} vertices)")
+
+    return closed_verts.astype(np.asarray(vertices).dtype, copy=False)
+
+
 class JointFLAMEOptimizer:
     """
     联合 L-BFGS 优化器。
@@ -505,11 +667,21 @@ class JointFLAMEOptimizer:
         lmk_weights = {}
         side_risk_idx = np.array(list(range(27)), dtype=np.int64)
         side_extra_soft_idx = np.array([36, 37, 38, 39, 42, 43, 44, 45], dtype=np.int64)
+        try:
+            from src import config as cfg
+            force_closed_eyes = bool(getattr(cfg, "FORCE_CLOSED_EYES", False))
+            closed_eye_loss_weight = float(getattr(cfg, "CLOSED_EYE_LOSS_WEIGHT", 0.0))
+        except Exception:
+            force_closed_eyes = False
+            closed_eye_loss_weight = 0.0
+        eye_idx_t = torch.tensor(LMK_EYE_IDX, device=dev)
         for name in view_names:
             w = torch.ones(68, device=dev, dtype=torch.float32)
             if name != "front":
                 w[torch.tensor(side_risk_idx, device=dev)] = 0.35
                 w[torch.tensor(side_extra_soft_idx, device=dev)] = 0.6
+            if force_closed_eyes:
+                w[eye_idx_t] = torch.maximum(w[eye_idx_t], torch.full_like(w[eye_idx_t], 3.0))
             lmk_weights[name] = w
 
         all_params = (
@@ -550,6 +722,9 @@ class JointFLAMEOptimizer:
                 ).mean(dim=1)
                 lmk_loss = (per_point * lmk_weights[name]).sum() / lmk_weights[name].sum().clamp_min(1e-6)
                 total_loss = total_loss + lmk_loss
+                if force_closed_eyes and closed_eye_loss_weight > 0:
+                    eye_close_loss = _closed_eye_landmark_loss(lmk_proj_n, lmk_target_n)
+                    total_loss = total_loss + closed_eye_loss_weight * eye_close_loss
 
                 contour_data = contour_rows.get(name)
                 if contour_data is not None and self.lambda_contour > 0:
@@ -1368,6 +1543,46 @@ def run_geometry_reconstruction(
         verts_displaced = np.array(_sm.vertices)
     except Exception as _e:
         logger.warning(f"Laplacian 平滑失败（{_e}），跳过")
+
+    try:
+        from src import config as cfg
+        force_closed_eyes = bool(getattr(cfg, "FORCE_CLOSED_EYES", False))
+        closed_eye_strength = float(getattr(cfg, "CLOSED_EYE_GEOMETRY_STRENGTH", 0.95))
+    except Exception:
+        force_closed_eyes = False
+        closed_eye_strength = 0.95
+
+    if force_closed_eyes and front_name in view_data and front_name in per_view_results:
+        logger.info("默认闭眼：按正脸闭眼线直接闭合眼部 mesh 顶点...")
+        front_result = per_view_results[front_name]
+        front_lmks = view_data[front_name]["lmk_2d"]
+        front_img = preprocessed_views[front_name]["image"]
+        front_base_normals = compute_vertex_normals(verts_sub, faces_sub)
+        front_depth_normals = compute_vertex_normals(verts_displaced, faces_sub)
+        verts_sub = _force_close_eye_geometry(
+            verts_sub,
+            intrinsics[front_name],
+            front_result["R"],
+            front_result["t"],
+            front_lmks,
+            faces=faces_sub,
+            vertex_normals=front_base_normals,
+            image_shape=front_img.shape[:2],
+            strength=closed_eye_strength,
+            debug_image=front_img,
+            debug_path=output_dir.parent / "debug" / "closed_eye_geometry" / "front_closed_eye_vertices.png",
+        )
+        verts_displaced = _force_close_eye_geometry(
+            verts_displaced,
+            intrinsics[front_name],
+            front_result["R"],
+            front_result["t"],
+            front_lmks,
+            faces=faces_sub,
+            vertex_normals=front_depth_normals,
+            image_shape=front_img.shape[:2],
+            strength=closed_eye_strength,
+        )
 
     # ── 导出 .obj ─────────────────────────────────────────────────────────
     base_output_path = output_dir / "face_mesh.obj"
