@@ -91,6 +91,25 @@ LAMBDA_EXP      = 5e-4  # 表情正则化权重
 LBFGS_MAX_ITER  = 100   # L-BFGS 最大迭代次数（提升拟合精度）
 LBFGS_LR        = 0.05  # 小学习率防止 NaN
 
+# ── 脸型轮廓拟合超参数 ──────────────────────────────────────────────────
+LAMBDA_CONTOUR = 0.0
+FRONT_CONTOUR_WEIGHT = 2.4
+FRONT_JAW_WEIGHT = 3.2
+SIDE_CONTOUR_WEIGHT = 1.2
+SIDE_JAW_WEIGHT = 1.8
+SIDE_BROW_WEIGHT = 0.25
+SIDE_EXTRA_SOFT_WEIGHT = 0.6
+ENABLE_SHAPE_ONLY_FINE_TUNE = True
+SHAPE_ONLY_MAX_ITER = 80
+SHAPE_ONLY_LR = 0.03
+SHAPE_ONLY_CONTOUR_SCALE = 1.5
+SHAPE_ONLY_STABLE_ANCHOR_WEIGHT = 1.8
+SHAPE_ONLY_DELTA_WEIGHT = 0.05
+SHAPE_ONLY_MAX_PARAM_DELTA = 0.35
+SHAPE_ONLY_MIN_CONTOUR_IMPROVE_PX = 0.05
+SHAPE_ONLY_MAX_STABLE_WORSEN_PX = 2.0
+SHAPE_ONLY_MAX_TOTAL_WORSEN_PX = 1.5
+
 # ── 深度估计超参数 ──────────────────────────────────────────────────────
 DEPTH_MODEL_SIZE = "large"       # "small"/"base"/"large"
 DISPLACEMENT_SCALE = 0.002         # 顶点置换最大幅度（米）

@@ -566,6 +566,12 @@ class JointFLAMEOptimizer:
         lambda_shape: float = 1e-3,
         lambda_exp: float = 1e-3,
         lambda_contour: float = 0.0,
+        front_contour_weight: float = 2.4,
+        front_jaw_weight: float = 3.2,
+        side_contour_weight: float = 1.2,
+        side_jaw_weight: float = 1.8,
+        side_brow_weight: float = 0.25,
+        side_extra_soft_weight: float = 0.6,
         max_iter: int = 100,
         lr: float = 0.5,
         device: str = "cuda",
@@ -576,6 +582,12 @@ class JointFLAMEOptimizer:
         self.lambda_shape = lambda_shape
         self.lambda_exp   = lambda_exp
         self.lambda_contour = lambda_contour
+        self.front_contour_weight = front_contour_weight
+        self.front_jaw_weight = front_jaw_weight
+        self.side_contour_weight = side_contour_weight
+        self.side_jaw_weight = side_jaw_weight
+        self.side_brow_weight = side_brow_weight
+        self.side_extra_soft_weight = side_extra_soft_weight
         self.max_iter = max_iter
         self.lr       = lr
         self.device   = device
@@ -654,8 +666,10 @@ class JointFLAMEOptimizer:
         }
         contour_rows = {}
         for name in view_names:
-            mask = views[name].get("face_mask")
-            if name == "front" or mask is None:
+            mask = views[name].get("shape_mask")
+            if mask is None:
+                mask = views[name].get("face_mask")
+            if mask is None:
                 contour_rows[name] = None
                 continue
             xmin, xmax, valid = _build_mask_row_bounds(mask)
@@ -665,8 +679,13 @@ class JointFLAMEOptimizer:
                 "valid": torch.tensor(valid, device=dev, dtype=torch.bool),
             }
         lmk_weights = {}
-        side_risk_idx = np.array(list(range(27)), dtype=np.int64)
-        side_extra_soft_idx = np.array([36, 37, 38, 39, 42, 43, 44, 45], dtype=np.int64)
+        contour_idx_t = torch.tensor(LMK_CONTOUR_IDX, device=dev)
+        jaw_idx_t = torch.tensor(np.arange(4, 13, dtype=np.int64), device=dev)
+        brow_idx_t = torch.tensor(LMK_BROW_IDX, device=dev)
+        side_extra_soft_idx_t = torch.tensor(
+            np.array([36, 37, 38, 39, 42, 43, 44, 45], dtype=np.int64),
+            device=dev,
+        )
         try:
             from src import config as cfg
             force_closed_eyes = bool(getattr(cfg, "FORCE_CLOSED_EYES", False))
@@ -677,9 +696,14 @@ class JointFLAMEOptimizer:
         eye_idx_t = torch.tensor(LMK_EYE_IDX, device=dev)
         for name in view_names:
             w = torch.ones(68, device=dev, dtype=torch.float32)
-            if name != "front":
-                w[torch.tensor(side_risk_idx, device=dev)] = 0.35
-                w[torch.tensor(side_extra_soft_idx, device=dev)] = 0.6
+            if name == "front":
+                w[contour_idx_t] = float(self.front_contour_weight)
+                w[jaw_idx_t] = float(self.front_jaw_weight)
+            else:
+                w[contour_idx_t] = float(self.side_contour_weight)
+                w[jaw_idx_t] = float(self.side_jaw_weight)
+                w[brow_idx_t] = float(self.side_brow_weight)
+                w[side_extra_soft_idx_t] = float(self.side_extra_soft_weight)
             if force_closed_eyes:
                 w[eye_idx_t] = torch.maximum(w[eye_idx_t], torch.full_like(w[eye_idx_t], 3.0))
             lmk_weights[name] = w
@@ -728,12 +752,12 @@ class JointFLAMEOptimizer:
 
                 contour_data = contour_rows.get(name)
                 if contour_data is not None and self.lambda_contour > 0:
-                    jaw_proj = lmk_proj[4:13]
-                    row_idx = torch.round(jaw_proj[:, 1]).long()
+                    contour_proj = lmk_proj[contour_idx_t]
+                    row_idx = torch.round(contour_proj[:, 1]).long()
                     row_idx = row_idx.clamp(0, contour_data["valid"].shape[0] - 1)
                     valid_rows = contour_data["valid"][row_idx]
                     if torch.any(valid_rows):
-                        jaw_x = jaw_proj[:, 0][valid_rows]
+                        jaw_x = contour_proj[:, 0][valid_rows]
                         xmin = contour_data["xmin"][row_idx][valid_rows]
                         xmax = contour_data["xmax"][row_idx][valid_rows]
                         side_dist = torch.minimum(torch.abs(jaw_x - xmin), torch.abs(jaw_x - xmax))
@@ -780,6 +804,247 @@ class JointFLAMEOptimizer:
             per_view[name] = {"R": R_final, "t": t_final, "exp": e_final}
 
         return shape_np, per_view
+
+
+def _shape_only_fine_tune(
+    flame: FLAMEModel,
+    shape_init: np.ndarray,
+    per_view_results: Dict[str, dict],
+    view_data: Dict[str, dict],
+    lmk_vertex_indices: np.ndarray,
+    lmk_face_idx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    debug_dir: Path,
+    device: str,
+    max_iter: int = 80,
+    lr: float = 0.03,
+    contour_scale: float = 1.5,
+    stable_anchor_weight: float = 1.8,
+    delta_weight: float = 0.05,
+    max_param_delta: float = 0.35,
+    min_contour_improve_px: float = 0.05,
+    max_stable_worsen_px: float = 2.0,
+    max_total_worsen_px: float = 1.5,
+    front_contour_weight: float = 2.4,
+    front_jaw_weight: float = 3.2,
+    side_contour_weight: float = 1.2,
+    side_jaw_weight: float = 1.8,
+) -> Tuple[np.ndarray, dict]:
+    """Fine-tune only shared shape while keeping each view's pose/expression fixed."""
+    report = {
+        "enabled": bool(max_iter > 0),
+        "accepted": False,
+        "reason": "",
+        "before": {},
+        "after": {},
+    }
+    if max_iter <= 0 or not per_view_results:
+        report["reason"] = "disabled"
+        return shape_init, report
+
+    out_dir = debug_dir / "shape_only_fine_tune"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    flame = flame.to(device)
+    model_device = flame.v_template.device
+    model_dtype = flame.v_template.dtype
+
+    shape_anchor = torch.tensor(shape_init, device=device, dtype=torch.float32)
+    shape_param = shape_anchor.clone().detach().requires_grad_(True)
+    view_names = [name for name in per_view_results.keys() if name in view_data]
+
+    faces_np = flame.faces.detach().cpu().numpy()
+    lmk_tri_vidx_np = None
+    if lmk_face_idx is not None and lmk_bary_coords is not None:
+        lmk_tri_vidx_np = faces_np[lmk_face_idx]
+        use_bary = True
+        lmk_v0 = torch.tensor(lmk_tri_vidx_np[:, 0], dtype=torch.long, device=device)
+        lmk_v1 = torch.tensor(lmk_tri_vidx_np[:, 1], dtype=torch.long, device=device)
+        lmk_v2 = torch.tensor(lmk_tri_vidx_np[:, 2], dtype=torch.long, device=device)
+        bary = torch.tensor(lmk_bary_coords, dtype=torch.float32, device=device)
+        bary_w0 = bary[:, 0:1]
+        bary_w1 = bary[:, 1:2]
+        bary_w2 = bary[:, 2:3]
+    else:
+        use_bary = False
+        lmk_idx = torch.tensor(lmk_vertex_indices, dtype=torch.long, device=device)
+
+    def torch_lmk_proj(proj: torch.Tensor) -> torch.Tensor:
+        if use_bary:
+            return proj[lmk_v0] * bary_w0 + proj[lmk_v1] * bary_w1 + proj[lmk_v2] * bary_w2
+        return proj[lmk_idx]
+
+    Ks = {
+        name: torch.tensor(view_data[name]["K"], device=device, dtype=torch.float32)
+        for name in view_names
+    }
+    targets = {
+        name: torch.tensor(view_data[name]["lmk_2d"], device=device, dtype=torch.float32)
+        for name in view_names
+    }
+    frozen = {}
+    for name in view_names:
+        res = per_view_results[name]
+        frozen[name] = {
+            "exp": torch.tensor(res["exp"], device=device, dtype=torch.float32),
+            "R": torch.tensor(res["R"], device=device, dtype=torch.float32),
+            "t": torch.tensor(res["t"], device=device, dtype=torch.float32),
+        }
+
+    contour_idx_t = torch.tensor(LMK_CONTOUR_IDX, device=device)
+    jaw_idx_t = torch.tensor(np.arange(4, 13, dtype=np.int64), device=device)
+    stable_idx_np = np.concatenate([LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX])
+    stable_idx_t = torch.tensor(stable_idx_np, device=device)
+
+    target_weights = {}
+    anchor_weights = {}
+    for name in view_names:
+        tw = torch.full((68,), 0.25, device=device, dtype=torch.float32)
+        if name == "front":
+            tw[contour_idx_t] = float(front_contour_weight * contour_scale)
+            tw[jaw_idx_t] = float(front_jaw_weight * contour_scale)
+        else:
+            tw[contour_idx_t] = float(side_contour_weight * contour_scale)
+            tw[jaw_idx_t] = float(side_jaw_weight * contour_scale)
+        aw = torch.zeros(68, device=device, dtype=torch.float32)
+        aw[stable_idx_t] = float(stable_anchor_weight)
+        target_weights[name] = tw
+        anchor_weights[name] = aw
+
+    baseline_proj = {}
+    with torch.no_grad():
+        for name in view_names:
+            verts0 = flame(shape_anchor, frozen[name]["exp"])
+            proj0 = project_vertices(verts0, Ks[name], frozen[name]["R"], frozen[name]["t"])
+            baseline_proj[name] = torch_lmk_proj(proj0).detach()
+
+    optimizer = torch.optim.Adam([shape_param], lr=lr)
+    for step in range(max_iter):
+        optimizer.zero_grad()
+        total_loss = torch.tensor(0.0, device=device)
+        for name in view_names:
+            verts = flame(shape_param, frozen[name]["exp"])
+            proj = project_vertices(verts, Ks[name], frozen[name]["R"], frozen[name]["t"])
+            lmk_proj = torch_lmk_proj(proj)
+            lmk_proj_n = lmk_proj / 1000.0
+            target_n = targets[name] / 1000.0
+            anchor_n = baseline_proj[name] / 1000.0
+
+            target_loss = F.smooth_l1_loss(
+                lmk_proj_n,
+                target_n,
+                reduction="none",
+                beta=0.01,
+            ).mean(dim=1)
+            target_loss = (target_loss * target_weights[name]).sum() / target_weights[name].sum().clamp_min(1e-6)
+
+            anchor_loss = F.smooth_l1_loss(
+                lmk_proj_n,
+                anchor_n,
+                reduction="none",
+                beta=0.006,
+            ).mean(dim=1)
+            anchor_loss = (anchor_loss * anchor_weights[name]).sum() / anchor_weights[name].sum().clamp_min(1e-6)
+            total_loss = total_loss + target_loss + anchor_loss
+
+        delta = shape_param - shape_anchor
+        total_loss = total_loss + float(delta_weight) * (delta ** 2).mean()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_([shape_param], max_norm=0.5)
+        optimizer.step()
+        if max_param_delta > 0:
+            with torch.no_grad():
+                delta = (shape_param - shape_anchor).clamp(-float(max_param_delta), float(max_param_delta))
+                shape_param.copy_(shape_anchor + delta)
+        if step == 0 or (step + 1) % 20 == 0:
+            logger.info(f"  shape-only step {step + 1}/{max_iter}, loss={float(total_loss.detach().cpu()):.6f}")
+
+    shape_after = shape_param.detach().cpu().numpy().astype(np.float32)
+
+    def evaluate_shape(shape_np: np.ndarray, image_prefix: str) -> dict:
+        records = []
+        for name in view_names:
+            res = per_view_results[name]
+            with torch.no_grad():
+                verts_np = flame(
+                    torch.tensor(shape_np, device=model_device, dtype=model_dtype),
+                    torch.tensor(res["exp"], device=model_device, dtype=model_dtype),
+                ).detach().cpu().numpy()
+            mean_err, max_err, errors = _save_landmark_reprojection_debug(
+                vertices=verts_np,
+                K=intrinsics[name],
+                R=res["R"],
+                t=res["t"],
+                image=preprocessed_views[name]["image"],
+                target_landmarks=view_data[name]["lmk_2d"],
+                lmk_vertex_indices=lmk_vertex_indices,
+                out_path=out_dir / f"{name}_{image_prefix}_reprojection.png",
+                lmk_tri_vidx=lmk_tri_vidx_np,
+                lmk_bary_coords=lmk_bary_coords,
+                return_errors=True,
+            )
+            records.append({
+                "view": name,
+                "mean_px": round(float(mean_err), 3),
+                "max_px": round(float(max_err), 3),
+                "contour_mean_px": _landmark_subset_stats(errors, LMK_CONTOUR_IDX)["mean_px"],
+                "jaw_mean_px": _landmark_subset_stats(errors, np.arange(4, 13, dtype=np.int64))["mean_px"],
+                "stable_mean_px": _landmark_subset_stats(errors, stable_idx_np)["mean_px"],
+            })
+        if not records:
+            return {
+                "records": [],
+                "mean_px": float("inf"),
+                "contour_mean_px": float("inf"),
+                "jaw_mean_px": float("inf"),
+                "stable_mean_px": float("inf"),
+            }
+        return {
+            "records": records,
+            "mean_px": round(float(np.mean([r["mean_px"] for r in records])), 3),
+            "contour_mean_px": round(float(np.mean([r["contour_mean_px"] for r in records])), 3),
+            "jaw_mean_px": round(float(np.mean([r["jaw_mean_px"] for r in records])), 3),
+            "stable_mean_px": round(float(np.mean([r["stable_mean_px"] for r in records])), 3),
+        }
+
+    before = evaluate_shape(np.asarray(shape_init, dtype=np.float32), "before")
+    after = evaluate_shape(shape_after, "after")
+    report["before"] = before
+    report["after"] = after
+
+    contour_improve = float(before["contour_mean_px"] - after["contour_mean_px"])
+    stable_worsen = float(after["stable_mean_px"] - before["stable_mean_px"])
+    total_worsen = float(after["mean_px"] - before["mean_px"])
+    accepted = (
+        contour_improve >= float(min_contour_improve_px)
+        and stable_worsen <= float(max_stable_worsen_px)
+        and total_worsen <= float(max_total_worsen_px)
+    )
+    report.update({
+        "accepted": bool(accepted),
+        "contour_improve_px": round(contour_improve, 3),
+        "stable_worsen_px": round(stable_worsen, 3),
+        "total_worsen_px": round(total_worsen, 3),
+        "shape_delta_norm": round(float(np.linalg.norm(shape_after - shape_init)), 6),
+        "reason": "contour improved with frozen pose" if accepted else "rejected by acceptance gate",
+    })
+
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        import json
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        "Shape-only fine tune: "
+        f"accepted={report['accepted']}, "
+        f"contour {before['contour_mean_px']:.2f}->{after['contour_mean_px']:.2f}px, "
+        f"stable {before['stable_mean_px']:.2f}->{after['stable_mean_px']:.2f}px, "
+        f"total {before['mean_px']:.2f}->{after['mean_px']:.2f}px"
+    )
+    if accepted:
+        return shape_after, report
+    return np.asarray(shape_init, dtype=np.float32), report
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1274,6 +1539,7 @@ def run_geometry_reconstruction(
             "R_init":   R_init,
             "t_init":   t_init,
             "face_mask": pdata.get("face_mask"),
+            "shape_mask": pdata.get("shape_mask"),
         }
         init_exps[view_name] = pv.get("exp")
 
@@ -1310,12 +1576,40 @@ def run_geometry_reconstruction(
     )
 
     # ── 联合 L-BFGS 优化 ──────────────────────────────────────────────────
+    try:
+        from src import config as _cfg
+    except Exception:
+        _cfg = None
+
+    def _cfg_float(name: str, default: float) -> float:
+        if _cfg is None:
+            return default
+        try:
+            return float(getattr(_cfg, name, default))
+        except Exception:
+            return default
+
+    def _cfg_bool(name: str, default: bool) -> bool:
+        if _cfg is None:
+            return default
+        try:
+            return bool(getattr(_cfg, name, default))
+        except Exception:
+            return default
+
     def _make_optimizer():
         return JointFLAMEOptimizer(
             flame=flame,
             lmk_vertex_indices=lmk_vertex_indices,
             lambda_shape=lambda_shape,
             lambda_exp=lambda_exp,
+            lambda_contour=_cfg_float("LAMBDA_CONTOUR", 0.0),
+            front_contour_weight=_cfg_float("FRONT_CONTOUR_WEIGHT", 2.4),
+            front_jaw_weight=_cfg_float("FRONT_JAW_WEIGHT", 3.2),
+            side_contour_weight=_cfg_float("SIDE_CONTOUR_WEIGHT", 1.2),
+            side_jaw_weight=_cfg_float("SIDE_JAW_WEIGHT", 1.8),
+            side_brow_weight=_cfg_float("SIDE_BROW_WEIGHT", 0.25),
+            side_extra_soft_weight=_cfg_float("SIDE_EXTRA_SOFT_WEIGHT", 0.6),
             max_iter=lbfgs_max_iter,
             lr=lbfgs_lr,
             device=device,
@@ -1369,6 +1663,47 @@ def run_geometry_reconstruction(
             logger.warning(
                 f"重试未改善：avg reproj {mean_err_avg:.2f}px -> {mean_err_retry:.2f}px，保留首次结果"
             )
+
+    shape_only_report = {"enabled": False, "accepted": False}
+    if _cfg_bool("ENABLE_SHAPE_ONLY_FINE_TUNE", True):
+        shape_opt, shape_only_report = _shape_only_fine_tune(
+            flame=flame,
+            shape_init=shape_opt,
+            per_view_results=per_view_results,
+            view_data=view_data,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_face_idx=lmk_data["face_idx"] if lmk_data is not None else None,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            preprocessed_views=preprocessed_views,
+            intrinsics=intrinsics,
+            debug_dir=debug_dir,
+            device=device,
+            max_iter=int(_cfg_float("SHAPE_ONLY_MAX_ITER", 80)),
+            lr=_cfg_float("SHAPE_ONLY_LR", 0.03),
+            contour_scale=_cfg_float("SHAPE_ONLY_CONTOUR_SCALE", 1.5),
+            stable_anchor_weight=_cfg_float("SHAPE_ONLY_STABLE_ANCHOR_WEIGHT", 1.8),
+            delta_weight=_cfg_float("SHAPE_ONLY_DELTA_WEIGHT", 0.05),
+            max_param_delta=_cfg_float("SHAPE_ONLY_MAX_PARAM_DELTA", 0.35),
+            min_contour_improve_px=_cfg_float("SHAPE_ONLY_MIN_CONTOUR_IMPROVE_PX", 0.05),
+            max_stable_worsen_px=_cfg_float("SHAPE_ONLY_MAX_STABLE_WORSEN_PX", 2.0),
+            max_total_worsen_px=_cfg_float("SHAPE_ONLY_MAX_TOTAL_WORSEN_PX", 1.5),
+            front_contour_weight=_cfg_float("FRONT_CONTOUR_WEIGHT", 2.4),
+            front_jaw_weight=_cfg_float("FRONT_JAW_WEIGHT", 3.2),
+            side_contour_weight=_cfg_float("SIDE_CONTOUR_WEIGHT", 1.2),
+            side_jaw_weight=_cfg_float("SIDE_JAW_WEIGHT", 1.8),
+        )
+
+    with open(debug_dir / "optimized_shape.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "shape_norm": float(np.linalg.norm(shape_opt)) if shape_opt is not None else 0.0,
+                "shape_params": shape_opt.tolist() if shape_opt is not None else [],
+                "shape_only_fine_tune": shape_only_report,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     _save_optimized_pose_quality_debug(
         shape_opt=shape_opt,

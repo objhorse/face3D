@@ -185,6 +185,24 @@ def create_face_mask_from_landmarks(
     return mask
 
 
+def create_face_shape_mask_from_landmarks(
+    landmarks_2d: np.ndarray,
+    image_shape: Tuple[int, int],
+    dilate_px: int = 7,
+) -> np.ndarray:
+    h, w = image_shape[:2]
+    hull_pts = landmarks_2d[FACE_OVAL].astype(np.int32)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(mask, [hull_pts], 255)
+    if dilate_px > 0:
+        k = max(1, int(dilate_px))
+        if k % 2 == 0:
+            k += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask = cv2.dilate(mask, kernel)
+    return mask
+
+
 
 def create_landmark_hull_mask(
     landmarks_2d: np.ndarray,
@@ -381,24 +399,27 @@ def preprocess_all_views(
             lmks[:, 1] = lmks[:, 1] * scale + y_off
 
         if lmks is not None:
+            shape_mask = create_face_shape_mask_from_landmarks(lmks, image.shape)
             if parser_mask is not None and view_name in {"left", "right"}:
                 face_mask = refine_face_mask_parser_primary(image, lmks, parser_mask)
             else:
                 face_mask = refine_face_mask_grabcut(image, lmks, coarse_fg_mask=bg_mask)
         else:
             face_mask = bg_mask.copy()
+            shape_mask = face_mask.copy()
 
         results[view_name] = {
             'image': image,
             'landmarks': lmks,
             'visibility': vis,
             'face_mask': face_mask,
+            'shape_mask': shape_mask,
             'bg_mask': bg_mask,
             'parser_mask': parser_mask,
         }
 
         if debug_dir is not None:
-            _save_debug_images(view_name, image, lmks, face_mask, bg_mask, parser_mask, debug_dir)
+            _save_debug_images(view_name, image, lmks, face_mask, shape_mask, bg_mask, parser_mask, debug_dir)
 
     return results
 
@@ -409,6 +430,7 @@ def _save_debug_images(
     image: np.ndarray,
     landmarks: Optional[np.ndarray],
     face_mask: np.ndarray,
+    shape_mask: np.ndarray,
     bg_mask: np.ndarray,
     parser_mask: Optional[np.ndarray],
     debug_dir: Path,
@@ -417,6 +439,7 @@ def _save_debug_images(
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
     cv2.imwrite(str(debug_dir / f'{view_name}_face_mask.png'), face_mask)
+    cv2.imwrite(str(debug_dir / f'{view_name}_shape_mask.png'), shape_mask)
     cv2.imwrite(str(debug_dir / f'{view_name}_bg_mask.png'), bg_mask)
     if parser_mask is not None:
         cv2.imwrite(str(debug_dir / f'{view_name}_parser_mask.png'), parser_mask)

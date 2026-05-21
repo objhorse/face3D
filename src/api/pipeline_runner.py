@@ -84,7 +84,11 @@ def _run_pipeline(
     # ── 3. 关键点检测 ────────────────────────────────────────────────────────
     progress("landmarks", 20, "检测面部关键点...")
     from src.module1_preprocess import preprocess_all_views
-    view_data = preprocess_all_views(images, target_size=cfg.WORK_IMAGE_SIZE)
+    view_data = preprocess_all_views(
+        images,
+        debug_dir=session_output_dir / "debug",
+        target_size=cfg.WORK_IMAGE_SIZE,
+    )
     # 后续所有模块统一使用缩放后的图像（512×512），确保与内参 cx=cy=256 匹配
     images_resized = {k: v["image"] for k, v in view_data.items()}
 
