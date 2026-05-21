@@ -399,6 +399,104 @@ def _expand_face_selection(faces: np.ndarray, keep_faces: np.ndarray, rings: int
     return expanded
 
 
+def _visible_face_crop_strict_settings(image_shape: Tuple[int, int]) -> Tuple[bool, int, float]:
+    try:
+        from src import config as cfg
+        enabled = bool(getattr(cfg, "VISIBLE_FACE_CROP_STRICT_BOUNDARY", True))
+        base_erode_px = float(getattr(cfg, "VISIBLE_FACE_CROP_ERODE_PX_AT_1024", 3))
+        lower_start = float(getattr(cfg, "VISIBLE_FACE_CROP_LOWER_STRICT_START", 0.78))
+        base_size = float(getattr(cfg, "WORK_IMAGE_SIZE", 1024))
+    except Exception:
+        enabled, base_erode_px, lower_start, base_size = True, 3.0, 0.78, 1024.0
+
+    h, w = image_shape[:2]
+    erode_px = int(round(base_erode_px * max(h, w) / max(base_size, 1.0)))
+    return enabled, max(0, erode_px), float(np.clip(lower_start, 0.0, 1.0))
+
+
+def _erode_binary_mask(mask: np.ndarray, erode_px: int) -> np.ndarray:
+    if erode_px <= 0:
+        return mask
+    k = max(3, int(erode_px) * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    return cv2.erode(mask, kernel, iterations=1)
+
+
+def _mask_lower_strict_y(mask: np.ndarray, lower_start: float) -> int:
+    ys = np.where(mask > 127)[0]
+    if len(ys) == 0:
+        return mask.shape[0]
+    y_min, y_max = int(ys.min()), int(ys.max())
+    return int(round(y_min + (y_max - y_min) * float(lower_start)))
+
+
+def _strict_visible_face_filter(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    mask: np.ndarray,
+    center_proj: np.ndarray,
+    base_keep: np.ndarray,
+    image_shape: Tuple[int, int],
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Tighten visible-crop decisions near mask boundaries and the chin."""
+    enabled, erode_px, lower_start = _visible_face_crop_strict_settings(image_shape)
+    if not enabled or not np.any(base_keep):
+        return base_keep, {"enabled": int(enabled), "rejected": 0}
+
+    h_img, w_img = image_shape[:2]
+    eroded = _erode_binary_mask(mask, erode_px)
+    lower_y = _mask_lower_strict_y(mask, lower_start)
+
+    tri = vertices[faces].astype(np.float32)
+    edge_mid = (tri + np.roll(tri, -1, axis=1)) * 0.5
+    samples = np.concatenate([tri, edge_mid], axis=1)
+    _, _, sample_proj_flat, sample_front_flat = project_texture_points_to_image(
+        samples.reshape(-1, 3), K, R, t
+    )
+    sample_proj = sample_proj_flat.reshape(len(faces), 6, 2)
+    sample_front = sample_front_flat.reshape(len(faces), 6)
+
+    sx = np.clip(sample_proj[:, :, 0].astype(np.int32), 0, w_img - 1)
+    sy = np.clip(sample_proj[:, :, 1].astype(np.int32), 0, h_img - 1)
+    sample_in_img = (
+        sample_front
+        & (sample_proj[:, :, 0] >= 0)
+        & (sample_proj[:, :, 0] < w_img - 1)
+        & (sample_proj[:, :, 1] >= 0)
+        & (sample_proj[:, :, 1] < h_img - 1)
+    )
+    sample_in_mask = sample_in_img & (mask[sy, sx] > 127)
+    sample_in_eroded = sample_in_img & (eroded[sy, sx] > 127)
+
+    cx = np.clip(center_proj[:, 0].astype(np.int32), 0, w_img - 1)
+    cy = np.clip(center_proj[:, 1].astype(np.int32), 0, h_img - 1)
+    center_in_eroded = eroded[cy, cx] > 127
+    lower_face = cy >= lower_y
+    boundary_face = ~center_in_eroded
+
+    all_samples_in_mask = np.all(sample_in_mask, axis=1)
+    all_samples_in_eroded = np.all(sample_in_eroded, axis=1)
+    strict_needed = base_keep & (boundary_face | lower_face)
+    strict_ok = all_samples_in_mask & (~lower_face | all_samples_in_eroded)
+    keep = base_keep & (~strict_needed | strict_ok)
+
+    rejected = base_keep & ~keep
+    stats = {
+        "enabled": 1,
+        "erode_px": int(erode_px),
+        "lower_y": int(lower_y),
+        "base_keep": int(base_keep.sum()),
+        "strict_needed": int(strict_needed.sum()),
+        "rejected": int(rejected.sum()),
+        "rejected_lower": int((rejected & lower_face).sum()),
+        "rejected_boundary": int((rejected & boundary_face).sum()),
+    }
+    return keep, stats
+
+
 def _save_visible_face_crop_debug(
     uv_verts: np.ndarray,
     uv_faces: np.ndarray,
@@ -456,7 +554,20 @@ def crop_mesh_to_visible_face(
         in_mask = mask[py, px] > 127
         z_ref = depth_map[py, px]
         z_ok = z <= (z_ref + float(z_tol))
-        face_keep |= in_img & in_mask & z_ok
+        view_keep = in_img & in_mask & z_ok
+        view_keep, strict_stats = _strict_visible_face_filter(
+            vertices, faces, k, r, t, mask, proj, view_keep, (h_img, w_img)
+        )
+        if strict_stats.get("enabled"):
+            logger.info(
+                f"  [{view_name}] visible crop strict: "
+                f"need={strict_stats.get('strict_needed', 0)}, "
+                f"reject={strict_stats.get('rejected', 0)} "
+                f"(lower={strict_stats.get('rejected_lower', 0)}, "
+                f"boundary={strict_stats.get('rejected_boundary', 0)}), "
+                f"erode={strict_stats.get('erode_px', 0)}px"
+            )
+        face_keep |= view_keep
 
     if not np.any(face_keep):
         logger.warning("Visible face crop found no faces; keeping the full mesh")
@@ -1465,4 +1576,3 @@ def run_texture_pipeline(
     )
 
     return glb_path
-

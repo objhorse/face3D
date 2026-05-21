@@ -27,6 +27,18 @@ output/
 
 # 常见大媒体（按需注释掉以纳入版本库）
 *.mp4
+*.avi
+*.zip
+*.rar
+
+# Local captures, camera utilities, and runtime logs
+AMCap/
+captures/
+captures_*/
+new_captures/
+charuco_analysis/
+server_*.log
+新建文件夹/
 
 # 可选：不提交原始拍摄图（含隐私/体积）。若需一并上传，删除下一行。
 # image20260207_rotated/

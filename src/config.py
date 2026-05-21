@@ -38,6 +38,9 @@ ENABLE_UV_HOLE_FILL_FACES = True
 ENABLE_VISIBLE_FACE_CROP = True
 VISIBLE_FACE_CROP_DILATE_RINGS = 0
 VISIBLE_FACE_CROP_Z_TOL = 0.006
+VISIBLE_FACE_CROP_STRICT_BOUNDARY = True
+VISIBLE_FACE_CROP_ERODE_PX_AT_1024 = 3
+VISIBLE_FACE_CROP_LOWER_STRICT_START = 0.78
 FORCE_CLOSED_EYES = True
 CLOSED_EYE_GEOMETRY_STRENGTH = 0.95
 CLOSED_EYE_LOSS_WEIGHT = 0.0
@@ -46,11 +49,11 @@ TEST_DATA_DIR       = OUTPUT_DIR / "test_data"   # generate_test_data.py 输出
 # ── 输入图像命名约定 ─────────────────────────────────────────────────────
 # key: 视角名, value: 文件名（相对于图像目录）
 DEFAULT_VIEW_NAMES = {
-    "left":   "camera1_20260511_191357.jpg",
-    "front":  "camera2_20260511_191357.jpg",
-    "right":  "camera3_20260511_191357.jpg",
+    "left":   "camera1_20260519_102448.jpg",
+    "front":  "camera2_20260519_102448.jpg",
+    "right":  "camera3_20260519_102448.jpg",
 }
-DEFAULT_IMAGE_DIR = ROOT / "new_captures" / "zyz_captures"
+DEFAULT_IMAGE_DIR = ROOT / "captures_20260519_102448"
 
 # ── 相机内参（手动覆盖接口） ──────────────────────────────────────────────
 # 若为 None，则由 Dust3R 预测；若设置则跳过 Dust3R 直接使用
