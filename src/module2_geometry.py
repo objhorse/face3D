@@ -806,6 +806,191 @@ class JointFLAMEOptimizer:
         return shape_np, per_view
 
 
+def _logsumexp_np(a: np.ndarray, axis: int = 1) -> np.ndarray:
+    max_a = np.max(a, axis=axis, keepdims=True)
+    return np.squeeze(max_a, axis=axis) + np.log(np.sum(np.exp(a - max_a), axis=axis))
+
+
+def _dense_side_envelope_np(
+    proj_np: np.ndarray,
+    candidate_idx: np.ndarray,
+    rows: np.ndarray,
+    row_sigma: float,
+    tau: float,
+    side: str,
+) -> np.ndarray:
+    pts = proj_np[candidate_idx]
+    x = pts[:, 0][None, :]
+    y = pts[:, 1][None, :]
+    row_y = rows.astype(np.float32)[:, None]
+    logits = -0.5 * ((y - row_y) / max(float(row_sigma), 1e-3)) ** 2
+    logits = np.clip(logits, -60.0, 0.0)
+    if side == "left":
+        return -float(tau) * _logsumexp_np(logits - x / float(tau), axis=1)
+    return float(tau) * _logsumexp_np(logits + x / float(tau), axis=1)
+
+
+def _dense_contour_metric_np(proj_np: np.ndarray, dense: dict) -> Tuple[float, np.ndarray, np.ndarray]:
+    rows = dense["rows_np"]
+    row_weight = dense["row_weight_np"]
+    target_left = dense["target_left_np"]
+    target_right = dense["target_right_np"]
+    row_sigma = float(dense["row_sigma"])
+    tau = float(dense["tau"])
+    left_pred = _dense_side_envelope_np(
+        proj_np, dense["left_idx_np"], rows, row_sigma, tau, side="left"
+    )
+    right_pred = _dense_side_envelope_np(
+        proj_np, dense["right_idx_np"], rows, row_sigma, tau, side="right"
+    )
+    err = (np.abs(left_pred - target_left) + np.abs(right_pred - target_right)) * 0.5
+    metric = float((err * row_weight).sum() / np.clip(row_weight.sum(), 1e-6, None))
+    return metric, left_pred, right_pred
+
+
+def _save_dense_contour_debug_image(
+    image: np.ndarray,
+    dense: dict,
+    left_pred: np.ndarray,
+    right_pred: np.ndarray,
+    out_path: Path,
+):
+    import cv2
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    rows = dense["rows_np"].astype(np.int32)
+    left_target = dense["target_left_np"]
+    right_target = dense["target_right_np"]
+    for row, xl_t, xr_t, xl_p, xr_p in zip(rows, left_target, right_target, left_pred, right_pred):
+        y = int(row)
+        cv2.circle(img, (int(round(xl_t)), y), 2, (0, 255, 0), -1)
+        cv2.circle(img, (int(round(xr_t)), y), 2, (0, 255, 0), -1)
+        cv2.circle(img, (int(round(xl_p)), y), 2, (0, 0, 255), -1)
+        cv2.circle(img, (int(round(xr_p)), y), 2, (0, 0, 255), -1)
+        cv2.line(img, (int(round(xl_t)), y), (int(round(xl_p)), y), (0, 255, 255), 1)
+        cv2.line(img, (int(round(xr_t)), y), (int(round(xr_p)), y), (0, 255, 255), 1)
+    cv2.imwrite(str(out_path), img)
+
+
+def _build_shape_only_dense_contours(
+    flame: FLAMEModel,
+    shape_anchor: torch.Tensor,
+    frozen: Dict[str, dict],
+    view_names: list,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    device: str,
+    row_step: int,
+    row_sigma: float,
+    tau: float,
+    boundary_band_px: float,
+    search_margin_px: float,
+) -> Dict[str, dict]:
+    dense = {}
+    row_step = max(2, int(row_step))
+    with torch.no_grad():
+        for name in view_names:
+            mask = None
+            if name in preprocessed_views:
+                mask = preprocessed_views[name].get("shape_mask")
+                if mask is None:
+                    mask = preprocessed_views[name].get("face_mask")
+            if mask is None:
+                mask = view_data[name].get("shape_mask")
+            if mask is None:
+                continue
+
+            h, _w = mask.shape[:2]
+            xmin, xmax, valid = _build_mask_row_bounds(mask)
+            target_lmk = np.asarray(view_data[name]["lmk_2d"], dtype=np.float32)
+            contour_y = target_lmk[LMK_CONTOUR_IDX, 1]
+            y_min = int(max(0, np.percentile(contour_y, 12) - 8))
+            y_max = int(min(h - 1, np.max(contour_y) + 14))
+            rows = np.arange(y_min, y_max + 1, row_step, dtype=np.int32)
+            rows = rows[valid[rows]]
+            if rows.size < 8:
+                continue
+
+            verts0 = flame(shape_anchor, frozen[name]["exp"])
+            K_t = torch.tensor(view_data[name]["K"], device=device, dtype=torch.float32)
+            proj0 = project_vertices(verts0, K_t, frozen[name]["R"], frozen[name]["t"])
+            proj0_np = proj0.detach().cpu().numpy()
+            row_idx = np.round(proj0_np[:, 1]).astype(np.int32)
+            row_idx = np.clip(row_idx, 0, h - 1)
+            v_valid = valid[row_idx]
+            left = xmin[row_idx]
+            right = xmax[row_idx]
+            center = (left + right) * 0.5
+            in_y = (proj0_np[:, 1] >= y_min - boundary_band_px) & (proj0_np[:, 1] <= y_max + boundary_band_px)
+            in_x = (proj0_np[:, 0] >= left - search_margin_px) & (proj0_np[:, 0] <= right + search_margin_px)
+            base = v_valid & in_y & in_x
+            left_candidates = base & (
+                (np.abs(proj0_np[:, 0] - left) <= boundary_band_px) | (proj0_np[:, 0] <= center)
+            )
+            right_candidates = base & (
+                (np.abs(proj0_np[:, 0] - right) <= boundary_band_px) | (proj0_np[:, 0] >= center)
+            )
+            left_idx = np.flatnonzero(left_candidates).astype(np.int64)
+            right_idx = np.flatnonzero(right_candidates).astype(np.int64)
+            if left_idx.size < 24 or right_idx.size < 24:
+                continue
+
+            y_norm = (rows.astype(np.float32) - float(rows.min())) / max(float(rows.max() - rows.min()), 1.0)
+            row_weight = 0.75 + 0.65 * y_norm
+            item = {
+                "rows_np": rows.astype(np.float32),
+                "target_left_np": xmin[rows].astype(np.float32),
+                "target_right_np": xmax[rows].astype(np.float32),
+                "row_weight_np": row_weight.astype(np.float32),
+                "left_idx_np": left_idx,
+                "right_idx_np": right_idx,
+                "row_sigma": float(row_sigma),
+                "tau": float(tau),
+                "rows_t": torch.tensor(rows.astype(np.float32), device=device),
+                "target_left_t": torch.tensor(xmin[rows].astype(np.float32), device=device),
+                "target_right_t": torch.tensor(xmax[rows].astype(np.float32), device=device),
+                "row_weight_t": torch.tensor(row_weight.astype(np.float32), device=device),
+                "left_idx_t": torch.tensor(left_idx, dtype=torch.long, device=device),
+                "right_idx_t": torch.tensor(right_idx, dtype=torch.long, device=device),
+            }
+            dense[name] = item
+            logger.info(
+                f"  [{name}] dense contour rows={rows.size}, "
+                f"left_vertices={left_idx.size}, right_vertices={right_idx.size}"
+            )
+    return dense
+
+
+def _dense_contour_loss_torch(proj: torch.Tensor, dense: dict) -> torch.Tensor:
+    def side_loss(candidate_idx: torch.Tensor, target: torch.Tensor, side: str) -> torch.Tensor:
+        pts = proj[candidate_idx]
+        x = pts[:, 0].unsqueeze(0)
+        y = pts[:, 1].unsqueeze(0)
+        rows = dense["rows_t"].unsqueeze(1)
+        sigma = max(float(dense["row_sigma"]), 1e-3)
+        tau = max(float(dense["tau"]), 1e-3)
+        logits = -0.5 * ((y - rows) / sigma) ** 2
+        logits = torch.clamp(logits, min=-60.0, max=0.0)
+        if side == "left":
+            pred = -tau * torch.logsumexp(logits - x / tau, dim=1)
+        else:
+            pred = tau * torch.logsumexp(logits + x / tau, dim=1)
+        err = (pred - target) / 1000.0
+        per_row = F.smooth_l1_loss(
+            err,
+            torch.zeros_like(err),
+            reduction="none",
+            beta=0.006,
+        )
+        weight = dense["row_weight_t"]
+        return (per_row * weight).sum() / weight.sum().clamp_min(1e-6)
+
+    left = side_loss(dense["left_idx_t"], dense["target_left_t"], "left")
+    right = side_loss(dense["right_idx_t"], dense["target_right_t"], "right")
+    return 0.5 * (left + right)
+
+
 def _shape_only_fine_tune(
     flame: FLAMEModel,
     shape_init: np.ndarray,
@@ -831,6 +1016,15 @@ def _shape_only_fine_tune(
     front_jaw_weight: float = 3.2,
     side_contour_weight: float = 1.2,
     side_jaw_weight: float = 1.8,
+    enable_dense_contour: bool = True,
+    dense_contour_weight: float = 4.0,
+    dense_row_step: int = 6,
+    dense_row_sigma: float = 7.0,
+    dense_softmin_tau: float = 10.0,
+    dense_boundary_band_px: float = 90.0,
+    dense_search_margin_px: float = 70.0,
+    min_dense_contour_improve_px: float = 0.25,
+    max_contour_worsen_px: float = 1.5,
 ) -> Tuple[np.ndarray, dict]:
     """Fine-tune only shared shape while keeping each view's pose/expression fixed."""
     report = {
@@ -920,6 +1114,25 @@ def _shape_only_fine_tune(
             proj0 = project_vertices(verts0, Ks[name], frozen[name]["R"], frozen[name]["t"])
             baseline_proj[name] = torch_lmk_proj(proj0).detach()
 
+    dense_contours = {}
+    if enable_dense_contour and dense_contour_weight > 0:
+        dense_contours = _build_shape_only_dense_contours(
+            flame=flame,
+            shape_anchor=shape_anchor,
+            frozen=frozen,
+            view_names=view_names,
+            view_data=view_data,
+            preprocessed_views=preprocessed_views,
+            device=device,
+            row_step=dense_row_step,
+            row_sigma=dense_row_sigma,
+            tau=dense_softmin_tau,
+            boundary_band_px=dense_boundary_band_px,
+            search_margin_px=dense_search_margin_px,
+        )
+        if not dense_contours:
+            logger.warning("Shape-only dense contour enabled but no usable dense contour rows were built.")
+
     optimizer = torch.optim.Adam([shape_param], lr=lr)
     for step in range(max_iter):
         optimizer.zero_grad()
@@ -948,6 +1161,12 @@ def _shape_only_fine_tune(
             ).mean(dim=1)
             anchor_loss = (anchor_loss * anchor_weights[name]).sum() / anchor_weights[name].sum().clamp_min(1e-6)
             total_loss = total_loss + target_loss + anchor_loss
+
+            dense = dense_contours.get(name)
+            if dense is not None:
+                dense_loss = _dense_contour_loss_torch(proj, dense)
+                if torch.isfinite(dense_loss):
+                    total_loss = total_loss + float(dense_contour_weight) * dense_loss
 
         delta = shape_param - shape_anchor
         total_loss = total_loss + float(delta_weight) * (delta ** 2).mean()
@@ -985,6 +1204,21 @@ def _shape_only_fine_tune(
                 lmk_bary_coords=lmk_bary_coords,
                 return_errors=True,
             )
+            dense_metric = None
+            dense = dense_contours.get(name)
+            if dense is not None:
+                v_cam = (res["R"] @ verts_np.T + res["t"][:, None]).T
+                z = np.clip(v_cam[:, 2], 1e-6, None)
+                v_hom = (intrinsics[name] @ v_cam.T).T
+                proj_np = np.stack([v_hom[:, 0] / z, v_hom[:, 1] / z], axis=1)
+                dense_metric, left_pred, right_pred = _dense_contour_metric_np(proj_np, dense)
+                _save_dense_contour_debug_image(
+                    image=preprocessed_views[name]["image"],
+                    dense=dense,
+                    left_pred=left_pred,
+                    right_pred=right_pred,
+                    out_path=out_dir / f"{name}_{image_prefix}_dense_contour.png",
+                )
             records.append({
                 "view": name,
                 "mean_px": round(float(mean_err), 3),
@@ -992,6 +1226,7 @@ def _shape_only_fine_tune(
                 "contour_mean_px": _landmark_subset_stats(errors, LMK_CONTOUR_IDX)["mean_px"],
                 "jaw_mean_px": _landmark_subset_stats(errors, np.arange(4, 13, dtype=np.int64))["mean_px"],
                 "stable_mean_px": _landmark_subset_stats(errors, stable_idx_np)["mean_px"],
+                "dense_contour_mean_px": round(float(dense_metric), 3) if dense_metric is not None else None,
             })
         if not records:
             return {
@@ -1000,13 +1235,20 @@ def _shape_only_fine_tune(
                 "contour_mean_px": float("inf"),
                 "jaw_mean_px": float("inf"),
                 "stable_mean_px": float("inf"),
+                "dense_contour_mean_px": None,
             }
+        dense_vals = [
+            float(r["dense_contour_mean_px"])
+            for r in records
+            if r.get("dense_contour_mean_px") is not None
+        ]
         return {
             "records": records,
             "mean_px": round(float(np.mean([r["mean_px"] for r in records])), 3),
             "contour_mean_px": round(float(np.mean([r["contour_mean_px"] for r in records])), 3),
             "jaw_mean_px": round(float(np.mean([r["jaw_mean_px"] for r in records])), 3),
             "stable_mean_px": round(float(np.mean([r["stable_mean_px"] for r in records])), 3),
+            "dense_contour_mean_px": round(float(np.mean(dense_vals)), 3) if dense_vals else None,
         }
 
     before = evaluate_shape(np.asarray(shape_init, dtype=np.float32), "before")
@@ -1017,18 +1259,31 @@ def _shape_only_fine_tune(
     contour_improve = float(before["contour_mean_px"] - after["contour_mean_px"])
     stable_worsen = float(after["stable_mean_px"] - before["stable_mean_px"])
     total_worsen = float(after["mean_px"] - before["mean_px"])
-    accepted = (
+    before_dense = before.get("dense_contour_mean_px")
+    after_dense = after.get("dense_contour_mean_px")
+    dense_improve = 0.0
+    if before_dense is not None and after_dense is not None:
+        dense_improve = float(before_dense - after_dense)
+    contour_worsen = float(after["contour_mean_px"] - before["contour_mean_px"])
+    contour_or_dense_improved = (
         contour_improve >= float(min_contour_improve_px)
+        or dense_improve >= float(min_dense_contour_improve_px)
+    )
+    accepted = (
+        contour_or_dense_improved
+        and contour_worsen <= float(max_contour_worsen_px)
         and stable_worsen <= float(max_stable_worsen_px)
         and total_worsen <= float(max_total_worsen_px)
     )
     report.update({
         "accepted": bool(accepted),
         "contour_improve_px": round(contour_improve, 3),
+        "dense_contour_improve_px": round(dense_improve, 3),
+        "contour_worsen_px": round(contour_worsen, 3),
         "stable_worsen_px": round(stable_worsen, 3),
         "total_worsen_px": round(total_worsen, 3),
         "shape_delta_norm": round(float(np.linalg.norm(shape_after - shape_init)), 6),
-        "reason": "contour improved with frozen pose" if accepted else "rejected by acceptance gate",
+        "reason": "dense/landmark contour improved with frozen pose" if accepted else "rejected by acceptance gate",
     })
 
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
@@ -1039,6 +1294,7 @@ def _shape_only_fine_tune(
         "Shape-only fine tune: "
         f"accepted={report['accepted']}, "
         f"contour {before['contour_mean_px']:.2f}->{after['contour_mean_px']:.2f}px, "
+        f"dense {before_dense}->{after_dense}px, "
         f"stable {before['stable_mean_px']:.2f}->{after['stable_mean_px']:.2f}px, "
         f"total {before['mean_px']:.2f}->{after['mean_px']:.2f}px"
     )
@@ -1691,6 +1947,15 @@ def run_geometry_reconstruction(
             front_jaw_weight=_cfg_float("FRONT_JAW_WEIGHT", 3.2),
             side_contour_weight=_cfg_float("SIDE_CONTOUR_WEIGHT", 1.2),
             side_jaw_weight=_cfg_float("SIDE_JAW_WEIGHT", 1.8),
+            enable_dense_contour=_cfg_bool("ENABLE_SHAPE_ONLY_DENSE_CONTOUR", True),
+            dense_contour_weight=_cfg_float("SHAPE_ONLY_DENSE_CONTOUR_WEIGHT", 4.0),
+            dense_row_step=int(_cfg_float("SHAPE_ONLY_DENSE_ROW_STEP", 6)),
+            dense_row_sigma=_cfg_float("SHAPE_ONLY_DENSE_ROW_SIGMA", 7.0),
+            dense_softmin_tau=_cfg_float("SHAPE_ONLY_DENSE_SOFTMIN_TAU", 10.0),
+            dense_boundary_band_px=_cfg_float("SHAPE_ONLY_DENSE_BOUNDARY_BAND_PX", 90.0),
+            dense_search_margin_px=_cfg_float("SHAPE_ONLY_DENSE_SEARCH_MARGIN_PX", 70.0),
+            min_dense_contour_improve_px=_cfg_float("SHAPE_ONLY_MIN_DENSE_CONTOUR_IMPROVE_PX", 0.25),
+            max_contour_worsen_px=_cfg_float("SHAPE_ONLY_MAX_CONTOUR_WORSEN_PX", 1.5),
         )
 
     with open(debug_dir / "optimized_shape.json", "w", encoding="utf-8") as f:
