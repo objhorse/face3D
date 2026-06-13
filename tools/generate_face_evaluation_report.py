@@ -26,6 +26,13 @@ def read_json(path: Path, default=None):
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
+def read_first_json(paths, default=None):
+    for path in paths:
+        if path.exists():
+            return read_json(path, default)
+    return {} if default is None else default
+
+
 def parse_reprojection(path: Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     mean_match = re.search(r"mean_error_px=([0-9.]+)", text)
@@ -84,6 +91,7 @@ def asset(relative: str) -> str:
 def build_report(metrics: dict) -> str:
     reproj = metrics["reprojection"]
     shape = metrics["shape_fine_tune"]
+    pose = metrics.get("pose_refinement", {})
     deform = metrics["free_face_deform"]
     mesh = metrics["mesh"]
     texture = metrics["texture"]
@@ -95,6 +103,24 @@ def build_report(metrics: dict) -> str:
         f"<tr><td>{label}</td><td>{record['mean_px']:.2f} px</td><td>{record['max_px']:.2f} px</td></tr>"
         for label, record in (("左侧", reproj["left"]), ("正面", reproj["front"]), ("右侧", reproj["right"]))
     )
+    pose_rows = "".join(
+        "<tr>"
+        f"<td>{rec.get('view')}</td>"
+        f"<td>{'采用' if rec.get('accepted') else '回滚'}</td>"
+        f"<td>{rec.get('dense_improve_px')} px</td>"
+        f"<td>{rec.get('stable_worsen_px')} px</td>"
+        f"<td>{rec.get('mean_improve_px')} px</td>"
+        "</tr>"
+        for rec in pose.get("view_records", [])
+    )
+    pose_panel = f"""
+<section class="panel"><h2>相机/姿态微调结果</h2>
+<p>本轮只调整每个视角的相机 <code>R/t</code>，不改 UV、不强行移动最终网格。最终状态：<b>{'已采用' if pose.get('accepted') else '未采用'}</b>；采用视角：<b>{', '.join(pose.get('applied_views', [])) or '无'}</b>。</p>
+<table><thead><tr><th>视角</th><th>动作</th><th>密集轮廓改善</th><th>稳定五官变化</th><th>关键点均值改善</th></tr></thead><tbody>{pose_rows}</tbody></table>
+<p class="muted">负的“稳定五官变化”表示眼鼻嘴更稳。当前策略保留正脸相机，采用左右侧脸候选，用小于 1px 的单视角关键点均值代价换取约 15-17px 的侧脸轮廓收益。</p>
+<p class="muted">细节审计页：<a href="../debug/pose_refinement/index.html">pose_refinement/index.html</a></p>
+</section>
+"""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -135,6 +161,8 @@ table{{width:100%;border-collapse:collapse}} th,td{{padding:11px 10px;border-bot
 </div>
 
 <section class="panel"><h2>完整管线结果</h2><div class="three"><div><h3>几何阶段</h3><b>{phase1['ElapsedSeconds']:.1f} 秒</b><p class="muted">三视图预处理、MICA/DECA 初始化、FLAME 拟合、自由轮廓与深度置换均完成。</p></div><div><h3>纹理阶段</h3><b>{phase3['ElapsedSeconds']:.1f} 秒</b><p class="muted">三视图采样、颜色匹配、接缝与耳侧修复、GLB 打包完成。</p></div><div><h3>总耗时</h3><b>{total_seconds:.1f} 秒</b><p class="muted">最终 GLB：{metrics['artifacts']['glb_mb']:.2f} MB；首次运行补全了 InsightFace/3DFAN 缓存。</p></div></div></section>
+
+{pose_panel}
 
 <section class="two">
  <div class="panel"><h2>重投影误差</h2><table><thead><tr><th>视角</th><th>平均误差</th><th>最大误差</th></tr></thead><tbody>{reprojection_rows}</tbody></table><p class="muted">1024×1024 工作画布。眉眼、脸侧轮廓和下颌是主要误差来源。</p></div>
@@ -185,9 +213,19 @@ renderer.setAnimationLoop(()=>{{resize();controls.update();renderer.render(scene
 
 def main() -> None:
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
-    phase1 = read_json(EVAL_DIR / "phase1_run.json")
-    phase3 = read_json(EVAL_DIR / "phase3_run.json")
-    shape = read_json(OUTPUT / "debug" / "optimized_shape.json").get("shape_only_fine_tune", {})
+    phase1 = read_first_json([
+        EVAL_DIR / "phase1_pose_refine_v3_run.json",
+        EVAL_DIR / "phase1_pose_refine_v2_run.json",
+        EVAL_DIR / "phase1_pose_refine_run.json",
+        EVAL_DIR / "phase1_run.json",
+    ])
+    phase3 = read_first_json([
+        EVAL_DIR / "phase3_pose_refine_run.json",
+        EVAL_DIR / "phase3_run.json",
+    ])
+    optimized_shape = read_json(OUTPUT / "debug" / "optimized_shape.json")
+    shape = optimized_shape.get("shape_only_fine_tune", {})
+    pose = optimized_shape.get("pose_refinement", {})
     deform = read_json(OUTPUT / "debug" / "free_face_deform_summary.json")
     metrics = {
         "generated_at": datetime.now().astimezone().isoformat(),
@@ -202,6 +240,7 @@ def main() -> None:
             for name in ("left", "front", "right")
         },
         "shape_fine_tune": shape,
+        "pose_refinement": pose,
         "free_face_deform": deform,
         "mesh": mesh_metrics(),
         "texture": texture_metrics(),

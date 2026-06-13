@@ -2487,6 +2487,472 @@ def _shape_only_fine_tune(
 # Depth-Anything-V2 深度置换
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _pose_refine_cameras(
+    flame: FLAMEModel,
+    shape_opt: np.ndarray,
+    per_view_results: Dict[str, dict],
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    lmk_vertex_indices: np.ndarray,
+    lmk_face_idx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    debug_dir: Path,
+    device: str,
+    enabled: bool = True,
+    max_iter: int = 80,
+    lr: float = 0.01,
+    lmk_weight: float = 1.0,
+    stable_weight: float = 1.4,
+    dense_contour_weight: float = 0.35,
+    rot_reg: float = 0.02,
+    trans_reg: float = 0.02,
+    min_mean_improve_px: float = 1.0,
+    min_dense_improve_px: float = 3.0,
+    max_mean_worsen_px: float = 1.0,
+    max_stable_worsen_px: float = 1.0,
+    max_maxerr_worsen_px: float = 5.0,
+    max_rot_deg: float = 6.0,
+    max_trans_rel: float = 0.08,
+    global_max_overall_worsen_px: float = 0.75,
+    global_max_front_worsen_px: float = 0.5,
+    global_max_side_dense_worsen_px: float = 2.0,
+) -> Tuple[Dict[str, dict], dict]:
+    """Refine per-view camera pose only; keep shape, expression, mesh and UV fixed."""
+    report = {
+        "enabled": bool(enabled),
+        "accepted": False,
+        "applied_views": [],
+        "view_records": [],
+        "global_reject_reasons": [],
+    }
+    if not enabled or max_iter <= 0 or not per_view_results:
+        report["reason"] = "disabled"
+        return per_view_results, report
+
+    out_dir = debug_dir / "pose_refinement"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    flame = flame.to(device)
+    model_device = flame.v_template.device
+    model_dtype = flame.v_template.dtype
+    shape_t = torch.tensor(shape_opt, device=model_device, dtype=model_dtype)
+    faces_np = flame.faces.detach().cpu().numpy()
+    lmk_tri_vidx_np = faces_np[lmk_face_idx] if lmk_face_idx is not None and lmk_bary_coords is not None else None
+    view_names = [name for name in per_view_results.keys() if name in view_data and name in intrinsics]
+    stable_idx_np = np.concatenate([LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX])
+    stable_idx_t = torch.tensor(stable_idx_np, dtype=torch.long, device=device)
+
+    def view_vertices(name: str) -> np.ndarray:
+        exp = np.asarray(per_view_results[name]["exp"], dtype=np.float32)
+        with torch.no_grad():
+            verts = flame(shape_t, torch.tensor(exp, device=model_device, dtype=model_dtype))
+        return verts.detach().cpu().numpy()
+
+    def measure_view(name: str, verts_np: np.ndarray, R: np.ndarray, t: np.ndarray) -> dict:
+        _lmk_proj, errors = _landmark_reprojection_details(
+            vertices=verts_np,
+            K=intrinsics[name],
+            R=R,
+            t=t,
+            target_landmarks=view_data[name]["lmk_2d"],
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx_np,
+            lmk_bary_coords=lmk_bary_coords,
+        )
+        dense_metric = None
+        dense = dense_contours.get(name)
+        if dense is not None:
+            proj_np, _ = _project_vertices_np(verts_np, intrinsics[name], R, t)
+            dense_metric, _left_pred, _right_pred = _dense_contour_metric_np(proj_np, dense)
+        return {
+            "mean_px": float(errors.mean()),
+            "max_px": float(errors.max()),
+            "stable_mean_px": float(np.asarray(errors)[stable_idx_np].mean()),
+            "contour_mean_px": float(np.asarray(errors)[LMK_CONTOUR_IDX].mean()),
+            "dense_contour_mean_px": None if dense_metric is None else float(dense_metric),
+        }
+
+    def rounded_metrics(metrics: dict) -> dict:
+        return {
+            "mean_px": round(float(metrics["mean_px"]), 3),
+            "max_px": round(float(metrics["max_px"]), 3),
+            "stable_mean_px": round(float(metrics["stable_mean_px"]), 3),
+            "contour_mean_px": round(float(metrics["contour_mean_px"]), 3),
+            "dense_contour_mean_px": (
+                None if metrics.get("dense_contour_mean_px") is None
+                else round(float(metrics["dense_contour_mean_px"]), 3)
+            ),
+        }
+
+    def evaluate_view(name: str, R: np.ndarray, t: np.ndarray, prefix: str) -> dict:
+        verts_np = view_vertices(name)
+        mean_err, max_err, errors = _save_landmark_reprojection_debug(
+            vertices=verts_np,
+            K=intrinsics[name],
+            R=R,
+            t=t,
+            image=preprocessed_views[name]["image"],
+            target_landmarks=view_data[name]["lmk_2d"],
+            lmk_vertex_indices=lmk_vertex_indices,
+            out_path=out_dir / f"{name}_{prefix}_reprojection.png",
+            lmk_tri_vidx=lmk_tri_vidx_np,
+            lmk_bary_coords=lmk_bary_coords,
+            return_errors=True,
+        )
+        face_mask = preprocessed_views[name].get("face_mask")
+        if face_mask is None:
+            face_mask = preprocessed_views[name].get("shape_mask")
+        if face_mask is not None:
+            _save_projection_debug(
+                verts_np,
+                faces_np,
+                intrinsics[name],
+                R,
+                t,
+                preprocessed_views[name]["image"],
+                face_mask,
+                out_dir / f"{name}_{prefix}_mesh.png",
+            )
+        dense_metric = None
+        dense = dense_contours.get(name)
+        if dense is not None:
+            proj_np, _ = _project_vertices_np(verts_np, intrinsics[name], R, t)
+            dense_metric, left_pred, right_pred = _dense_contour_metric_np(proj_np, dense)
+            _save_dense_contour_debug_image(
+                image=preprocessed_views[name]["image"],
+                dense=dense,
+                left_pred=left_pred,
+                right_pred=right_pred,
+                out_path=out_dir / f"{name}_{prefix}_dense_contour.png",
+            )
+        return {
+            "mean_px": round(float(mean_err), 3),
+            "max_px": round(float(max_err), 3),
+            "stable_mean_px": _landmark_subset_stats(errors, stable_idx_np)["mean_px"],
+            "contour_mean_px": _landmark_subset_stats(errors, LMK_CONTOUR_IDX)["mean_px"],
+            "dense_contour_mean_px": round(float(dense_metric), 3) if dense_metric is not None else None,
+        }
+
+    frozen_for_dense = {}
+    for name in view_names:
+        res = per_view_results[name]
+        frozen_for_dense[name] = {
+            "exp": torch.tensor(res["exp"], device=device, dtype=torch.float32),
+            "R": torch.tensor(res["R"], device=device, dtype=torch.float32),
+            "t": torch.tensor(res["t"], device=device, dtype=torch.float32),
+        }
+    dense_contours = _build_shape_only_dense_contours(
+        flame=flame,
+        shape_anchor=torch.tensor(shape_opt, device=device, dtype=torch.float32),
+        frozen=frozen_for_dense,
+        view_names=view_names,
+        view_data=view_data,
+        preprocessed_views=preprocessed_views,
+        device=device,
+        row_step=6,
+        row_sigma=7.0,
+        tau=10.0,
+        boundary_band_px=90.0,
+        search_margin_px=70.0,
+    )
+
+    refined = {
+        name: {
+            "R": np.asarray(res["R"], dtype=np.float32).copy(),
+            "t": np.asarray(res["t"], dtype=np.float32).copy(),
+            "exp": np.asarray(res["exp"], dtype=np.float32).copy(),
+        }
+        for name, res in per_view_results.items()
+    }
+
+    for name in view_names:
+        res = per_view_results[name]
+        R0 = np.asarray(res["R"], dtype=np.float32)
+        t0 = np.asarray(res["t"], dtype=np.float32)
+        exp_t = torch.tensor(res["exp"], device=device, dtype=torch.float32)
+        verts = flame(torch.tensor(shape_opt, device=device, dtype=torch.float32), exp_t).detach()
+        verts_np = verts.detach().cpu().numpy()
+        K_t = torch.tensor(intrinsics[name], device=device, dtype=torch.float32)
+        target = torch.tensor(view_data[name]["lmk_2d"], device=device, dtype=torch.float32)
+        r0 = Rotation.from_matrix(R0).as_rotvec().astype(np.float32)
+        r_param = torch.tensor(r0, device=device, dtype=torch.float32, requires_grad=True)
+        t_param = torch.tensor(t0, device=device, dtype=torch.float32, requires_grad=True)
+        r_anchor = torch.tensor(r0, device=device, dtype=torch.float32)
+        t_anchor = torch.tensor(t0, device=device, dtype=torch.float32)
+
+        if lmk_tri_vidx_np is not None and lmk_bary_coords is not None:
+            lmk_v0 = torch.tensor(lmk_tri_vidx_np[:, 0], dtype=torch.long, device=device)
+            lmk_v1 = torch.tensor(lmk_tri_vidx_np[:, 1], dtype=torch.long, device=device)
+            lmk_v2 = torch.tensor(lmk_tri_vidx_np[:, 2], dtype=torch.long, device=device)
+            bary = torch.tensor(lmk_bary_coords, dtype=torch.float32, device=device)
+
+            def lmk_from_proj(proj: torch.Tensor) -> torch.Tensor:
+                return (
+                    proj[lmk_v0] * bary[:, 0:1]
+                    + proj[lmk_v1] * bary[:, 1:2]
+                    + proj[lmk_v2] * bary[:, 2:3]
+                )
+        else:
+            lmk_idx = torch.tensor(lmk_vertex_indices, dtype=torch.long, device=device)
+
+            def lmk_from_proj(proj: torch.Tensor) -> torch.Tensor:
+                return proj[lmk_idx]
+
+        point_weights = torch.ones(68, device=device, dtype=torch.float32) * float(lmk_weight)
+        point_weights[stable_idx_t] = point_weights[stable_idx_t] + float(stable_weight)
+        view_lr = float(lr) * (0.5 if name == "front" else 1.0)
+        view_dense_weight = float(dense_contour_weight) * (0.25 if name == "front" else 1.0)
+        optimizer = torch.optim.Adam([r_param, t_param], lr=view_lr)
+        dense = dense_contours.get(name)
+        before_quick = measure_view(name, verts_np, R0, t0)
+        best_candidate = None
+        best_score = -float("inf")
+
+        def candidate_deltas(metrics: dict, R_candidate: np.ndarray, t_candidate: np.ndarray) -> dict:
+            dense_improve_value = 0.0
+            if (
+                before_quick.get("dense_contour_mean_px") is not None
+                and metrics.get("dense_contour_mean_px") is not None
+            ):
+                dense_improve_value = float(before_quick["dense_contour_mean_px"] - metrics["dense_contour_mean_px"])
+            rot_delta = float(np.rad2deg(np.linalg.norm(Rotation.from_matrix(R_candidate @ R0.T).as_rotvec())))
+            trans_delta = float(np.linalg.norm(t_candidate - t0) / max(abs(float(t0[2])), float(np.linalg.norm(t0)), 1e-6))
+            return {
+                "mean_improve": float(before_quick["mean_px"] - metrics["mean_px"]),
+                "mean_worsen": float(metrics["mean_px"] - before_quick["mean_px"]),
+                "stable_worsen": float(metrics["stable_mean_px"] - before_quick["stable_mean_px"]),
+                "maxerr_worsen": float(metrics["max_px"] - before_quick["max_px"]),
+                "dense_improve": dense_improve_value,
+                "rot_delta_deg": rot_delta,
+                "trans_rel": trans_delta,
+            }
+
+        for _step in range(int(max_iter)):
+            optimizer.zero_grad()
+            R_cur = rodrigues_to_matrix(r_param)
+            proj = project_vertices(verts, K_t, R_cur, t_param)
+            lmk_proj = lmk_from_proj(proj)
+            per_point = F.smooth_l1_loss(
+                lmk_proj / 1000.0,
+                target / 1000.0,
+                reduction="none",
+                beta=0.01,
+            ).mean(dim=1)
+            loss = (per_point * point_weights).sum() / point_weights.sum().clamp_min(1e-6)
+            if dense is not None and view_dense_weight > 0:
+                dense_loss = _dense_contour_loss_torch(proj, dense)
+                if torch.isfinite(dense_loss):
+                    loss = loss + view_dense_weight * dense_loss
+            loss = loss + float(rot_reg) * ((r_param - r_anchor) ** 2).mean()
+            t_scale = torch.clamp(torch.abs(t_anchor[2]), min=0.05)
+            loss = loss + float(trans_reg) * (((t_param - t_anchor) / t_scale) ** 2).mean()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_([r_param, t_param], max_norm=0.25)
+            optimizer.step()
+            if (_step + 1) % 5 == 0 or (_step + 1) == int(max_iter):
+                R_candidate = rodrigues_to_matrix(r_param.detach()).detach().cpu().numpy().astype(np.float32)
+                t_candidate = t_param.detach().cpu().numpy().astype(np.float32)
+                metrics = measure_view(name, verts_np, R_candidate, t_candidate)
+                deltas = candidate_deltas(metrics, R_candidate, t_candidate)
+                view_max_mean_worsen = float(max_mean_worsen_px) * (0.25 if name == "front" else 1.0)
+                enough_improvement = (
+                    deltas["mean_improve"] >= float(min_mean_improve_px)
+                    or deltas["dense_improve"] >= float(min_dense_improve_px)
+                )
+                candidate_ok = (
+                    enough_improvement
+                    and deltas["mean_worsen"] <= view_max_mean_worsen
+                    and deltas["stable_worsen"] <= float(max_stable_worsen_px)
+                    and deltas["maxerr_worsen"] <= float(max_maxerr_worsen_px)
+                    and deltas["rot_delta_deg"] <= float(max_rot_deg)
+                    and deltas["trans_rel"] <= float(max_trans_rel)
+                )
+                score = (
+                    deltas["dense_improve"]
+                    + max(deltas["mean_improve"], 0.0) * 2.0
+                    - max(deltas["mean_worsen"], 0.0) * 3.0
+                    - max(deltas["stable_worsen"], 0.0) * 8.0
+                )
+                if candidate_ok and score > best_score:
+                    best_score = score
+                    best_candidate = {
+                        "R": R_candidate.copy(),
+                        "t": t_candidate.copy(),
+                        "metrics": metrics,
+                        "deltas": deltas,
+                        "step": _step + 1,
+                        "score": float(score),
+                    }
+
+        before = evaluate_view(name, R0, t0, "before")
+        if best_candidate is not None:
+            R1 = best_candidate["R"]
+            t1 = best_candidate["t"]
+        else:
+            R1 = rodrigues_to_matrix(r_param.detach()).detach().cpu().numpy().astype(np.float32)
+            t1 = t_param.detach().cpu().numpy().astype(np.float32)
+        after = evaluate_view(name, R1, t1, "after")
+        mean_improve = float(before["mean_px"] - after["mean_px"])
+        mean_worsen = float(after["mean_px"] - before["mean_px"])
+        stable_worsen = float(after["stable_mean_px"] - before["stable_mean_px"])
+        maxerr_worsen = float(after["max_px"] - before["max_px"])
+        dense_improve = 0.0
+        if before.get("dense_contour_mean_px") is not None and after.get("dense_contour_mean_px") is not None:
+            dense_improve = float(before["dense_contour_mean_px"] - after["dense_contour_mean_px"])
+        rot_delta_deg = float(np.rad2deg(np.linalg.norm(Rotation.from_matrix(R1 @ R0.T).as_rotvec())))
+        trans_rel = float(np.linalg.norm(t1 - t0) / max(abs(float(t0[2])), float(np.linalg.norm(t0)), 1e-6))
+        reasons = []
+        if mean_improve < float(min_mean_improve_px) and dense_improve < float(min_dense_improve_px):
+            reasons.append("insufficient_improvement")
+        view_max_mean_worsen = float(max_mean_worsen_px) * (0.25 if name == "front" else 1.0)
+        if mean_worsen > view_max_mean_worsen:
+            reasons.append("mean_worsened")
+        if stable_worsen > float(max_stable_worsen_px):
+            reasons.append("stable_worsened")
+        if maxerr_worsen > float(max_maxerr_worsen_px):
+            reasons.append("max_error_worsened")
+        if rot_delta_deg > float(max_rot_deg):
+            reasons.append("rotation_too_large")
+        if trans_rel > float(max_trans_rel):
+            reasons.append("translation_too_large")
+        accepted = not reasons
+        record = {
+            "view": name,
+            "accepted": bool(accepted),
+            "reject_reasons": reasons,
+            "before": before,
+            "after": after,
+            "mean_improve_px": round(mean_improve, 3),
+            "dense_improve_px": round(dense_improve, 3),
+            "stable_worsen_px": round(stable_worsen, 3),
+            "maxerr_worsen_px": round(maxerr_worsen, 3),
+            "rot_delta_deg": round(rot_delta_deg, 3),
+            "trans_rel": round(trans_rel, 5),
+            "selected_step": None if best_candidate is None else int(best_candidate["step"]),
+            "selected_score": None if best_candidate is None else round(float(best_candidate["score"]), 4),
+        }
+        report["view_records"].append(record)
+        if accepted:
+            refined[name]["R"] = R1
+            refined[name]["t"] = t1
+            report["applied_views"].append(name)
+        logger.info(
+            "Pose refine [%s]: accepted=%s mean %.2f->%.2fpx dense %s->%s rot=%.2fdeg trans_rel=%.4f",
+            name,
+            accepted,
+            before["mean_px"],
+            after["mean_px"],
+            before.get("dense_contour_mean_px"),
+            after.get("dense_contour_mean_px"),
+            rot_delta_deg,
+            trans_rel,
+        )
+
+    def aggregate(records: list, use_after: bool) -> dict:
+        vals = []
+        front = None
+        side_dense_worsen = 0.0
+        for rec in records:
+            key = "after" if use_after and rec["accepted"] else "before"
+            vals.append(float(rec[key]["mean_px"]))
+            if rec["view"] == "front":
+                front = float(rec[key]["mean_px"])
+            if rec["view"] != "front":
+                b = rec["before"].get("dense_contour_mean_px")
+                a = rec[key].get("dense_contour_mean_px")
+                if b is not None and a is not None:
+                    side_dense_worsen = max(side_dense_worsen, float(a - b))
+        return {
+            "mean_px": round(float(np.mean(vals)) if vals else 0.0, 3),
+            "front_mean_px": round(float(front), 3) if front is not None else None,
+            "max_side_dense_worsen_px": round(float(side_dense_worsen), 3),
+        }
+
+    before_global = aggregate(report["view_records"], use_after=False)
+    after_global = aggregate(report["view_records"], use_after=True)
+    report["before_global"] = before_global
+    report["after_global"] = after_global
+    if after_global["mean_px"] - before_global["mean_px"] > float(global_max_overall_worsen_px):
+        report["global_reject_reasons"].append("overall_landmarks_worsened")
+    if (
+        before_global["front_mean_px"] is not None
+        and after_global["front_mean_px"] is not None
+        and after_global["front_mean_px"] - before_global["front_mean_px"] > float(global_max_front_worsen_px)
+    ):
+        report["global_reject_reasons"].append("front_landmarks_worsened")
+    if after_global["max_side_dense_worsen_px"] > float(global_max_side_dense_worsen_px):
+        report["global_reject_reasons"].append("side_dense_contour_worsened")
+
+    if report["global_reject_reasons"]:
+        refined = per_view_results
+        report["applied_views"] = []
+        report["accepted"] = False
+        report["reason"] = "global validation failed: " + ", ".join(report["global_reject_reasons"])
+    else:
+        report["accepted"] = bool(report["applied_views"])
+        report["reason"] = "accepted pose refinement" if report["accepted"] else "no view accepted"
+
+    _write_pose_refinement_index(out_dir, report)
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    return refined, report
+
+
+def _write_pose_refinement_index(out_dir: Path, report: dict) -> None:
+    import html
+
+    def esc(value) -> str:
+        return html.escape(str(value))
+
+    rows = []
+    figures = []
+    for rec in report.get("view_records", []):
+        view = rec["view"]
+        rows.append(
+            "<tr>"
+            f"<td>{esc(view)}</td>"
+            f"<td>{'yes' if rec.get('accepted') else 'no'}</td>"
+            f"<td>{esc(rec['before']['mean_px'])}</td>"
+            f"<td>{esc(rec['after']['mean_px'])}</td>"
+            f"<td>{esc(rec.get('mean_improve_px'))}</td>"
+            f"<td>{esc(rec['before'].get('dense_contour_mean_px'))}</td>"
+            f"<td>{esc(rec['after'].get('dense_contour_mean_px'))}</td>"
+            f"<td>{esc(', '.join(rec.get('reject_reasons', [])))}</td>"
+            "</tr>"
+        )
+        for kind in ("reprojection", "mesh", "dense_contour"):
+            before = out_dir / f"{view}_before_{kind}.png"
+            after = out_dir / f"{view}_after_{kind}.png"
+            if before.exists() and after.exists():
+                figures.append(
+                    "<section>"
+                    f"<h2>{esc(view)} {esc(kind)}</h2>"
+                    f"<figure><img src='{esc(before.name)}'><figcaption>before</figcaption></figure>"
+                    f"<figure><img src='{esc(after.name)}'><figcaption>after</figcaption></figure>"
+                    "</section>"
+                )
+    doc = f"""<!doctype html>
+<meta charset="utf-8">
+<title>Pose refinement audit</title>
+<style>
+body{{font-family:Arial,"Microsoft YaHei",sans-serif;background:#101827;color:#eef3ff;margin:24px}}
+table{{border-collapse:collapse;width:100%;margin:16px 0}}td,th{{border:1px solid #314866;padding:8px}}
+section{{margin:24px 0;padding:16px;background:#17243a;border-radius:10px}}
+figure{{display:inline-block;width:48%;vertical-align:top;margin:0 1% 16px 0}}img{{width:100%;background:#000}}
+.ok{{color:#4ade80}}.bad{{color:#fb7185}}
+</style>
+<h1>Pose refinement audit</h1>
+<p>Accepted: <b class="{'ok' if report.get('accepted') else 'bad'}">{esc(report.get('accepted'))}</b></p>
+<p>Reason: {esc(report.get('reason'))}</p>
+<table><thead><tr><th>view</th><th>accepted</th><th>mean before</th><th>mean after</th><th>improve</th><th>dense before</th><th>dense after</th><th>reject reasons</th></tr></thead><tbody>
+{''.join(rows)}
+</tbody></table>
+{''.join(figures)}
+"""
+    (out_dir / "index.html").write_text(doc, encoding="utf-8")
+
+
 def load_depth_model(model_dir: Path, model_size: str = "large", device: str = "cuda"):
     """Load Depth-Anything-V2, preferring a local snapshot directory."""
     try:
@@ -3138,12 +3604,47 @@ def run_geometry_reconstruction(
             max_contour_worsen_px=_cfg_float("SHAPE_ONLY_MAX_CONTOUR_WORSEN_PX", 1.5),
         )
 
+    pose_refine_report = {"enabled": False, "accepted": False}
+    if _cfg_bool("ENABLE_POSE_REFINEMENT", True):
+        per_view_results, pose_refine_report = _pose_refine_cameras(
+            flame=flame,
+            shape_opt=shape_opt,
+            per_view_results=per_view_results,
+            view_data=view_data,
+            preprocessed_views=preprocessed_views,
+            intrinsics=intrinsics,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_face_idx=lmk_data["face_idx"] if lmk_data is not None else None,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            debug_dir=debug_dir,
+            device=device,
+            enabled=True,
+            max_iter=int(_cfg_float("POSE_REFINE_MAX_ITER", 80)),
+            lr=_cfg_float("POSE_REFINE_LR", 0.01),
+            lmk_weight=_cfg_float("POSE_REFINE_LMK_WEIGHT", 1.0),
+            stable_weight=_cfg_float("POSE_REFINE_STABLE_WEIGHT", 1.4),
+            dense_contour_weight=_cfg_float("POSE_REFINE_DENSE_CONTOUR_WEIGHT", 0.35),
+            rot_reg=_cfg_float("POSE_REFINE_ROT_REG", 0.02),
+            trans_reg=_cfg_float("POSE_REFINE_TRANS_REG", 0.02),
+            min_mean_improve_px=_cfg_float("POSE_REFINE_MIN_MEAN_IMPROVE_PX", 1.0),
+            min_dense_improve_px=_cfg_float("POSE_REFINE_MIN_DENSE_IMPROVE_PX", 3.0),
+            max_mean_worsen_px=_cfg_float("POSE_REFINE_MAX_MEAN_WORSEN_PX", 1.0),
+            max_stable_worsen_px=_cfg_float("POSE_REFINE_MAX_STABLE_WORSEN_PX", 1.0),
+            max_maxerr_worsen_px=_cfg_float("POSE_REFINE_MAX_MAXERR_WORSEN_PX", 5.0),
+            max_rot_deg=_cfg_float("POSE_REFINE_MAX_ROT_DEG", 6.0),
+            max_trans_rel=_cfg_float("POSE_REFINE_MAX_TRANS_REL", 0.08),
+            global_max_overall_worsen_px=_cfg_float("POSE_REFINE_GLOBAL_MAX_OVERALL_WORSEN_PX", 0.75),
+            global_max_front_worsen_px=_cfg_float("POSE_REFINE_GLOBAL_MAX_FRONT_WORSEN_PX", 0.5),
+            global_max_side_dense_worsen_px=_cfg_float("POSE_REFINE_GLOBAL_MAX_SIDE_DENSE_WORSEN_PX", 2.0),
+        )
+
     with open(debug_dir / "optimized_shape.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "shape_norm": float(np.linalg.norm(shape_opt)) if shape_opt is not None else 0.0,
                 "shape_params": shape_opt.tolist() if shape_opt is not None else [],
                 "shape_only_fine_tune": shape_only_report,
+                "pose_refinement": pose_refine_report,
             },
             f,
             ensure_ascii=False,
