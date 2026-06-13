@@ -16,6 +16,7 @@
 import sys
 import logging
 import pickle
+import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -39,6 +40,7 @@ LMK_BROW_IDX = np.arange(17, 27, dtype=np.int64)
 LMK_NOSE_IDX = np.arange(27, 36, dtype=np.int64)
 LMK_EYE_IDX = np.arange(36, 48, dtype=np.int64)
 LMK_MOUTH_IDX = np.arange(48, 68, dtype=np.int64)
+LMK_INNER_MOUTH_IDX = np.arange(60, 68, dtype=np.int64)
 LMK_GEOMETRY_IDX = np.concatenate([LMK_CONTOUR_IDX, LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX])
 LMK_ERROR_GROUPS = (
     ("轮廓", LMK_CONTOUR_IDX),
@@ -989,6 +991,1184 @@ def _dense_contour_loss_torch(proj: torch.Tensor, dense: dict) -> torch.Tensor:
     left = side_loss(dense["left_idx_t"], dense["target_left_t"], "left")
     right = side_loss(dense["right_idx_t"], dense["target_right_t"], "right")
     return 0.5 * (left + right)
+
+
+def _project_vertices_np(vertices: np.ndarray, K: np.ndarray, R: np.ndarray, t: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    v_cam = (R @ vertices.T + t[:, None]).T
+    z = np.clip(v_cam[:, 2], 1e-6, None)
+    v_hom = (K @ v_cam.T).T
+    proj = np.stack([v_hom[:, 0] / z, v_hom[:, 1] / z], axis=1)
+    return proj, v_cam
+
+
+def _build_free_face_contour_data(
+    vertices: np.ndarray,
+    K: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+    mask: np.ndarray,
+    landmarks_2d: np.ndarray,
+    row_step: int,
+    row_sigma: float,
+    tau: float,
+    boundary_band_px: float,
+    search_margin_px: float,
+    visible_mask: Optional[np.ndarray] = None,
+) -> Optional[dict]:
+    h, _w = mask.shape[:2]
+    xmin, xmax, valid = _build_mask_row_bounds(mask)
+    contour_y = np.asarray(landmarks_2d, dtype=np.float32)[LMK_CONTOUR_IDX, 1]
+    y_min = int(max(0, np.percentile(contour_y, 12) - 8))
+    y_max = int(min(h - 1, np.max(contour_y) + 16))
+    rows = np.arange(y_min, y_max + 1, max(2, int(row_step)), dtype=np.int32)
+    rows = rows[valid[rows]]
+    if rows.size < 8:
+        return None
+
+    proj, _v_cam = _project_vertices_np(vertices, K, R, t)
+    row_idx = np.round(proj[:, 1]).astype(np.int32)
+    row_idx = np.clip(row_idx, 0, h - 1)
+    v_valid = valid[row_idx]
+    left = xmin[row_idx]
+    right = xmax[row_idx]
+    center = (left + right) * 0.5
+    in_y = (proj[:, 1] >= y_min - boundary_band_px) & (proj[:, 1] <= y_max + boundary_band_px)
+    in_x = (proj[:, 0] >= left - search_margin_px) & (proj[:, 0] <= right + search_margin_px)
+    base = v_valid & in_y & in_x
+    if visible_mask is not None:
+        base &= np.asarray(visible_mask, dtype=bool)
+    left_candidates = base & (
+        (np.abs(proj[:, 0] - left) <= boundary_band_px) | (proj[:, 0] <= center)
+    )
+    right_candidates = base & (
+        (np.abs(proj[:, 0] - right) <= boundary_band_px) | (proj[:, 0] >= center)
+    )
+    left_idx = np.flatnonzero(left_candidates).astype(np.int64)
+    right_idx = np.flatnonzero(right_candidates).astype(np.int64)
+    if left_idx.size < 32 or right_idx.size < 32:
+        return None
+
+    y_norm = (rows.astype(np.float32) - float(rows.min())) / max(float(rows.max() - rows.min()), 1.0)
+    row_weight = 0.75 + 0.65 * y_norm
+    return {
+        "rows_np": rows.astype(np.float32),
+        "target_left_np": xmin[rows].astype(np.float32),
+        "target_right_np": xmax[rows].astype(np.float32),
+        "row_weight_np": row_weight.astype(np.float32),
+        "left_idx_np": left_idx,
+        "right_idx_np": right_idx,
+        "row_sigma": float(row_sigma),
+        "tau": float(tau),
+        "y_min": y_min,
+        "y_max": y_max,
+        "xmin": xmin,
+        "xmax": xmax,
+        "valid": valid,
+    }
+
+
+def _stable_protect_vertices(
+    proj: np.ndarray,
+    landmarks_2d: np.ndarray,
+    radius_px: float,
+) -> np.ndarray:
+    stable = np.concatenate([LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX])
+    pts = np.asarray(landmarks_2d, dtype=np.float32)[stable]
+    if pts.size == 0:
+        return np.zeros(len(proj), dtype=bool)
+    protect = np.zeros(len(proj), dtype=bool)
+    radius2 = float(radius_px) ** 2
+    for start in range(0, len(pts), 8):
+        chunk = pts[start:start + 8]
+        d2 = ((proj[:, None, :] - chunk[None, :, :]) ** 2).sum(axis=2)
+        protect |= np.min(d2, axis=1) <= radius2
+    return protect
+
+
+def _vertices_near_points_2d(proj: np.ndarray, points: np.ndarray, radius_px: float) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float32)
+    if len(proj) == 0 or points.size == 0 or radius_px <= 0:
+        return np.zeros(len(proj), dtype=bool)
+    keep = np.zeros(len(proj), dtype=bool)
+    radius2 = float(radius_px) ** 2
+    for start in range(0, len(points), 12):
+        chunk = points[start:start + 12]
+        d2 = ((proj[:, None, :] - chunk[None, :, :]) ** 2).sum(axis=2)
+        keep |= np.min(d2, axis=1) <= radius2
+    return keep
+
+
+def _stable_anchor_vertices_from_views(
+    vertices: np.ndarray,
+    view_data: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    lmk_vertex_indices: Optional[np.ndarray] = None,
+    lmk_tri_vidx: Optional[np.ndarray] = None,
+    lmk_bary_coords: Optional[np.ndarray] = None,
+    enabled: bool = True,
+    nose_radius_px: float = 38.0,
+    eye_radius_px: float = 30.0,
+    inner_mouth_radius_px: float = 26.0,
+) -> Tuple[np.ndarray, dict]:
+    anchor_mask = np.zeros(len(vertices), dtype=bool)
+    group_masks = {
+        "nose_bridge": np.zeros(len(vertices), dtype=bool),
+        "eye_centers": np.zeros(len(vertices), dtype=bool),
+        "inner_mouth": np.zeros(len(vertices), dtype=bool),
+    }
+    report = {
+        "enabled": bool(enabled),
+        "anchor_vertices": 0,
+        "anchor_ratio": 0.0,
+        "source_views": [],
+        "groups": [],
+    }
+    if not enabled or len(vertices) == 0:
+        return anchor_mask, report
+
+    landmark_proj_by_view = {}
+    if lmk_vertex_indices is not None:
+        try:
+            lmk_3d = _landmark_points_3d(
+                vertices,
+                lmk_vertex_indices,
+                lmk_tri_vidx=lmk_tri_vidx,
+                lmk_bary_coords=lmk_bary_coords,
+            )
+            for view_name, view_result in per_view_results.items():
+                if view_name not in intrinsics:
+                    continue
+                proj_lmk, _ = _project_vertices_np(
+                    lmk_3d,
+                    intrinsics[view_name],
+                    view_result["R"],
+                    view_result["t"],
+                )
+                landmark_proj_by_view[view_name] = proj_lmk
+        except Exception as exc:
+            logger.warning("Stable anchor landmark projection failed: %s", exc)
+
+    specs = (
+        ("nose_bridge", LMK_NOSE_IDX, float(nose_radius_px)),
+        ("eye_centers", LMK_EYE_IDX, float(eye_radius_px)),
+        ("inner_mouth", LMK_INNER_MOUTH_IDX, float(inner_mouth_radius_px)),
+    )
+    if "front" in per_view_results and "front" in view_data and "front" in intrinsics:
+        source_view_names = ["front"]
+    else:
+        source_view_names = [
+            name for name in per_view_results
+            if name in view_data and name in intrinsics
+        ]
+
+    for view_name in source_view_names:
+        view_result = per_view_results[view_name]
+        if view_name not in view_data or view_name not in intrinsics:
+            continue
+        target_lmk = np.asarray(view_data[view_name].get("lmk_2d"), dtype=np.float32)
+        if target_lmk.ndim != 2 or target_lmk.shape[0] < 68:
+            continue
+        proj, _ = _project_vertices_np(
+            vertices,
+            intrinsics[view_name],
+            view_result["R"],
+            view_result["t"],
+        )
+        current_lmk = landmark_proj_by_view.get(view_name)
+        for group_name, idx, radius in specs:
+            pts = [target_lmk[idx]]
+            if current_lmk is not None and current_lmk.shape[0] >= 68:
+                pts.append(current_lmk[idx])
+            group_mask = _vertices_near_points_2d(proj, np.concatenate(pts, axis=0), radius)
+            group_masks[group_name] |= group_mask
+            anchor_mask |= group_mask
+
+    report.update({
+        "anchor_vertices": int(anchor_mask.sum()),
+        "anchor_ratio": round(float(anchor_mask.sum()) / float(len(anchor_mask)), 4) if len(anchor_mask) else 0.0,
+        "source_views": source_view_names,
+        "groups": [
+            {
+                "name": name,
+                "vertices": int(mask.sum()),
+            }
+            for name, mask in group_masks.items()
+        ],
+    })
+    return anchor_mask, report
+
+
+def _mesh_offset_safety_report(
+    offsets: np.ndarray,
+    faces: np.ndarray,
+    stable_anchor_mask: Optional[np.ndarray] = None,
+) -> dict:
+    offsets = np.asarray(offsets, dtype=np.float64)
+    offset_norm = np.linalg.norm(offsets, axis=1) if len(offsets) else np.zeros(0, dtype=np.float64)
+    moved = offset_norm > 1e-6
+    if len(faces):
+        f = np.asarray(faces, dtype=np.int64)
+        edges = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=0)
+        edge_jump = np.linalg.norm(offsets[edges[:, 0]] - offsets[edges[:, 1]], axis=1)
+    else:
+        edge_jump = np.zeros(0, dtype=np.float64)
+
+    if stable_anchor_mask is not None and len(stable_anchor_mask) == len(offset_norm):
+        anchor_offsets = offset_norm[np.asarray(stable_anchor_mask, dtype=bool)]
+    else:
+        anchor_offsets = np.zeros(0, dtype=np.float64)
+
+    return {
+        "moved_vertices": int(moved.sum()),
+        "moved_ratio": round(float(moved.sum()) / float(len(offset_norm)), 4) if len(offset_norm) else 0.0,
+        "mean_offset_m": round(float(offset_norm[moved].mean()) if np.any(moved) else 0.0, 6),
+        "p95_offset_m": round(float(np.percentile(offset_norm[moved], 95)) if np.any(moved) else 0.0, 6),
+        "max_offset_m": round(float(offset_norm.max()) if len(offset_norm) else 0.0, 6),
+        "edge_jump_mean_m": round(float(edge_jump.mean()) if len(edge_jump) else 0.0, 6),
+        "edge_jump_p95_m": round(float(np.percentile(edge_jump, 95)) if len(edge_jump) else 0.0, 6),
+        "edge_jump_max_m": round(float(edge_jump.max()) if len(edge_jump) else 0.0, 6),
+        "anchor_vertices": int(anchor_offsets.size),
+        "anchor_moved_vertices": int(np.count_nonzero(anchor_offsets > 1e-7)),
+        "anchor_mean_offset_m": round(float(anchor_offsets.mean()) if anchor_offsets.size else 0.0, 6),
+        "anchor_max_offset_m": round(float(anchor_offsets.max()) if anchor_offsets.size else 0.0, 6),
+    }
+
+
+def _deform_safety_reject_reasons(
+    safety: dict,
+    max_moved_ratio: float,
+    max_anchor_move_m: float,
+    max_offset_jump_p95_m: float,
+    max_offset_jump_m: float,
+) -> list:
+    reasons = []
+    if float(safety.get("moved_ratio", 0.0)) > float(max_moved_ratio):
+        reasons.append("moved-ratio")
+    if float(safety.get("anchor_max_offset_m", 0.0)) > float(max_anchor_move_m):
+        reasons.append("anchor-motion")
+    if float(safety.get("edge_jump_p95_m", 0.0)) > float(max_offset_jump_p95_m):
+        reasons.append("offset-jump-p95")
+    if float(safety.get("edge_jump_max_m", 0.0)) > float(max_offset_jump_m):
+        reasons.append("offset-jump-max")
+    return reasons
+
+
+def _multi_view_validation_report(
+    view_records: list,
+    before_key: str,
+    after_key: str,
+    improve_key: str,
+    min_front_improve_px: float = 0.25,
+    min_overall_improve_px: float = 0.25,
+    max_side_worsen_px: float = 0.35,
+    max_side_mean_worsen_px: float = 0.05,
+    require_side_views: bool = True,
+) -> dict:
+    records = []
+    before_vals = []
+    after_vals = []
+    front_improves = []
+    side_improves = []
+
+    for rec in view_records:
+        if before_key not in rec or after_key not in rec:
+            continue
+        before = float(rec[before_key])
+        after = float(rec[after_key])
+        improve = float(rec.get(improve_key, before - after))
+        item = {
+            "view": rec.get("view", ""),
+            "before_px": round(before, 3),
+            "after_px": round(after, 3),
+            "improve_px": round(improve, 3),
+            "role": "front" if rec.get("view") == "front" else "side",
+        }
+        records.append(item)
+        before_vals.append(before)
+        after_vals.append(after)
+        if item["role"] == "front":
+            front_improves.append(improve)
+        else:
+            side_improves.append(improve)
+
+    before_mean = float(np.mean(before_vals)) if before_vals else 0.0
+    after_mean = float(np.mean(after_vals)) if after_vals else 0.0
+    overall_improve = before_mean - after_mean
+    front_improve = max(front_improves) if front_improves else overall_improve
+    max_side_worsen = max((max(0.0, -v) for v in side_improves), default=0.0)
+    side_mean_improve = float(np.mean(side_improves)) if side_improves else 0.0
+
+    reject_reasons = []
+    if not front_improves:
+        reject_reasons.append("missing-front-view")
+    if require_side_views and not side_improves:
+        reject_reasons.append("missing-side-views")
+    if front_improve < float(min_front_improve_px):
+        reject_reasons.append("front-improve-too-small")
+    if overall_improve < float(min_overall_improve_px):
+        reject_reasons.append("overall-improve-too-small")
+    if max_side_worsen > float(max_side_worsen_px):
+        reject_reasons.append("side-view-worsened")
+    if side_improves and side_mean_improve < -float(max_side_mean_worsen_px):
+        reject_reasons.append("side-mean-worsened")
+
+    return {
+        "enabled": True,
+        "accepted": not reject_reasons,
+        "reject_reasons": reject_reasons,
+        "records": records,
+        "front_improve_px": round(float(front_improve), 3),
+        "overall_before_px": round(float(before_mean), 3),
+        "overall_after_px": round(float(after_mean), 3),
+        "overall_improve_px": round(float(overall_improve), 3),
+        "side_mean_improve_px": round(float(side_mean_improve), 3),
+        "max_side_worsen_px": round(float(max_side_worsen), 3),
+        "thresholds": {
+            "min_front_improve_px": round(float(min_front_improve_px), 3),
+            "min_overall_improve_px": round(float(min_overall_improve_px), 3),
+            "max_side_worsen_px": round(float(max_side_worsen_px), 3),
+            "max_side_mean_worsen_px": round(float(max_side_mean_worsen_px), 3),
+            "require_side_views": bool(require_side_views),
+        },
+    }
+
+
+def _smooth_vertex_offsets(
+    offsets: np.ndarray,
+    faces: np.ndarray,
+    editable: np.ndarray,
+    constraints: np.ndarray,
+    constraint_offsets: np.ndarray,
+    max_offset_m: float,
+    iterations: int,
+    alpha: float,
+    constraint_keep: float,
+) -> np.ndarray:
+    f = faces.astype(np.int64, copy=False)
+    a = np.concatenate([f[:, 0], f[:, 1], f[:, 2]])
+    b = np.concatenate([f[:, 1], f[:, 2], f[:, 0]])
+    src = np.concatenate([a, b])
+    dst = np.concatenate([b, a])
+    counts = np.zeros(len(offsets), dtype=np.float64)
+    np.add.at(counts, src, 1.0)
+    counts = np.clip(counts, 1.0, None)
+
+    editable = editable.astype(bool)
+    constraints = constraints.astype(bool)
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    constraint_keep = float(np.clip(constraint_keep, 0.0, 1.0))
+
+    smoothed = offsets.copy()
+    for _ in range(max(0, int(iterations))):
+        accum = np.zeros_like(smoothed)
+        np.add.at(accum, src, smoothed[dst])
+        avg = accum / counts[:, None]
+        nxt = smoothed.copy()
+        nxt[editable] = (1.0 - alpha) * smoothed[editable] + alpha * avg[editable]
+        nxt[~editable] = 0.0
+        nxt[constraints] = (
+            (1.0 - constraint_keep) * nxt[constraints] +
+            constraint_keep * constraint_offsets[constraints]
+        )
+        norm = np.linalg.norm(nxt, axis=1)
+        too_far = norm > max_offset_m
+        if np.any(too_far):
+            nxt[too_far] *= (max_offset_m / np.clip(norm[too_far], 1e-8, None))[:, None]
+        smoothed = nxt
+    return smoothed
+
+
+def _free_identity_landmark_profile(idx: int, base_radius_px: float, contour_radius_px: float, mouth_radius_px: float) -> Tuple[float, float]:
+    if idx in set(LMK_CONTOUR_IDX.tolist()):
+        return 1.0, float(contour_radius_px)
+    if idx in set(LMK_MOUTH_IDX.tolist()):
+        return 0.72, float(mouth_radius_px)
+    if idx in set(LMK_BROW_IDX.tolist()):
+        return 0.28, float(base_radius_px * 0.85)
+    if idx in set(LMK_NOSE_IDX.tolist()):
+        return 0.16, float(base_radius_px * 0.75)
+    if idx in set(LMK_EYE_IDX.tolist()):
+        return 0.18, float(base_radius_px * 0.72)
+    return 0.35, float(base_radius_px)
+
+
+def _free_identity_metric_report(
+    vertices: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    lmk_vertex_indices: np.ndarray,
+    lmk_tri_vidx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    out_dir: Path,
+    prefix: str,
+) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    stable_vals = []
+    mean_vals = []
+    contour_vals = []
+    mouth_vals = []
+    for view_name, view_result in per_view_results.items():
+        if view_name not in view_data or view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        mean_err, max_err, errors = _save_landmark_reprojection_debug(
+            vertices=vertices,
+            K=intrinsics[view_name],
+            R=view_result["R"],
+            t=view_result["t"],
+            image=preprocessed_views[view_name]["image"],
+            target_landmarks=view_data[view_name]["lmk_2d"],
+            lmk_vertex_indices=lmk_vertex_indices,
+            out_path=out_dir / f"{view_name}_{prefix}_landmarks.png",
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+            return_errors=True,
+        )
+        stable = _landmark_subset_stats(errors, np.concatenate([LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX]))
+        contour = _landmark_subset_stats(errors, LMK_CONTOUR_IDX)
+        mouth = _landmark_subset_stats(errors, LMK_MOUTH_IDX)
+        record = {
+            "view": view_name,
+            "mean_px": round(float(mean_err), 3),
+            "max_px": round(float(max_err), 3),
+            "stable_mean_px": stable["mean_px"],
+            "contour_mean_px": contour["mean_px"],
+            "mouth_mean_px": mouth["mean_px"],
+        }
+        records.append(record)
+        mean_vals.append(float(mean_err))
+        stable_vals.append(float(stable["mean_px"]))
+        contour_vals.append(float(contour["mean_px"]))
+        mouth_vals.append(float(mouth["mean_px"]))
+
+    return {
+        "records": records,
+        "mean_px": round(float(np.mean(mean_vals)) if mean_vals else 0.0, 3),
+        "stable_mean_px": round(float(np.mean(stable_vals)) if stable_vals else 0.0, 3),
+        "contour_mean_px": round(float(np.mean(contour_vals)) if contour_vals else 0.0, 3),
+        "mouth_mean_px": round(float(np.mean(mouth_vals)) if mouth_vals else 0.0, 3),
+    }
+
+
+def _free_identity_deform_mesh(
+    verts_base: np.ndarray,
+    verts_displaced: np.ndarray,
+    faces: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    lmk_vertex_indices: np.ndarray,
+    lmk_tri_vidx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    debug_dir: Path,
+    enabled: bool = True,
+    max_offset_m: float = 0.028,
+    max_step_px: float = 45.0,
+    radius_px: float = 42.0,
+    contour_radius_px: float = 56.0,
+    mouth_radius_px: float = 36.0,
+    view_weight_front: float = 1.0,
+    view_weight_side: float = 0.22,
+    min_view_cos: float = 0.02,
+    smooth_iter: int = 18,
+    smooth_alpha: float = 0.22,
+    constraint_keep: float = 0.78,
+    min_improve_px: float = 0.15,
+    max_stable_worsen_px: float = 1.4,
+    max_side_worsen_px: float = 2.5,
+    max_moved_ratio: float = 0.18,
+    stable_anchor_enabled: bool = True,
+    anchor_nose_radius_px: float = 38.0,
+    anchor_eye_radius_px: float = 30.0,
+    anchor_inner_mouth_radius_px: float = 26.0,
+    max_anchor_move_m: float = 0.0005,
+    max_offset_jump_p95_m: float = 0.012,
+    max_offset_jump_m: float = 0.035,
+    multiview_enabled: bool = True,
+    multiview_min_front_improve_px: float = 0.25,
+    multiview_min_overall_improve_px: float = 0.25,
+    multiview_max_side_worsen_px: float = 0.35,
+    multiview_max_side_mean_worsen_px: float = 0.05,
+    multiview_require_side_views: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    report = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "accepted": False,
+        "view_records": [],
+    }
+    if not enabled or len(verts_displaced) == 0 or lmk_vertex_indices is None:
+        report["reason"] = "disabled or missing landmarks"
+        return verts_base, verts_displaced, report
+
+    out_dir = debug_dir / "free_identity_deform"
+    before = _free_identity_metric_report(
+        verts_displaced,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+        lmk_vertex_indices,
+        lmk_tri_vidx,
+        lmk_bary_coords,
+        out_dir,
+        "before",
+    )
+    stable_anchors, stable_anchor_report = _stable_anchor_vertices_from_views(
+        vertices=verts_displaced,
+        view_data=view_data,
+        intrinsics=intrinsics,
+        per_view_results=per_view_results,
+        lmk_vertex_indices=lmk_vertex_indices,
+        lmk_tri_vidx=lmk_tri_vidx,
+        lmk_bary_coords=lmk_bary_coords,
+        enabled=stable_anchor_enabled,
+        nose_radius_px=anchor_nose_radius_px,
+        eye_radius_px=anchor_eye_radius_px,
+        inner_mouth_radius_px=anchor_inner_mouth_radius_px,
+    )
+    report["stable_anchors"] = stable_anchor_report
+
+    n = len(verts_displaced)
+    offset_accum = np.zeros((n, 3), dtype=np.float64)
+    weight_accum = np.zeros(n, dtype=np.float64)
+    editable = np.zeros(n, dtype=bool)
+    vertex_normals = compute_vertex_normals(verts_displaced, faces)
+    constraint_handles = 0
+
+    for view_name, view_result in per_view_results.items():
+        if view_name not in view_data or view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        mask = preprocessed_views[view_name].get("shape_mask")
+        if mask is None:
+            mask = preprocessed_views[view_name].get("face_mask")
+        if mask is None:
+            continue
+
+        view_weight = float(view_weight_front if view_name == "front" else view_weight_side)
+        if view_weight <= 1e-8:
+            continue
+
+        K = intrinsics[view_name]
+        R = view_result["R"]
+        t = view_result["t"]
+        target_lmk = np.asarray(view_data[view_name]["lmk_2d"], dtype=np.float64)
+        proj, v_cam = _project_vertices_np(verts_displaced, K, R, t)
+        lmk_world = _landmark_points_3d(
+            verts_displaced,
+            lmk_vertex_indices,
+            lmk_tri_vidx,
+            lmk_bary_coords,
+        )
+        lmk_proj, _lmk_cam = _project_vertices_np(lmk_world, K, R, t)
+
+        h, w = mask.shape[:2]
+        sample_x = np.clip(np.round(proj[:, 0]).astype(np.int32), 0, w - 1)
+        sample_y = np.clip(np.round(proj[:, 1]).astype(np.int32), 0, h - 1)
+        view_dir_world = -R[2, :]
+        visible = (vertex_normals @ view_dir_world) > float(min_view_cos)
+        valid = (
+            (v_cam[:, 2] > 1e-5) &
+            (proj[:, 0] >= 0) & (proj[:, 0] < w) &
+            (proj[:, 1] >= 0) & (proj[:, 1] < h) &
+            (mask[sample_y, sample_x] > 0) &
+            visible
+        )
+        if not np.any(valid):
+            continue
+
+        fx = float(K[0, 0]) if abs(float(K[0, 0])) > 1e-6 else 1.0
+        fy = float(K[1, 1]) if abs(float(K[1, 1])) > 1e-6 else fx
+        for lmk_idx in range(min(68, len(target_lmk), len(lmk_proj))):
+            lmk_weight, local_radius = _free_identity_landmark_profile(
+                lmk_idx,
+                base_radius_px=radius_px,
+                contour_radius_px=contour_radius_px,
+                mouth_radius_px=mouth_radius_px,
+            )
+            if lmk_weight <= 0.0:
+                continue
+            delta = target_lmk[lmk_idx] - lmk_proj[lmk_idx]
+            step = float(np.linalg.norm(delta))
+            if not np.isfinite(step) or step < 0.35:
+                continue
+            if step > float(max_step_px):
+                delta = delta * (float(max_step_px) / step)
+                step = float(max_step_px)
+
+            d2 = ((proj[:, 0] - lmk_proj[lmk_idx, 0]) ** 2) + ((proj[:, 1] - lmk_proj[lmk_idx, 1]) ** 2)
+            near = valid & (d2 <= float(local_radius) ** 2) & ~stable_anchors
+            if not np.any(near):
+                continue
+
+            ids = np.flatnonzero(near)
+            sigma2 = max((float(local_radius) * 0.55) ** 2, 1e-6)
+            conf = np.exp(-0.5 * d2[ids] / sigma2)
+            conf *= float(lmk_weight) * view_weight
+            dx_cam = delta[0] * np.clip(v_cam[ids, 2], 1e-6, None) / fx
+            dy_cam = delta[1] * np.clip(v_cam[ids, 2], 1e-6, None) / fy
+            cam_offsets = np.stack([dx_cam, dy_cam, np.zeros_like(dx_cam)], axis=1)
+            world_offsets = cam_offsets @ R
+            np.add.at(offset_accum, ids, world_offsets * conf[:, None])
+            np.add.at(weight_accum, ids, conf)
+            editable[ids] = True
+            constraint_handles += 1
+
+    constraints = (weight_accum > 1e-6) & ~stable_anchors
+    if not np.any(constraints):
+        report["reason"] = "no usable free-identity constraints"
+        report["before"] = before
+        return verts_base, verts_displaced, report
+
+    constraint_offsets = np.zeros_like(offset_accum)
+    constraint_offsets[constraints] = offset_accum[constraints] / weight_accum[constraints, None]
+    norm = np.linalg.norm(constraint_offsets, axis=1)
+    too_far = norm > float(max_offset_m)
+    if np.any(too_far):
+        constraint_offsets[too_far] *= (float(max_offset_m) / np.clip(norm[too_far], 1e-8, None))[:, None]
+
+    editable &= ~stable_anchors
+    offsets = _smooth_vertex_offsets(
+        offsets=constraint_offsets.copy(),
+        faces=faces,
+        editable=editable,
+        constraints=constraints,
+        constraint_offsets=constraint_offsets,
+        max_offset_m=float(max_offset_m),
+        iterations=int(smooth_iter),
+        alpha=float(smooth_alpha),
+        constraint_keep=float(constraint_keep),
+    )
+    verts_base_out = verts_base + offsets.astype(verts_base.dtype, copy=False)
+    verts_disp_out = verts_displaced + offsets.astype(verts_displaced.dtype, copy=False)
+
+    after = _free_identity_metric_report(
+        verts_disp_out,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+        lmk_vertex_indices,
+        lmk_tri_vidx,
+        lmk_bary_coords,
+        out_dir,
+        "after",
+    )
+
+    before_by_view = {r["view"]: r for r in before.get("records", [])}
+    after_by_view = {r["view"]: r for r in after.get("records", [])}
+    side_worsen = 0.0
+    front_improve = None
+    view_records = []
+    for name, b in before_by_view.items():
+        a = after_by_view.get(name)
+        if a is None:
+            continue
+        improve = float(b["mean_px"] - a["mean_px"])
+        stable_worsen_view = float(a["stable_mean_px"] - b["stable_mean_px"])
+        view_records.append({
+            "view": name,
+            "before_mean_px": b["mean_px"],
+            "after_mean_px": a["mean_px"],
+            "mean_improve_px": round(improve, 3),
+            "stable_worsen_px": round(stable_worsen_view, 3),
+        })
+        if name == "front":
+            front_improve = improve
+        else:
+            side_worsen = max(side_worsen, -improve)
+
+    mean_improve = float(before["mean_px"] - after["mean_px"])
+    stable_worsen = float(after["stable_mean_px"] - before["stable_mean_px"])
+    accept_improve = front_improve if front_improve is not None else mean_improve
+    accepted = (
+        (mean_improve >= float(min_improve_px) or accept_improve >= float(min_improve_px)) and
+        stable_worsen <= float(max_stable_worsen_px) and
+        side_worsen <= float(max_side_worsen_px)
+    )
+    landmark_gate_accepted = bool(accepted)
+
+    if multiview_enabled:
+        multiview_report = _multi_view_validation_report(
+            view_records=view_records,
+            before_key="before_mean_px",
+            after_key="after_mean_px",
+            improve_key="mean_improve_px",
+            min_front_improve_px=float(min_improve_px),
+            min_overall_improve_px=float(min_improve_px),
+            max_side_worsen_px=float(max_side_worsen_px),
+            max_side_mean_worsen_px=float(max_side_worsen_px),
+            require_side_views=bool(multiview_require_side_views),
+        )
+    else:
+        multiview_report = _multi_view_validation_report(
+            view_records=view_records,
+            before_key="before_mean_px",
+            after_key="after_mean_px",
+            improve_key="mean_improve_px",
+            min_front_improve_px=float(min_improve_px),
+            min_overall_improve_px=-1e9,
+            max_side_worsen_px=float(max_side_worsen_px),
+            max_side_mean_worsen_px=1e9,
+            require_side_views=False,
+        )
+        multiview_report["enabled"] = False
+    accepted = bool(accepted and multiview_report["accepted"])
+
+    safety = _mesh_offset_safety_report(offsets, faces, stable_anchors)
+    safety_reasons = _deform_safety_reject_reasons(
+        safety=safety,
+        max_moved_ratio=max_moved_ratio,
+        max_anchor_move_m=max_anchor_move_m,
+        max_offset_jump_p95_m=max_offset_jump_p95_m,
+        max_offset_jump_m=max_offset_jump_m,
+    )
+    validation_dir = debug_dir / "multiview_validation"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    with open(validation_dir / "free_identity_landmarks.json", "w", encoding="utf-8") as f:
+        json.dump(multiview_report, f, ensure_ascii=False, indent=2)
+
+    reject_reason = "accepted free identity deformation"
+    if not accepted:
+        if not landmark_gate_accepted:
+            reject_reason = "rejected free identity deformation by landmark gate"
+        else:
+            reject_reason = "rejected free identity deformation by multiview gate: " + ", ".join(multiview_report["reject_reasons"])
+    report.update({
+        "applied": bool(accepted),
+        "accepted": bool(accepted),
+        "reason": reject_reason,
+        "before": before,
+        "after": after,
+        "view_records": view_records,
+        "multiview_validation": multiview_report,
+        "constraint_handles": int(constraint_handles),
+        "constraint_vertices": int(constraints.sum()),
+        "moved_vertices": int(safety["moved_vertices"]),
+        "moved_ratio": safety["moved_ratio"],
+        "mean_offset_m": safety["mean_offset_m"],
+        "max_offset_m": safety["max_offset_m"],
+        "safety": safety,
+        "mean_improve_px": round(mean_improve, 3),
+        "front_improve_px": round(float(accept_improve), 3),
+        "stable_worsen_px": round(stable_worsen, 3),
+        "max_side_worsen_px": round(float(side_worsen), 3),
+    })
+    if safety_reasons:
+        accepted = False
+        report["applied"] = False
+        report["accepted"] = False
+        report["reason"] = "rejected free identity deformation by safety gate: " + ", ".join(safety_reasons)
+        report["max_moved_ratio"] = round(float(max_moved_ratio), 4)
+        report["max_anchor_move_m"] = round(float(max_anchor_move_m), 6)
+        report["max_offset_jump_p95_m"] = round(float(max_offset_jump_p95_m), 6)
+        report["max_offset_jump_m"] = round(float(max_offset_jump_m), 6)
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    logger.info(
+        "Free-identity deform: "
+        f"accepted={accepted}, moved={report['moved_vertices']}, "
+        f"landmark {before['mean_px']:.2f}->{after['mean_px']:.2f}px, "
+        f"stable_worsen={stable_worsen:.2f}px"
+    )
+    if not accepted:
+        return verts_base, verts_displaced, report
+    return verts_base_out, verts_disp_out, report
+
+
+def _select_free_face_envelope_vertices(
+    proj: np.ndarray,
+    contour_data: dict,
+    side: str,
+    topk: int,
+    row_sigma: float,
+    protected: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows = contour_data["rows_np"]
+    target = contour_data["target_left_np"] if side == "left" else contour_data["target_right_np"]
+    candidate_idx = contour_data["left_idx_np"] if side == "left" else contour_data["right_idx_np"]
+    if candidate_idx.size == 0:
+        empty_i = np.zeros(0, dtype=np.int64)
+        empty_f = np.zeros(0, dtype=np.float64)
+        return empty_i, empty_f, empty_f
+
+    candidate_idx = np.asarray(candidate_idx, dtype=np.int64)
+    if protected is not None:
+        candidate_idx = candidate_idx[~protected[candidate_idx]]
+    if candidate_idx.size == 0:
+        empty_i = np.zeros(0, dtype=np.int64)
+        empty_f = np.zeros(0, dtype=np.float64)
+        return empty_i, empty_f, empty_f
+
+    k = max(1, int(topk))
+    sigma = max(float(row_sigma), 1e-3)
+    picked_idx = []
+    picked_target = []
+    picked_row_weight = []
+    row_weight = contour_data["row_weight_np"]
+    proj_y = proj[candidate_idx, 1]
+    proj_x = proj[candidate_idx, 0]
+    for row_i, row in enumerate(rows):
+        near = np.flatnonzero(np.abs(proj_y - float(row)) <= sigma)
+        if near.size == 0:
+            continue
+        if side == "left":
+            order = np.argsort(proj_x[near])[:k]
+        else:
+            order = np.argsort(-proj_x[near])[:k]
+        chosen = candidate_idx[near[order]]
+        picked_idx.append(chosen)
+        picked_target.append(np.full(chosen.shape, float(target[row_i]), dtype=np.float64))
+        picked_row_weight.append(np.full(chosen.shape, float(row_weight[row_i]), dtype=np.float64))
+
+    if not picked_idx:
+        empty_i = np.zeros(0, dtype=np.int64)
+        empty_f = np.zeros(0, dtype=np.float64)
+        return empty_i, empty_f, empty_f
+    return (
+        np.concatenate(picked_idx).astype(np.int64, copy=False),
+        np.concatenate(picked_target).astype(np.float64, copy=False),
+        np.concatenate(picked_row_weight).astype(np.float64, copy=False),
+    )
+
+
+def _free_face_deform_mesh(
+    verts_base: np.ndarray,
+    verts_displaced: np.ndarray,
+    faces: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    debug_dir: Path,
+    lmk_vertex_indices: Optional[np.ndarray] = None,
+    lmk_tri_vidx: Optional[np.ndarray] = None,
+    lmk_bary_coords: Optional[np.ndarray] = None,
+    enabled: bool = True,
+    max_offset_m: float = 0.018,
+    boundary_band_px: float = 95.0,
+    search_margin_px: float = 80.0,
+    stable_protect_radius_px: float = 58.0,
+    row_step: int = 6,
+    row_sigma: float = 8.0,
+    tau: float = 10.0,
+    envelope_topk: int = 28,
+    view_weight_front: float = 1.0,
+    view_weight_side: float = 0.75,
+    min_view_cos: float = 0.03,
+    max_step_px: float = 36.0,
+    smooth_iter: int = 35,
+    smooth_alpha: float = 0.35,
+    constraint_keep: float = 0.45,
+    accept_min_improve_px: float = 0.25,
+    max_side_worsen_px: float = 2.0,
+    max_moved_ratio: float = 0.08,
+    stable_anchor_enabled: bool = True,
+    anchor_nose_radius_px: float = 38.0,
+    anchor_eye_radius_px: float = 30.0,
+    anchor_inner_mouth_radius_px: float = 26.0,
+    max_anchor_move_m: float = 0.0005,
+    max_offset_jump_p95_m: float = 0.012,
+    max_offset_jump_m: float = 0.035,
+    multiview_enabled: bool = True,
+    multiview_min_front_improve_px: float = 0.25,
+    multiview_min_overall_improve_px: float = 0.25,
+    multiview_max_side_worsen_px: float = 0.35,
+    multiview_max_side_mean_worsen_px: float = 0.05,
+    multiview_require_side_views: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    report = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "view_records": [],
+    }
+    if not enabled or len(verts_displaced) == 0:
+        report["reason"] = "disabled"
+        return verts_base, verts_displaced, report
+
+    out_dir = debug_dir / "free_face_deform"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n = len(verts_displaced)
+    offset_accum = np.zeros((n, 3), dtype=np.float64)
+    weight_accum = np.zeros(n, dtype=np.float64)
+    editable = np.zeros(n, dtype=bool)
+    protected = np.zeros(n, dtype=bool)
+    contour_data_by_view = {}
+    vertex_normals = compute_vertex_normals(verts_displaced, faces)
+    stable_anchors, stable_anchor_report = _stable_anchor_vertices_from_views(
+        vertices=verts_displaced,
+        view_data=view_data,
+        intrinsics=intrinsics,
+        per_view_results=per_view_results,
+        lmk_vertex_indices=lmk_vertex_indices,
+        lmk_tri_vidx=lmk_tri_vidx,
+        lmk_bary_coords=lmk_bary_coords,
+        enabled=stable_anchor_enabled,
+        nose_radius_px=anchor_nose_radius_px,
+        eye_radius_px=anchor_eye_radius_px,
+        inner_mouth_radius_px=anchor_inner_mouth_radius_px,
+    )
+    report["stable_anchors"] = stable_anchor_report
+
+    for view_name, view_result in per_view_results.items():
+        if view_name not in preprocessed_views or view_name not in intrinsics or view_name not in view_data:
+            continue
+        mask = preprocessed_views[view_name].get("shape_mask")
+        if mask is None:
+            mask = preprocessed_views[view_name].get("face_mask")
+        if mask is None:
+            continue
+
+        K = intrinsics[view_name]
+        R = view_result["R"]
+        t = view_result["t"]
+        lmk = view_data[view_name]["lmk_2d"]
+        view_dir_world = -R[2, :]
+        visible_mask = (vertex_normals @ view_dir_world) > float(min_view_cos)
+        contour_data = _build_free_face_contour_data(
+            vertices=verts_displaced,
+            K=K,
+            R=R,
+            t=t,
+            mask=mask,
+            landmarks_2d=lmk,
+            row_step=row_step,
+            row_sigma=row_sigma,
+            tau=tau,
+            boundary_band_px=boundary_band_px,
+            search_margin_px=search_margin_px,
+            visible_mask=visible_mask,
+        )
+        if contour_data is None:
+            continue
+        contour_data_by_view[view_name] = contour_data
+
+        proj, v_cam = _project_vertices_np(verts_displaced, K, R, t)
+        before_metric, before_left, before_right = _dense_contour_metric_np(proj, contour_data)
+        _save_dense_contour_debug_image(
+            preprocessed_views[view_name]["image"],
+            contour_data,
+            before_left,
+            before_right,
+            out_dir / f"{view_name}_before_contour.png",
+        )
+
+        row_idx = np.round(proj[:, 1]).astype(np.int32)
+        row_idx = np.clip(row_idx, 0, mask.shape[0] - 1)
+        valid = contour_data["valid"][row_idx]
+        xmin = contour_data["xmin"][row_idx]
+        xmax = contour_data["xmax"][row_idx]
+        y_min = contour_data["y_min"]
+        y_max = contour_data["y_max"]
+        in_lower = (proj[:, 1] >= y_min - boundary_band_px) & (proj[:, 1] <= y_max + boundary_band_px)
+        in_x = (proj[:, 0] >= xmin - search_margin_px) & (proj[:, 0] <= xmax + search_margin_px)
+        view_editable = valid & in_lower & in_x & visible_mask & (v_cam[:, 2] > 1e-5)
+        legacy_protected = _stable_protect_vertices(proj, lmk, stable_protect_radius_px)
+        if stable_anchor_enabled:
+            view_protected = stable_anchors | legacy_protected
+        else:
+            view_protected = legacy_protected
+        protected |= view_protected
+
+        view_weight = float(view_weight_front if view_name == "front" else view_weight_side)
+        if view_weight > 1e-8:
+            editable |= view_editable
+        camera_x_world = R.T @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        fx = float(K[0, 0]) if abs(float(K[0, 0])) > 1e-6 else 1.0
+        side_constraint_counts = {}
+        for side in ("left", "right"):
+            idx, target_x, row_weight = _select_free_face_envelope_vertices(
+                proj=proj,
+                contour_data=contour_data,
+                side=side,
+                topk=envelope_topk,
+                row_sigma=row_sigma,
+                protected=view_protected,
+            )
+            side_constraint_counts[side] = int(len(idx))
+            if idx.size == 0:
+                continue
+            if view_weight <= 1e-8:
+                continue
+            du = np.clip(target_x - proj[idx, 0], -float(max_step_px), float(max_step_px))
+            dist = np.abs(target_x - proj[idx, 0])
+            conf = np.exp(-0.5 * (dist / max(float(boundary_band_px), 1e-3)) ** 2)
+            conf *= row_weight
+            conf *= view_weight
+            dx_cam = du * np.clip(v_cam[idx, 2], 1e-6, None) / fx
+            offset_world = dx_cam[:, None] * camera_x_world[None, :]
+            np.add.at(offset_accum, idx, offset_world * conf[:, None])
+            np.add.at(weight_accum, idx, conf)
+
+        report["view_records"].append({
+            "view": view_name,
+            "before_dense_contour_px": round(float(before_metric), 3),
+            "rows": int(len(contour_data["rows_np"])),
+            "left_candidates": int(len(contour_data["left_idx_np"])),
+            "right_candidates": int(len(contour_data["right_idx_np"])),
+            "left_envelope_vertices": int(side_constraint_counts.get("left", 0)),
+            "right_envelope_vertices": int(side_constraint_counts.get("right", 0)),
+            "constraint_weight": round(float(view_weight), 3),
+        })
+
+    constraints = (weight_accum > 1e-6) & editable & ~protected
+    if not np.any(constraints):
+        report["reason"] = "no usable free-face constraints"
+        return verts_base, verts_displaced, report
+
+    constraint_offsets = np.zeros_like(offset_accum)
+    constraint_offsets[constraints] = offset_accum[constraints] / weight_accum[constraints, None]
+    norm = np.linalg.norm(constraint_offsets, axis=1)
+    too_far = norm > max_offset_m
+    if np.any(too_far):
+        constraint_offsets[too_far] *= (max_offset_m / np.clip(norm[too_far], 1e-8, None))[:, None]
+
+    editable &= ~protected
+    offsets = _smooth_vertex_offsets(
+        offsets=constraint_offsets.copy(),
+        faces=faces,
+        editable=editable,
+        constraints=constraints,
+        constraint_offsets=constraint_offsets,
+        max_offset_m=float(max_offset_m),
+        iterations=int(smooth_iter),
+        alpha=float(smooth_alpha),
+        constraint_keep=float(constraint_keep),
+    )
+    verts_base_out = verts_base + offsets.astype(verts_base.dtype, copy=False)
+    verts_disp_out = verts_displaced + offsets.astype(verts_displaced.dtype, copy=False)
+
+    after_metrics = []
+    for rec in report["view_records"]:
+        view_name = rec["view"]
+        contour_data = contour_data_by_view[view_name]
+        view_result = per_view_results[view_name]
+        proj_after, _ = _project_vertices_np(
+            verts_disp_out,
+            intrinsics[view_name],
+            view_result["R"],
+            view_result["t"],
+        )
+        after_metric, after_left, after_right = _dense_contour_metric_np(proj_after, contour_data)
+        _save_dense_contour_debug_image(
+            preprocessed_views[view_name]["image"],
+            contour_data,
+            after_left,
+            after_right,
+            out_dir / f"{view_name}_after_contour.png",
+        )
+        rec["after_dense_contour_px"] = round(float(after_metric), 3)
+        rec["dense_improve_px"] = round(float(rec["before_dense_contour_px"] - after_metric), 3)
+        after_metrics.append(float(after_metric))
+        face_mask = preprocessed_views[view_name].get("face_mask")
+        if face_mask is None:
+            face_mask = preprocessed_views[view_name].get("shape_mask")
+        _save_projection_debug(
+            verts_disp_out,
+            faces,
+            intrinsics[view_name],
+            view_result["R"],
+            view_result["t"],
+            preprocessed_views[view_name]["image"],
+            face_mask,
+            out_dir / f"{view_name}_after_mesh.png",
+        )
+
+    safety = _mesh_offset_safety_report(offsets, faces, stable_anchors if stable_anchor_enabled else protected)
+    safety_reasons = _deform_safety_reject_reasons(
+        safety=safety,
+        max_moved_ratio=max_moved_ratio,
+        max_anchor_move_m=max_anchor_move_m,
+        max_offset_jump_p95_m=max_offset_jump_p95_m,
+        max_offset_jump_m=max_offset_jump_m,
+    )
+    if multiview_enabled:
+        multiview_report = _multi_view_validation_report(
+            view_records=report["view_records"],
+            before_key="before_dense_contour_px",
+            after_key="after_dense_contour_px",
+            improve_key="dense_improve_px",
+            min_front_improve_px=max(float(accept_min_improve_px), float(multiview_min_front_improve_px)),
+            min_overall_improve_px=float(multiview_min_overall_improve_px),
+            max_side_worsen_px=min(float(max_side_worsen_px), float(multiview_max_side_worsen_px)),
+            max_side_mean_worsen_px=float(multiview_max_side_mean_worsen_px),
+            require_side_views=bool(multiview_require_side_views),
+        )
+    else:
+        multiview_report = _multi_view_validation_report(
+            view_records=report["view_records"],
+            before_key="before_dense_contour_px",
+            after_key="after_dense_contour_px",
+            improve_key="dense_improve_px",
+            min_front_improve_px=float(accept_min_improve_px),
+            min_overall_improve_px=-1e9,
+            max_side_worsen_px=float(max_side_worsen_px),
+            max_side_mean_worsen_px=1e9,
+            require_side_views=False,
+        )
+        multiview_report["enabled"] = False
+
+    before_mean = float(multiview_report["overall_before_px"])
+    after_mean = float(multiview_report["overall_after_px"])
+    accept_improve = float(multiview_report["front_improve_px"])
+    side_worsen = float(multiview_report["max_side_worsen_px"])
+    accepted = bool(multiview_report["accepted"])
+    if safety_reasons:
+        accepted = False
+
+    validation_dir = debug_dir / "multiview_validation"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    with open(validation_dir / "free_face_dense_contour.json", "w", encoding="utf-8") as f:
+        json.dump(multiview_report, f, ensure_ascii=False, indent=2)
+
+    report.update({
+        "applied": bool(accepted),
+        "accepted": bool(accepted),
+        "reason": (
+            "accepted free-face envelope deformation"
+            if accepted else
+            (
+                "rejected free-face deformation by safety gate: " + ", ".join(safety_reasons)
+                if safety_reasons else
+                "rejected free-face deformation by multiview gate: " + ", ".join(multiview_report["reject_reasons"])
+            )
+        ),
+        "multiview_validation": multiview_report,
+        "editable_vertices": int(editable.sum()),
+        "constraint_vertices": int(constraints.sum()),
+        "moved_vertices": int(safety["moved_vertices"]),
+        "moved_ratio": safety["moved_ratio"],
+        "mean_offset_m": safety["mean_offset_m"],
+        "max_offset_m": safety["max_offset_m"],
+        "safety": safety,
+        "max_moved_ratio": round(float(max_moved_ratio), 4),
+        "max_anchor_move_m": round(float(max_anchor_move_m), 6),
+        "max_offset_jump_p95_m": round(float(max_offset_jump_p95_m), 6),
+        "max_offset_jump_m": round(float(max_offset_jump_m), 6),
+        "before_dense_contour_px": round(before_mean, 3),
+        "after_dense_contour_px": round(after_mean, 3),
+        "front_dense_improve_px": round(float(accept_improve), 3),
+        "max_side_worsen_px": round(float(side_worsen), 3),
+    })
+    report["dense_improve_px"] = round(
+        float(report["before_dense_contour_px"] - report["after_dense_contour_px"]),
+        3,
+    )
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    logger.info(
+        "Free-face deform: "
+        f"accepted={accepted}, moved={report['moved_vertices']}, "
+        f"dense {report['before_dense_contour_px']:.2f}->{report['after_dense_contour_px']:.2f}px, "
+        f"mean_offset={report['mean_offset_m']:.4f}m, max_offset={report['max_offset_m']:.4f}m"
+    )
+    if not accepted:
+        return verts_base, verts_displaced, report
+    return verts_base_out, verts_disp_out, report
 
 
 def _shape_only_fine_tune(
@@ -2143,6 +3323,135 @@ def run_geometry_reconstruction(
         verts_displaced = np.array(_sm.vertices)
     except Exception as _e:
         logger.warning(f"Laplacian 平滑失败（{_e}），跳过")
+
+    try:
+        from src import config as _free_cfg
+    except Exception:
+        _free_cfg = None
+
+    def _free_cfg_float(name: str, default: float) -> float:
+        if _free_cfg is None:
+            return default
+        try:
+            return float(getattr(_free_cfg, name, default))
+        except Exception:
+            return default
+
+    def _free_cfg_bool(name: str, default: bool) -> bool:
+        if _free_cfg is None:
+            return default
+        try:
+            return bool(getattr(_free_cfg, name, default))
+        except Exception:
+            return default
+
+    free_identity_report = {"enabled": False, "applied": False}
+    if _free_cfg_bool("ENABLE_FREE_IDENTITY_DEFORM", False):
+        verts_sub, verts_displaced, free_identity_report = _free_identity_deform_mesh(
+            verts_base=verts_sub,
+            verts_displaced=verts_displaced,
+            faces=faces_sub,
+            view_data=view_data,
+            preprocessed_views=preprocessed_views,
+            intrinsics=intrinsics,
+            per_view_results=per_view_results,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            debug_dir=output_dir.parent / "debug",
+            enabled=True,
+            max_offset_m=_free_cfg_float("FREE_IDENTITY_MAX_OFFSET_M", 0.028),
+            max_step_px=_free_cfg_float("FREE_IDENTITY_MAX_STEP_PX", 45.0),
+            radius_px=_free_cfg_float("FREE_IDENTITY_RADIUS_PX", 42.0),
+            contour_radius_px=_free_cfg_float("FREE_IDENTITY_CONTOUR_RADIUS_PX", 56.0),
+            mouth_radius_px=_free_cfg_float("FREE_IDENTITY_MOUTH_RADIUS_PX", 36.0),
+            view_weight_front=_free_cfg_float("FREE_IDENTITY_VIEW_WEIGHT_FRONT", 1.0),
+            view_weight_side=_free_cfg_float("FREE_IDENTITY_VIEW_WEIGHT_SIDE", 0.22),
+            min_view_cos=_free_cfg_float("FREE_IDENTITY_MIN_VIEW_COS", 0.02),
+            smooth_iter=int(_free_cfg_float("FREE_IDENTITY_SMOOTH_ITER", 18)),
+            smooth_alpha=_free_cfg_float("FREE_IDENTITY_SMOOTH_ALPHA", 0.22),
+            constraint_keep=_free_cfg_float("FREE_IDENTITY_CONSTRAINT_KEEP", 0.78),
+            min_improve_px=_free_cfg_float("FREE_IDENTITY_MIN_IMPROVE_PX", 0.15),
+            max_stable_worsen_px=_free_cfg_float("FREE_IDENTITY_MAX_STABLE_WORSEN_PX", 1.4),
+            max_side_worsen_px=_free_cfg_float("FREE_IDENTITY_MAX_SIDE_WORSEN_PX", 2.5),
+            max_moved_ratio=_free_cfg_float("FREE_IDENTITY_MAX_MOVED_RATIO", 0.18),
+            stable_anchor_enabled=_free_cfg_bool("ENABLE_STABLE_FACE_ANCHORS", True),
+            anchor_nose_radius_px=_free_cfg_float("STABLE_ANCHOR_NOSE_RADIUS_PX", 38.0),
+            anchor_eye_radius_px=_free_cfg_float("STABLE_ANCHOR_EYE_RADIUS_PX", 30.0),
+            anchor_inner_mouth_radius_px=_free_cfg_float("STABLE_ANCHOR_INNER_MOUTH_RADIUS_PX", 26.0),
+            max_anchor_move_m=_free_cfg_float("STABLE_ANCHOR_MAX_MOVE_M", 0.0005),
+            max_offset_jump_p95_m=_free_cfg_float("DEFORM_GUARD_MAX_OFFSET_JUMP_P95_M", 0.012),
+            max_offset_jump_m=_free_cfg_float("DEFORM_GUARD_MAX_OFFSET_JUMP_M", 0.035),
+            multiview_enabled=_free_cfg_bool("ENABLE_MULTIVIEW_DEFORM_VALIDATION", True),
+            multiview_min_front_improve_px=_free_cfg_float("MULTIVIEW_MIN_FRONT_IMPROVE_PX", 0.25),
+            multiview_min_overall_improve_px=_free_cfg_float("MULTIVIEW_MIN_OVERALL_IMPROVE_PX", 0.25),
+            multiview_max_side_worsen_px=_free_cfg_float("MULTIVIEW_MAX_SIDE_WORSEN_PX", 0.35),
+            multiview_max_side_mean_worsen_px=_free_cfg_float("MULTIVIEW_MAX_SIDE_MEAN_WORSEN_PX", 0.05),
+            multiview_require_side_views=_free_cfg_bool("MULTIVIEW_REQUIRE_SIDE_VIEWS", True),
+        )
+    else:
+        free_identity_report = {
+            "enabled": False,
+            "applied": False,
+            "accepted": False,
+            "reason": "disabled after over-deformation failure",
+        }
+        identity_debug_dir = output_dir.parent / "debug" / "free_identity_deform"
+        identity_debug_dir.mkdir(parents=True, exist_ok=True)
+        with open(identity_debug_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(free_identity_report, f, ensure_ascii=False, indent=2)
+    with open(output_dir.parent / "debug" / "free_identity_deform_summary.json", "w", encoding="utf-8") as f:
+        json.dump(free_identity_report, f, ensure_ascii=False, indent=2)
+
+    free_deform_report = {"enabled": False, "applied": False}
+    if _free_cfg_bool("ENABLE_FREE_FACE_DEFORM", False):
+        verts_sub, verts_displaced, free_deform_report = _free_face_deform_mesh(
+            verts_base=verts_sub,
+            verts_displaced=verts_displaced,
+            faces=faces_sub,
+            view_data=view_data,
+            preprocessed_views=preprocessed_views,
+            intrinsics=intrinsics,
+            per_view_results=per_view_results,
+            debug_dir=output_dir.parent / "debug",
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            enabled=True,
+            max_offset_m=_free_cfg_float("FREE_FACE_MAX_OFFSET_M", 0.018),
+            boundary_band_px=_free_cfg_float("FREE_FACE_BOUNDARY_BAND_PX", 95.0),
+            search_margin_px=_free_cfg_float("FREE_FACE_SEARCH_MARGIN_PX", 80.0),
+            stable_protect_radius_px=_free_cfg_float("FREE_FACE_STABLE_PROTECT_RADIUS_PX", 58.0),
+            row_step=int(_free_cfg_float("FREE_FACE_ROW_STEP", 6)),
+            row_sigma=_free_cfg_float("FREE_FACE_ROW_SIGMA", 8.0),
+            tau=_free_cfg_float("FREE_FACE_SOFTMIN_TAU", 10.0),
+            envelope_topk=int(_free_cfg_float("FREE_FACE_ENVELOPE_TOPK", 28)),
+            view_weight_front=_free_cfg_float("FREE_FACE_VIEW_WEIGHT_FRONT", 1.0),
+            view_weight_side=_free_cfg_float("FREE_FACE_VIEW_WEIGHT_SIDE", 0.75),
+            min_view_cos=_free_cfg_float("FREE_FACE_MIN_VIEW_COS", 0.03),
+            max_step_px=_free_cfg_float("FREE_FACE_MAX_STEP_PX", 36.0),
+            smooth_iter=int(_free_cfg_float("FREE_FACE_SMOOTH_ITER", 35)),
+            smooth_alpha=_free_cfg_float("FREE_FACE_SMOOTH_ALPHA", 0.35),
+            constraint_keep=_free_cfg_float("FREE_FACE_CONSTRAINT_KEEP", 0.45),
+            accept_min_improve_px=_free_cfg_float("FREE_FACE_ACCEPT_MIN_IMPROVE_PX", 0.25),
+            max_side_worsen_px=_free_cfg_float("FREE_FACE_MAX_SIDE_WORSEN_PX", 2.0),
+            max_moved_ratio=_free_cfg_float("FREE_FACE_MAX_MOVED_RATIO", 0.08),
+            stable_anchor_enabled=_free_cfg_bool("ENABLE_STABLE_FACE_ANCHORS", True),
+            anchor_nose_radius_px=_free_cfg_float("STABLE_ANCHOR_NOSE_RADIUS_PX", 38.0),
+            anchor_eye_radius_px=_free_cfg_float("STABLE_ANCHOR_EYE_RADIUS_PX", 30.0),
+            anchor_inner_mouth_radius_px=_free_cfg_float("STABLE_ANCHOR_INNER_MOUTH_RADIUS_PX", 26.0),
+            max_anchor_move_m=_free_cfg_float("STABLE_ANCHOR_MAX_MOVE_M", 0.0005),
+            max_offset_jump_p95_m=_free_cfg_float("DEFORM_GUARD_MAX_OFFSET_JUMP_P95_M", 0.012),
+            max_offset_jump_m=_free_cfg_float("DEFORM_GUARD_MAX_OFFSET_JUMP_M", 0.035),
+            multiview_enabled=_free_cfg_bool("ENABLE_MULTIVIEW_DEFORM_VALIDATION", True),
+            multiview_min_front_improve_px=_free_cfg_float("MULTIVIEW_MIN_FRONT_IMPROVE_PX", 0.25),
+            multiview_min_overall_improve_px=_free_cfg_float("MULTIVIEW_MIN_OVERALL_IMPROVE_PX", 0.25),
+            multiview_max_side_worsen_px=_free_cfg_float("MULTIVIEW_MAX_SIDE_WORSEN_PX", 0.35),
+            multiview_max_side_mean_worsen_px=_free_cfg_float("MULTIVIEW_MAX_SIDE_MEAN_WORSEN_PX", 0.05),
+            multiview_require_side_views=_free_cfg_bool("MULTIVIEW_REQUIRE_SIDE_VIEWS", True),
+        )
+        with open(output_dir.parent / "debug" / "free_face_deform_summary.json", "w", encoding="utf-8") as f:
+            json.dump(free_deform_report, f, ensure_ascii=False, indent=2)
 
     try:
         from src import config as cfg

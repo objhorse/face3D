@@ -399,6 +399,142 @@ def _expand_face_selection(faces: np.ndarray, keep_faces: np.ndarray, rings: int
     return expanded
 
 
+def _filter_small_face_components(
+    faces: np.ndarray,
+    keep_faces: np.ndarray,
+    min_component_faces: int,
+    debug_dir: Optional[Path] = None,
+) -> Tuple[np.ndarray, dict]:
+    min_component_faces = int(max(0, min_component_faces))
+    selected = np.flatnonzero(keep_faces)
+    stats = {
+        "enabled": min_component_faces > 1,
+        "min_component_faces": min_component_faces,
+        "before_faces": int(selected.size),
+        "after_faces": int(selected.size),
+        "removed_faces": 0,
+        "component_count": 0,
+        "removed_component_count": 0,
+        "components": [],
+    }
+    if min_component_faces <= 1 or selected.size == 0:
+        return keep_faces, stats
+
+    vertex_to_local_faces: Dict[int, List[int]] = {}
+    for local_idx, face_idx in enumerate(selected):
+        for vertex_idx in faces[face_idx]:
+            vertex_to_local_faces.setdefault(int(vertex_idx), []).append(local_idx)
+
+    seen = np.zeros(selected.size, dtype=bool)
+    component_faces: List[np.ndarray] = []
+    for start in range(selected.size):
+        if seen[start]:
+            continue
+        stack = [start]
+        seen[start] = True
+        component = []
+        while stack:
+            local_idx = stack.pop()
+            component.append(local_idx)
+            for vertex_idx in faces[selected[local_idx]]:
+                for neighbor in vertex_to_local_faces.get(int(vertex_idx), []):
+                    if not seen[neighbor]:
+                        seen[neighbor] = True
+                        stack.append(neighbor)
+        component_faces.append(selected[np.asarray(component, dtype=np.int64)])
+
+    component_faces.sort(key=len, reverse=True)
+    keep_filtered = keep_faces.copy()
+    keep_filtered[:] = False
+    kept_components = 0
+    removed_components = 0
+    removed_faces = 0
+    for component_id, comp in enumerate(component_faces):
+        comp_size = int(len(comp))
+        keep_component = comp_size >= min_component_faces
+        if component_id == 0 and not keep_component:
+            keep_component = True
+        if keep_component:
+            keep_filtered[comp] = True
+            kept_components += 1
+        else:
+            removed_components += 1
+            removed_faces += comp_size
+        stats["components"].append({
+            "component": int(component_id),
+            "faces": comp_size,
+            "kept": bool(keep_component),
+        })
+
+    stats.update({
+        "after_faces": int(keep_filtered.sum()),
+        "removed_faces": int(removed_faces),
+        "component_count": int(len(component_faces)),
+        "kept_component_count": int(kept_components),
+        "removed_component_count": int(removed_components),
+    })
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        with open(debug_dir / "visible_face_crop_components.json", "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+    return keep_filtered, stats
+
+
+def _trim_side_ear_faces(
+    face_centers: np.ndarray,
+    keep_faces: np.ndarray,
+    enabled: bool,
+    x_abs_min: float,
+    y_min: float,
+    y_max: float,
+    z_max: float,
+    debug_dir: Optional[Path] = None,
+) -> Tuple[np.ndarray, dict]:
+    stats = {
+        "enabled": bool(enabled),
+        "x_abs_min": float(x_abs_min),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
+        "z_max": float(z_max),
+        "removed_faces": 0,
+        "before_faces": int(np.count_nonzero(keep_faces)),
+        "after_faces": int(np.count_nonzero(keep_faces)),
+    }
+    if not enabled or len(face_centers) == 0:
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            with open(debug_dir / "visible_face_crop_side_ear_trim.json", "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+        return keep_faces, stats
+
+    centers = np.asarray(face_centers, dtype=np.float32)
+    side_ear = (
+        (np.abs(centers[:, 0]) >= float(x_abs_min)) &
+        (centers[:, 1] >= float(y_min)) &
+        (centers[:, 1] <= float(y_max)) &
+        (centers[:, 2] <= float(z_max))
+    )
+    remove = keep_faces & side_ear
+    if not np.any(remove):
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            with open(debug_dir / "visible_face_crop_side_ear_trim.json", "w", encoding="utf-8") as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+        return keep_faces, stats
+
+    trimmed = keep_faces.copy()
+    trimmed[remove] = False
+    stats.update({
+        "removed_faces": int(np.count_nonzero(remove)),
+        "after_faces": int(np.count_nonzero(trimmed)),
+    })
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        with open(debug_dir / "visible_face_crop_side_ear_trim.json", "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+    return trimmed, stats
+
+
 def _visible_face_crop_strict_settings(image_shape: Tuple[int, int]) -> Tuple[bool, int, float]:
     try:
         from src import config as cfg
@@ -524,6 +660,12 @@ def crop_mesh_to_visible_face(
     debug_dir: Path,
     dilate_rings: int = 2,
     z_tol: float = 0.006,
+    min_component_faces: int = 0,
+    side_ear_trim: bool = False,
+    side_ear_x_abs_min: float = 0.066,
+    side_ear_y_min: float = -0.060,
+    side_ear_y_max: float = 0.060,
+    side_ear_z_max: float = 0.004,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Keep mesh faces that are visible through at least one face-mask view."""
     if face_masks is None:
@@ -574,6 +716,36 @@ def crop_mesh_to_visible_face(
         return faces, uv_faces, np.ones(len(faces), dtype=bool)
 
     face_keep = _expand_face_selection(faces, face_keep, dilate_rings)
+    face_keep, side_ear_stats = _trim_side_ear_faces(
+        face_centers,
+        face_keep,
+        enabled=side_ear_trim,
+        x_abs_min=side_ear_x_abs_min,
+        y_min=side_ear_y_min,
+        y_max=side_ear_y_max,
+        z_max=side_ear_z_max,
+        debug_dir=debug_dir,
+    )
+    if side_ear_stats.get("removed_faces", 0) > 0:
+        logger.info(
+            "  Visible face crop side-ear trim: removed "
+            f"{side_ear_stats['removed_faces']} rear-side faces "
+            f"(abs(x)>={side_ear_stats['x_abs_min']:.3f}, "
+            f"z<={side_ear_stats['z_max']:.3f})"
+        )
+    face_keep, component_stats = _filter_small_face_components(
+        faces,
+        face_keep,
+        min_component_faces=min_component_faces,
+        debug_dir=debug_dir,
+    )
+    if component_stats.get("removed_faces", 0) > 0:
+        logger.info(
+            "  Visible face crop components: removed "
+            f"{component_stats['removed_faces']} faces from "
+            f"{component_stats['removed_component_count']} small components "
+            f"(<{component_stats['min_component_faces']} faces)"
+        )
     kept = int(face_keep.sum())
     logger.info(
         f"  Visible face crop: keep {kept}/{len(faces)} faces "
@@ -699,6 +871,225 @@ def _apply_lab_transform(colors: np.ndarray, transform: Optional[Tuple[np.ndarra
     lab = _rgb_to_lab_float(colors)
     matched = lab * scale[None, :] + bias[None, :]
     return np.clip(_lab_to_rgb_float(matched), 0.0, 255.0)
+
+
+def _write_side_ear_repair_debug(
+    debug_dir: Optional[Path],
+    before: np.ndarray,
+    after: np.ndarray,
+    roi_mask: np.ndarray,
+    repair_mask: np.ndarray,
+    stats: dict,
+) -> None:
+    if debug_dir is None:
+        return
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    with open(debug_dir / "side_ear_texture_repair.json", "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    cv2.imwrite(str(debug_dir / "roi_mask.png"), (roi_mask.astype(np.uint8) * 255))
+    cv2.imwrite(str(debug_dir / "repair_mask.png"), (repair_mask.astype(np.uint8) * 255))
+
+    overlay = before.copy()
+    overlay[roi_mask] = (overlay[roi_mask].astype(np.float32) * 0.55 + np.array([40, 170, 255]) * 0.45).astype(np.uint8)
+    overlay[repair_mask] = (overlay[repair_mask].astype(np.float32) * 0.25 + np.array([255, 60, 40]) * 0.75).astype(np.uint8)
+    cv2.imwrite(str(debug_dir / "roi_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+    focus = roi_mask | repair_mask
+    if not np.any(focus):
+        return
+    ys, xs = np.where(focus)
+    pad = 32
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(before.shape[0], int(ys.max()) + pad + 1)
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(before.shape[1], int(xs.max()) + pad + 1)
+    cv2.imwrite(str(debug_dir / "before_crop.png"), cv2.cvtColor(before[y0:y1, x0:x1], cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(debug_dir / "after_crop.png"), cv2.cvtColor(after[y0:y1, x0:x1], cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(debug_dir / "overlay_crop.png"), cv2.cvtColor(overlay[y0:y1, x0:x1], cv2.COLOR_RGB2BGR))
+
+
+def repair_side_ear_texture_patch(
+    texture: np.ndarray,
+    valid_mask: np.ndarray,
+    tri_map: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    enabled: bool,
+    x_abs_min: float,
+    y_min: float,
+    y_max: float,
+    z_max: float,
+    lab_delta_threshold: float,
+    grad_lab_threshold: float,
+    dilate_px: int,
+    inpaint_radius: int,
+    smooth_alpha: float,
+    debug_dir: Optional[Path] = None,
+) -> np.ndarray:
+    stats = {
+        "enabled": bool(enabled),
+        "x_abs_min": float(x_abs_min),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
+        "z_max": float(z_max),
+        "roi_faces": 0,
+        "roi_pixels": 0,
+        "repair_pixels": 0,
+        "reference_pixels": 0,
+        "ring_pixels": 0,
+        "median_rgb": None,
+    }
+    empty_mask = np.zeros(valid_mask.shape, dtype=bool)
+    if not enabled or len(faces) == 0 or texture.size == 0:
+        _write_side_ear_repair_debug(debug_dir, texture, texture, empty_mask, empty_mask, stats)
+        return texture
+
+    centers = vertices[faces].mean(axis=1).astype(np.float32)
+    side_faces = (
+        (np.abs(centers[:, 0]) >= float(x_abs_min)) &
+        (centers[:, 1] >= float(y_min)) &
+        (centers[:, 1] <= float(y_max)) &
+        (centers[:, 2] <= float(z_max))
+    )
+    stats["roi_faces"] = int(np.count_nonzero(side_faces))
+
+    face_index_ok = (tri_map >= 0) & (tri_map < len(faces))
+    roi_lookup = np.zeros(valid_mask.shape, dtype=bool)
+    roi_lookup[face_index_ok] = side_faces[tri_map[face_index_ok]]
+    roi_mask = valid_mask.astype(bool) & roi_lookup
+    stats["roi_pixels"] = int(np.count_nonzero(roi_mask))
+    before = texture.copy()
+    if stats["roi_pixels"] < 32:
+        _write_side_ear_repair_debug(debug_dir, before, texture, roi_mask, empty_mask, stats)
+        return texture
+
+    ring_px = max(17, int(dilate_px) * 5)
+    if ring_px % 2 == 0:
+        ring_px += 1
+    ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_px, ring_px))
+    ring_mask = cv2.dilate(roi_mask.astype(np.uint8), ring_kernel, iterations=1).astype(bool)
+    ring_mask = ring_mask & valid_mask.astype(bool) & ~roi_mask
+    if np.count_nonzero(ring_mask) < 100:
+        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_px * 2 + 1, ring_px * 2 + 1))
+        ring_mask = cv2.dilate(roi_mask.astype(np.uint8), ring_kernel, iterations=1).astype(bool)
+        ring_mask = ring_mask & valid_mask.astype(bool) & ~roi_mask
+
+    inner_band = 0.024
+    reference_faces = (
+        (np.abs(centers[:, 0]) >= max(0.0, float(x_abs_min) - inner_band)) &
+        (np.abs(centers[:, 0]) < float(x_abs_min)) &
+        (centers[:, 1] >= float(y_min) - 0.012) &
+        (centers[:, 1] <= float(y_max) + 0.012) &
+        (centers[:, 2] <= float(z_max) + 0.030)
+    )
+    reference_lookup = np.zeros(valid_mask.shape, dtype=bool)
+    reference_lookup[face_index_ok] = reference_faces[tri_map[face_index_ok]]
+    reference_mask = valid_mask.astype(bool) & reference_lookup
+    stats["reference_pixels"] = int(np.count_nonzero(reference_mask))
+
+    sample_mask = reference_mask if stats["reference_pixels"] >= 1000 else ring_mask
+    if np.count_nonzero(sample_mask) < 100:
+        sample_mask = valid_mask.astype(bool) & ~roi_mask
+    sample_pixels = texture[sample_mask]
+    if len(sample_pixels) == 0:
+        sample_pixels = texture[valid_mask.astype(bool)]
+
+    def skin_reference_pixels(pixels: np.ndarray) -> np.ndarray:
+        if len(pixels) == 0:
+            return pixels
+        p = pixels.astype(np.float32)
+        brightness = p.mean(axis=1)
+        r, g, b = p[:, 0], p[:, 1], p[:, 2]
+        skin_like = (
+            (brightness > 105.0) & (brightness < 245.0) &
+            (r > g * 0.78) & (g > b * 0.78) & (r > b * 0.86)
+        )
+        if np.count_nonzero(skin_like) < 500:
+            return pixels
+        filtered = pixels[skin_like]
+        filtered_brightness = filtered.astype(np.float32).mean(axis=1)
+        bright_cut = np.percentile(filtered_brightness, 45)
+        brighter = filtered[filtered_brightness >= bright_cut]
+        return brighter if len(brighter) >= 500 else filtered
+
+    skin_pixels = skin_reference_pixels(sample_pixels)
+    if len(skin_pixels) < 500:
+        broader_sample = texture[valid_mask.astype(bool) & ~roi_mask]
+        broader_skin = skin_reference_pixels(broader_sample)
+        if len(broader_skin) >= 500:
+            skin_pixels = broader_skin
+    if len(skin_pixels) >= 100:
+        sample_pixels = skin_pixels
+    median_rgb = np.median(sample_pixels, axis=0).astype(np.uint8)
+    stats["ring_pixels"] = int(np.count_nonzero(sample_mask))
+    stats["median_rgb"] = [int(v) for v in median_rgb.tolist()]
+
+    lab = cv2.cvtColor(texture, cv2.COLOR_RGB2LAB).astype(np.float32)
+    median_lab = cv2.cvtColor(median_rgb.reshape(1, 1, 3), cv2.COLOR_RGB2LAB).reshape(3).astype(np.float32)
+    lab_delta = lab - median_lab[None, None, :]
+    lab_delta[:, :, 1:] *= 1.35
+    color_delta = np.linalg.norm(lab_delta, axis=2)
+
+    lab_smooth = cv2.GaussianBlur(lab, (0, 0), 1.2)
+    grad_x = cv2.Sobel(lab_smooth[:, :, 0], cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(lab_smooth[:, :, 0], cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+
+    roi_delta = color_delta[roi_mask]
+    roi_grad = grad_mag[roi_mask]
+    delta_cut = max(float(lab_delta_threshold), float(np.percentile(roi_delta, 68)))
+    grad_cut = max(float(grad_lab_threshold), float(np.percentile(roi_grad, 72)))
+    repair_core = roi_mask & ((color_delta >= delta_cut) | (grad_mag >= grad_cut))
+    repair_mask = repair_core
+    min_repair = max(64, int(stats["roi_pixels"] * 0.015))
+    if np.count_nonzero(repair_mask) < min_repair:
+        delta_cut = max(float(lab_delta_threshold) * 0.75, float(np.percentile(roi_delta, 58)))
+        repair_core = roi_mask & ((color_delta >= delta_cut) | (grad_mag >= grad_cut))
+        repair_mask = repair_core
+
+    max_repair = int(stats["roi_pixels"] * 0.42)
+    if np.count_nonzero(repair_mask) > max_repair:
+        delta_cut = max(float(lab_delta_threshold), float(np.percentile(roi_delta, 82)))
+        grad_cut = max(float(grad_lab_threshold), float(np.percentile(roi_grad, 86)))
+        repair_core = roi_mask & ((color_delta >= delta_cut) | (grad_mag >= grad_cut))
+        repair_mask = repair_core
+
+    dilate_px = int(max(0, dilate_px))
+    if dilate_px > 0 and np.any(repair_mask):
+        k = dilate_px * 2 + 1
+        repair_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        dilated = cv2.dilate(repair_mask.astype(np.uint8), repair_kernel, iterations=1).astype(bool) & roi_mask
+        repair_mask = dilated if np.count_nonzero(dilated) <= max_repair else repair_core
+    stats["repair_pixels"] = int(np.count_nonzero(repair_mask))
+
+    result = texture.copy()
+    if np.any(repair_mask):
+        tmp = texture.copy()
+        tmp[~valid_mask.astype(bool)] = median_rgb
+        tmp[repair_mask] = median_rgb
+        inpainted = cv2.inpaint(tmp, repair_mask.astype(np.uint8) * 255, int(max(1, inpaint_radius)), cv2.INPAINT_TELEA)
+        result[repair_mask] = inpainted[repair_mask]
+
+    smooth_alpha = float(np.clip(smooth_alpha, 0.0, 1.0))
+    if smooth_alpha > 0:
+        tmp = result.copy()
+        tmp[~valid_mask.astype(bool)] = median_rgb
+        smooth = cv2.bilateralFilter(tmp, 9, 18, 7)
+        blended = result.astype(np.float32)
+        blended[roi_mask] = (
+            blended[roi_mask] * (1.0 - smooth_alpha) +
+            smooth[roi_mask].astype(np.float32) * smooth_alpha
+        )
+        result = np.clip(blended, 0, 255).astype(np.uint8)
+
+    logger.info(
+        "  Side-ear texture repair: "
+        f"roi_faces={stats['roi_faces']}, roi_px={stats['roi_pixels']}, "
+        f"repair_px={stats['repair_pixels']}"
+    )
+    _write_side_ear_repair_debug(debug_dir, before, result, roi_mask, repair_mask, stats)
+    return result
 
 
 def bake_texture(
@@ -1339,10 +1730,22 @@ def run_texture_pipeline(
         enable_visible_face_crop = bool(getattr(cfg, "ENABLE_VISIBLE_FACE_CROP", False))
         visible_face_crop_rings = int(getattr(cfg, "VISIBLE_FACE_CROP_DILATE_RINGS", 2))
         visible_face_crop_z_tol = float(getattr(cfg, "VISIBLE_FACE_CROP_Z_TOL", 0.006))
+        visible_face_crop_min_component_faces = int(getattr(cfg, "VISIBLE_FACE_CROP_MIN_COMPONENT_FACES", 0))
+        visible_face_crop_side_ear_trim = bool(getattr(cfg, "VISIBLE_FACE_CROP_SIDE_EAR_TRIM", False))
+        visible_face_crop_side_ear_x_abs_min = float(getattr(cfg, "VISIBLE_FACE_CROP_SIDE_EAR_X_ABS_MIN", 0.066))
+        visible_face_crop_side_ear_y_min = float(getattr(cfg, "VISIBLE_FACE_CROP_SIDE_EAR_Y_MIN", -0.060))
+        visible_face_crop_side_ear_y_max = float(getattr(cfg, "VISIBLE_FACE_CROP_SIDE_EAR_Y_MAX", 0.060))
+        visible_face_crop_side_ear_z_max = float(getattr(cfg, "VISIBLE_FACE_CROP_SIDE_EAR_Z_MAX", 0.004))
     except Exception:
         enable_visible_face_crop = False
         visible_face_crop_rings = 2
         visible_face_crop_z_tol = 0.006
+        visible_face_crop_min_component_faces = 0
+        visible_face_crop_side_ear_trim = False
+        visible_face_crop_side_ear_x_abs_min = 0.066
+        visible_face_crop_side_ear_y_min = -0.060
+        visible_face_crop_side_ear_y_max = 0.060
+        visible_face_crop_side_ear_z_max = 0.004
     if enable_visible_face_crop:
         crop_cameras = cameras
         crop_images = images
@@ -1386,6 +1789,12 @@ def run_texture_pipeline(
             output_texture_dir.parent / "debug" / "visible_face_crop",
             dilate_rings=visible_face_crop_rings,
             z_tol=visible_face_crop_z_tol,
+            min_component_faces=visible_face_crop_min_component_faces,
+            side_ear_trim=visible_face_crop_side_ear_trim,
+            side_ear_x_abs_min=visible_face_crop_side_ear_x_abs_min,
+            side_ear_y_min=visible_face_crop_side_ear_y_min,
+            side_ear_y_max=visible_face_crop_side_ear_y_max,
+            side_ear_z_max=visible_face_crop_side_ear_z_max,
         )
     try:
         from src import config as cfg
@@ -1558,6 +1967,49 @@ def run_texture_pipeline(
         texture = poisson_seam_fix_local(texture, valid_mask, uv_hole_repair_roi)
         if added_uv_faces:
             cv2.imwrite(str(debug_dir / "after_poisson.png"), cv2.cvtColor(texture, cv2.COLOR_RGB2BGR))
+
+    try:
+        from src import config as cfg
+        enable_side_ear_texture_repair = bool(getattr(cfg, "ENABLE_SIDE_EAR_TEXTURE_REPAIR", False))
+        side_ear_texture_repair_x_abs_min = float(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_X_ABS_MIN", 0.062))
+        side_ear_texture_repair_y_min = float(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_Y_MIN", -0.060))
+        side_ear_texture_repair_y_max = float(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_Y_MAX", 0.060))
+        side_ear_texture_repair_z_max = float(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_Z_MAX", 0.006))
+        side_ear_texture_repair_lab_delta = float(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_LAB_DELTA", 14.0))
+        side_ear_texture_repair_grad_lab = float(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_GRAD_LAB", 18.0))
+        side_ear_texture_repair_dilate_px = int(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_DILATE_PX", 2))
+        side_ear_texture_repair_inpaint_radius = int(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_INPAINT_RADIUS", 5))
+        side_ear_texture_repair_smooth_alpha = float(getattr(cfg, "SIDE_EAR_TEXTURE_REPAIR_SMOOTH_ALPHA", 0.16))
+    except Exception:
+        enable_side_ear_texture_repair = False
+        side_ear_texture_repair_x_abs_min = 0.062
+        side_ear_texture_repair_y_min = -0.060
+        side_ear_texture_repair_y_max = 0.060
+        side_ear_texture_repair_z_max = 0.006
+        side_ear_texture_repair_lab_delta = 14.0
+        side_ear_texture_repair_grad_lab = 18.0
+        side_ear_texture_repair_dilate_px = 2
+        side_ear_texture_repair_inpaint_radius = 5
+        side_ear_texture_repair_smooth_alpha = 0.16
+
+    texture = repair_side_ear_texture_patch(
+        texture,
+        valid_mask,
+        tri_map,
+        vertices,
+        faces,
+        enabled=enable_side_ear_texture_repair,
+        x_abs_min=side_ear_texture_repair_x_abs_min,
+        y_min=side_ear_texture_repair_y_min,
+        y_max=side_ear_texture_repair_y_max,
+        z_max=side_ear_texture_repair_z_max,
+        lab_delta_threshold=side_ear_texture_repair_lab_delta,
+        grad_lab_threshold=side_ear_texture_repair_grad_lab,
+        dilate_px=side_ear_texture_repair_dilate_px,
+        inpaint_radius=side_ear_texture_repair_inpaint_radius,
+        smooth_alpha=side_ear_texture_repair_smooth_alpha,
+        debug_dir=output_texture_dir.parent / "debug" / "side_ear_texture_repair",
+    )
 
     # ── 保存纹理图 ────────────────────────────────────────────────────────
     tex_path = output_texture_dir / f"albedo_{lighting_type}.png"
