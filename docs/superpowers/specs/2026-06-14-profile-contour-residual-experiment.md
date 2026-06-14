@@ -26,12 +26,12 @@ Add an experimental profile-only mode for side views in the personal residual de
 
 ### Boundary Selection
 
-For named side views:
+For named side views in the current capture setup:
 
-- `left` view targets the left boundary as the main profile side.
-- `right` view targets the right boundary as the main profile side.
+- `left` view targets the right boundary as the cheek/jaw/forehead profile side.
+- `right` view targets the left boundary as the cheek/jaw/forehead profile side.
 
-This matches the current capture setup, where the visible nose/profile direction points toward the named view side.
+An initial nose-side trial worsened the side metrics, which confirmed that the optimization target for this experiment should be the cheek/jaw/forehead boundary rather than the nose/lip protrusion boundary.
 
 If future data has different naming or pose conventions, this should become pose-derived from projected nose/chin direction instead of name-derived.
 

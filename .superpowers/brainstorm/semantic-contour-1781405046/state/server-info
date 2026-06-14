@@ -1,0 +1,8 @@
+﻿{
+    "type":  "server-started",
+    "port":  54081,
+    "url":  "http://localhost:54081",
+    "screen_dir":  "D:\\face3D\\.superpowers\\brainstorm\\semantic-contour-1781405046\\content",
+    "state_dir":  "D:\\face3D\\.superpowers\\brainstorm\\semantic-contour-1781405046\\state",
+    "pid":  21328
+}

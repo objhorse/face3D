@@ -92,6 +92,7 @@ def build_report(metrics: dict) -> str:
     reproj = metrics["reprojection"]
     shape = metrics["shape_fine_tune"]
     pose = metrics.get("pose_refinement", {})
+    personal = metrics.get("personal_residual_deform", {})
     deform = metrics["free_face_deform"]
     mesh = metrics["mesh"]
     texture = metrics["texture"]
@@ -121,6 +122,30 @@ def build_report(metrics: dict) -> str:
 <p class="muted">细节审计页：<a href="../debug/pose_refinement/index.html">pose_refinement/index.html</a></p>
 </section>
 """
+    personal_rows = "".join(
+        "<tr>"
+        f"<td>{rec.get('view')}</td>"
+        f"<td>{rec.get('role')}<br><span class=\"muted\">{rec.get('contour_target', 'full_mask')} / {rec.get('semantic_source', 'NA')}</span></td>"
+        f"<td>{rec.get('before_profile_contour_px', rec.get('before_semantic_face_contour_px', rec.get('before_dense_contour_px')))}<br><span class=\"muted\">full {rec.get('before_full_mask_dense_contour_px', 'NA')}</span></td>"
+        f"<td>{rec.get('after_profile_contour_px', rec.get('after_semantic_face_contour_px', rec.get('after_dense_contour_px')))}<br><span class=\"muted\">full {rec.get('after_full_mask_dense_contour_px', 'NA')}</span></td>"
+        f"<td>{rec.get('profile_improve_px', rec.get('semantic_face_improve_px', rec.get('dense_improve_px')))}<br><span class=\"muted\">full {rec.get('full_mask_dense_improve_px', 'NA')}</span></td>"
+        "</tr>"
+        for rec in personal.get("view_records", [])
+    )
+    first_personal_record = (personal.get("view_records") or [{}])[0]
+    personal_metric_name = personal.get("metric_name") or first_personal_record.get("metric_name", "full_mask_dense_contour_px")
+    personal_target = personal.get("contour_target") or first_personal_record.get("contour_target", "full_mask")
+    personal_panel = f"""
+<section class="panel"><h2>个人化残差形变结果</h2>
+<p>本轮在 FLAME 几何后增加受约束的 per-vertex residual。最终状态：<b>{'已采用' if personal.get('accepted') else '未采用/回滚'}</b>；原因：{personal.get('reason', '无记录')}。</p>
+<table><thead><tr><th>视角</th><th>角色</th><th>before dense</th><th>after dense</th><th>改善</th></tr></thead><tbody>{personal_rows}</tbody></table>
+<p class="muted">整体密集轮廓：{personal.get('overall_before_dense_contour_px', 'NA')} -> {personal.get('overall_after_dense_contour_px', 'NA')} px；侧脸平均改善：{personal.get('side_mean_improve_px', 'NA')} px；稳定五官变化：{personal.get('stable_worsen_px', 'NA')} px。</p>
+<p class="muted">细节审计页：<a href="../debug/personal_residual_deform/index.html">personal_residual_deform/index.html</a></p>
+</section>
+"""
+    deform_before = personal.get("overall_before_dense_contour_px", deform.get("before_dense_contour_px", 0.0))
+    deform_after = personal.get("overall_after_dense_contour_px", deform.get("after_dense_contour_px", deform_before))
+    deform_max_offset_m = personal.get("safety", {}).get("max_offset_m", deform.get("max_offset_m", 0.0))
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -164,9 +189,11 @@ table{{width:100%;border-collapse:collapse}} th,td{{padding:11px 10px;border-bot
 
 {pose_panel}
 
+{personal_panel}
+
 <section class="two">
  <div class="panel"><h2>重投影误差</h2><table><thead><tr><th>视角</th><th>平均误差</th><th>最大误差</th></tr></thead><tbody>{reprojection_rows}</tbody></table><p class="muted">1024×1024 工作画布。眉眼、脸侧轮廓和下颌是主要误差来源。</p></div>
- <div class="panel"><h2>轮廓变形</h2><p>Shape-only 稠密轮廓：<b>{shape['before']['dense_contour_mean_px']:.2f} → {shape['after']['dense_contour_mean_px']:.2f} px</b></p><div class="bar"><i style="width:31%"></i></div><p>最终自由轮廓：<b>{deform['before_dense_contour_px']:.2f} → {deform['after_dense_contour_px']:.2f} px</b></p><div class="bar"><i style="width:7%"></i></div><p class="muted">正面明显改善，但左右侧最终仍约 86.8 px；最大局部位移 {deform['max_offset_m']*1000:.1f} mm，接近 28 mm 安全上限。</p></div>
+ <div class="panel"><h2>轮廓变形</h2><p>Shape-only 稠密轮廓：<b>{shape['before']['dense_contour_mean_px']:.2f} → {shape['after']['dense_contour_mean_px']:.2f} px</b></p><div class="bar"><i style="width:31%"></i></div><p>Personal residual：<b>{float(deform_before):.2f} → {float(deform_after):.2f} px</b></p><div class="bar"><i style="width:18%"></i></div><p class="muted">该项是 FLAME 之后的个体脸型补偿；最大 residual 位移 {float(deform_max_offset_m)*1000:.1f} mm。若未采用，则最终 mesh 自动回滚到 residual 前状态。</p></div>
 </section>
 
 <section class="two">
@@ -214,18 +241,35 @@ renderer.setAnimationLoop(()=>{{resize();controls.update();renderer.render(scene
 def main() -> None:
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
     phase1 = read_first_json([
+        EVAL_DIR / "phase1_profile_residual_v3_run.json",
+        EVAL_DIR / "phase1_profile_residual_v2_run.json",
+        EVAL_DIR / "phase1_profile_residual_run.json",
+        EVAL_DIR / "phase1_semantic_residual_v3_run.json",
+        EVAL_DIR / "phase1_semantic_residual_v2_run.json",
+        EVAL_DIR / "phase1_semantic_residual_run.json",
+        EVAL_DIR / "phase1_personal_residual_v3_run.json",
+        EVAL_DIR / "phase1_personal_residual_v2_run.json",
+        EVAL_DIR / "phase1_personal_residual_run.json",
         EVAL_DIR / "phase1_pose_refine_v3_run.json",
         EVAL_DIR / "phase1_pose_refine_v2_run.json",
         EVAL_DIR / "phase1_pose_refine_run.json",
         EVAL_DIR / "phase1_run.json",
     ])
     phase3 = read_first_json([
+        EVAL_DIR / "phase3_profile_residual_run.json",
+        EVAL_DIR / "phase3_semantic_residual_run.json",
+        EVAL_DIR / "phase3_personal_residual_run.json",
         EVAL_DIR / "phase3_pose_refine_run.json",
         EVAL_DIR / "phase3_run.json",
     ])
     optimized_shape = read_json(OUTPUT / "debug" / "optimized_shape.json")
     shape = optimized_shape.get("shape_only_fine_tune", {})
     pose = optimized_shape.get("pose_refinement", {})
+    personal = read_json(OUTPUT / "debug" / "personal_residual_deform_summary.json")
+    if personal.get("view_records"):
+        first_personal_record = personal["view_records"][0]
+        personal.setdefault("contour_target", first_personal_record.get("contour_target"))
+        personal.setdefault("metric_name", first_personal_record.get("metric_name"))
     deform = read_json(OUTPUT / "debug" / "free_face_deform_summary.json")
     metrics = {
         "generated_at": datetime.now().astimezone().isoformat(),
@@ -241,6 +285,7 @@ def main() -> None:
         },
         "shape_fine_tune": shape,
         "pose_refinement": pose,
+        "personal_residual_deform": personal,
         "free_face_deform": deform,
         "mesh": mesh_metrics(),
         "texture": texture_metrics(),
