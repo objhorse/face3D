@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # insightface model root (antelopev2 pack required)
 _INSIGHTFACE_ROOT = str(Path.home() / ".insightface")
+_INSIGHTFACE_PACK_NAME = "antelopev2"
 
 
 def get_mica_shape(
@@ -55,7 +56,7 @@ def get_mica_shape(
     try:
         model, app = _load_mica_and_detector(mica_dir, device, mica_checkpoint)
     except Exception as e:
-        logger.warning(f"MICA 加载失败: {e}\n使用零初始化")
+        logger.warning(f"MICA load failed: {type(e).__name__}: {e!r}; using zero shape init")
         return np.zeros(n_shape, dtype=np.float32), False
 
     shape_candidates = []
@@ -113,11 +114,43 @@ def _load_mica_and_detector(mica_dir: Path, device: str, mica_checkpoint=None):
     )(cfg, mica_device)
     model.eval()
 
-    providers = ["CUDAExecutionProvider"] if device == "cuda" else ["CPUExecutionProvider"]
-    app = FaceAnalysis(name="antelopev2", root=_INSIGHTFACE_ROOT, providers=providers)
+    # Keep InsightFace detection on CPU. The MICA torch model may still use CUDA,
+    # but onnxruntime CUDA DLLs are often mismatched on local Windows setups.
+    providers = ["CPUExecutionProvider"]
+    pack_name = _resolve_insightface_pack_name(_INSIGHTFACE_ROOT, _INSIGHTFACE_PACK_NAME)
+    app = FaceAnalysis(name=pack_name, root=_INSIGHTFACE_ROOT, providers=providers)
     app.prepare(ctx_id=0, det_size=(224, 224))
 
     return model, app
+
+
+def _resolve_insightface_pack_name(root: str, pack_name: str) -> str:
+    """Find the model pack directory shape expected by InsightFace.
+
+    Some downloads extract as:
+      ~/.insightface/models/antelopev2/antelopev2/*.onnx
+    while FaceAnalysis(name="antelopev2") only scans:
+      ~/.insightface/models/antelopev2/*.onnx
+    """
+    root_path = Path(root).expanduser()
+    direct_dir = root_path / "models" / pack_name
+    if any(direct_dir.glob("*.onnx")):
+        return pack_name
+
+    nested_same_name = direct_dir / pack_name
+    if any(nested_same_name.glob("*.onnx")):
+        resolved = f"{pack_name}/{pack_name}"
+        logger.info("InsightFace model pack resolved to nested directory: %s", resolved)
+        return resolved
+
+    if direct_dir.exists():
+        for child in sorted(p for p in direct_dir.iterdir() if p.is_dir()):
+            if any(child.glob("*.onnx")):
+                resolved = f"{pack_name}/{child.name}"
+                logger.info("InsightFace model pack resolved to nested directory: %s", resolved)
+                return resolved
+
+    return pack_name
 
 
 def _run_mica_single(model, app, img_rgb: np.ndarray, device: str, n_shape: int) -> np.ndarray:

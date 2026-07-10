@@ -36,6 +36,19 @@ def _run_pipeline(
         sys.path.insert(0, str(ROOT))
 
     from src import config as cfg
+    pipeline_name = getattr(cfg, "RECONSTRUCTION_PIPELINE", "stable_three_view")
+    if pipeline_name == "stable_three_view":
+        from src.pipeline.stable_three_view import run_stable_three_view_pipeline
+
+        return run_stable_three_view_pipeline(
+            session_id=session_id,
+            patient_id=patient_id,
+            image_paths=image_paths,
+            session_output_dir=session_output_dir,
+            manual_intrinsics=manual_intrinsics,
+            progress=progress,
+        )
+
     import numpy as np
     import cv2
 

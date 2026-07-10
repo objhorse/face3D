@@ -216,6 +216,10 @@ async def create_session(
                     if row:
                         row.status = "done"
                         row.glb_path = str(glb_path.relative_to(ROOT))
+                        meta_path = _session_dir(session_id) / "debug" / "stable_pipeline" / "reconstruction_meta.json"
+                        if meta_path.exists():
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                row.meta = json.load(f)
                         row.finished_at = datetime.utcnow()
         except Exception as exc:
             async with SessionLocal() as bg_db:

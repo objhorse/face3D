@@ -41,6 +41,12 @@ LMK_NOSE_IDX = np.arange(27, 36, dtype=np.int64)
 LMK_EYE_IDX = np.arange(36, 48, dtype=np.int64)
 LMK_MOUTH_IDX = np.arange(48, 68, dtype=np.int64)
 LMK_INNER_MOUTH_IDX = np.arange(60, 68, dtype=np.int64)
+LMK_NOSE_BRIDGE_IDX = np.arange(27, 31, dtype=np.int64)
+LMK_NOSE_BASE_IDX = np.arange(31, 36, dtype=np.int64)
+LMK_OUTER_MOUTH_IDX = np.arange(48, 60, dtype=np.int64)
+LMK_NOSE_MOUTH_TARGET_IDX = np.concatenate([LMK_NOSE_BASE_IDX, LMK_OUTER_MOUTH_IDX, LMK_INNER_MOUTH_IDX])
+LMK_NOSE_MOUTH_PROTECT_IDX = np.concatenate([LMK_NOSE_BRIDGE_IDX, LMK_EYE_IDX])
+LMK_NOSE_REGION_PROTECT_IDX = np.concatenate([LMK_EYE_IDX, LMK_MOUTH_IDX])
 LMK_GEOMETRY_IDX = np.concatenate([LMK_CONTOUR_IDX, LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX])
 LMK_ERROR_GROUPS = (
     ("轮廓", LMK_CONTOUR_IDX),
@@ -715,11 +721,56 @@ class JointFLAMEOptimizer:
                 w[eye_idx_t] = torch.maximum(w[eye_idx_t], torch.full_like(w[eye_idx_t], 3.0))
             lmk_weights[name] = w
 
+        use_rig_extrinsics = all(
+            views[name].get("rig_R_ref_to_camera") is not None
+            and views[name].get("rig_t_ref_to_camera") is not None
+            for name in view_names
+        )
+        rig_reference_name = None
+        rig_R_ref_to_camera = {}
+        rig_t_ref_to_camera = {}
+        if use_rig_extrinsics:
+            candidates = [
+                name for name in view_names
+                if views[name].get("rig_reference_view") == name
+            ]
+            if not candidates and "front" in view_names:
+                candidates = ["front"]
+            rig_reference_name = candidates[0] if candidates else view_names[0]
+            for name in view_names:
+                rig_R_ref_to_camera[name] = torch.tensor(
+                    views[name]["rig_R_ref_to_camera"],
+                    device=dev,
+                    dtype=torch.float32,
+                )
+                rig_t_ref_to_camera[name] = torch.tensor(
+                    views[name]["rig_t_ref_to_camera"],
+                    device=dev,
+                    dtype=torch.float32,
+                )
+            logger.info(
+                "启用固定 rig 外参优化：reference=%s，优化一个全局人脸位姿并推导左右相机。",
+                rig_reference_name,
+            )
+
+        def _pose_for_view(name: str):
+            if use_rig_extrinsics:
+                R_ref = rodrigues_to_matrix(rvec_params[rig_reference_name])
+                t_ref = t_params[rig_reference_name]
+                R_rel = rig_R_ref_to_camera[name]
+                t_rel = rig_t_ref_to_camera[name]
+                return R_rel @ R_ref, R_rel @ t_ref + t_rel
+            return rodrigues_to_matrix(rvec_params[name]), t_params[name]
+
+        pose_params = (
+            [rvec_params[rig_reference_name], t_params[rig_reference_name]]
+            if use_rig_extrinsics
+            else list(rvec_params.values()) + list(t_params.values())
+        )
         all_params = (
             [shape_param]
             + list(exp_params.values())
-            + list(rvec_params.values())
-            + list(t_params.values())
+            + pose_params
         )
         optimizer = torch.optim.LBFGS(
             all_params, lr=self.lr, max_iter=self.max_iter,
@@ -732,8 +783,8 @@ class JointFLAMEOptimizer:
 
             for name in view_names:
                 verts = self.flame(shape_param, exp_params[name])   # (N, 3)
-                R_cur = rodrigues_to_matrix(rvec_params[name])      # (3, 3)
-                proj  = project_vertices(verts, Ks[name], R_cur, t_params[name])  # (N, 2)
+                R_cur, t_cur = _pose_for_view(name)
+                proj  = project_vertices(verts, Ks[name], R_cur, t_cur)  # (N, 2)
 
                 if self.use_bary:
                     lmk_proj = (
@@ -805,8 +856,9 @@ class JointFLAMEOptimizer:
         shape_np = shape_param.detach().cpu().numpy()
         per_view = {}
         for name in view_names:
-            R_final = rodrigues_to_matrix(rvec_params[name]).detach().cpu().numpy()
-            t_final = t_params[name].detach().cpu().numpy()
+            R_final_t, t_final_t = _pose_for_view(name)
+            R_final = R_final_t.detach().cpu().numpy()
+            t_final = t_final_t.detach().cpu().numpy()
             e_final = exp_params[name].detach().cpu().numpy()
             per_view[name] = {"R": R_final, "t": t_final, "exp": e_final}
 
@@ -1618,6 +1670,1259 @@ def _free_identity_metric_report(
         "contour_mean_px": round(float(np.mean(contour_vals)) if contour_vals else 0.0, 3),
         "mouth_mean_px": round(float(np.mean(mouth_vals)) if mouth_vals else 0.0, 3),
     }
+
+
+def _save_nose_mouth_overlay(
+    image: np.ndarray,
+    target_landmarks: np.ndarray,
+    projected_landmarks: np.ndarray,
+    out_path: Path,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    draw_groups = (
+        (LMK_NOSE_BRIDGE_IDX, (255, 180, 0)),
+        (LMK_NOSE_BASE_IDX, (0, 160, 255)),
+        (LMK_OUTER_MOUTH_IDX, (255, 0, 180)),
+        (LMK_INNER_MOUTH_IDX, (180, 0, 255)),
+    )
+    for idxs, color in draw_groups:
+        for idx in idxs:
+            gt = tuple(np.round(target_landmarks[idx]).astype(int))
+            pred = tuple(np.round(projected_landmarks[idx]).astype(int))
+            cv2.circle(img, gt, 3, (0, 255, 0), -1)
+            cv2.circle(img, pred, 3, (0, 0, 255), -1)
+            cv2.line(img, gt, pred, color, 2, cv2.LINE_AA)
+            cv2.putText(
+                img,
+                str(int(idx)),
+                (pred[0] + 3, pred[1] - 3),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.36,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+    pts = np.vstack([
+        target_landmarks[LMK_NOSE_MOUTH_TARGET_IDX],
+        projected_landmarks[LMK_NOSE_MOUTH_TARGET_IDX],
+    ])
+    x0, y0 = np.floor(pts.min(axis=0) - 70).astype(int)
+    x1, y1 = np.ceil(pts.max(axis=0) + 70).astype(int)
+    h, w = img.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 > x0 and y1 > y0:
+        cv2.rectangle(img, (x0, y0), (x1, y1), (240, 240, 240), 2)
+        cv2.imwrite(str(out_path.with_name(out_path.stem + "_crop.jpg")), img[y0:y1, x0:x1])
+    cv2.imwrite(str(out_path), img)
+
+
+def _nose_mouth_metric_report(
+    vertices: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    lmk_vertex_indices: np.ndarray,
+    lmk_tri_vidx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    out_dir: Path,
+    prefix: str,
+    target_idx: Optional[np.ndarray] = None,
+) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    active_target_idx = LMK_NOSE_MOUTH_TARGET_IDX if target_idx is None else np.asarray(target_idx, dtype=np.int64)
+    records = []
+    target_vals = []
+    front_target_vals = []
+    protected_vals = []
+    for view_name, view_result in per_view_results.items():
+        if view_name not in view_data or view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        target_lmk = np.asarray(view_data[view_name]["lmk_2d"], dtype=np.float64)
+        lmk_proj, errors = _landmark_reprojection_details(
+            vertices=vertices,
+            K=intrinsics[view_name],
+            R=view_result["R"],
+            t=view_result["t"],
+            target_landmarks=target_lmk,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+        )
+        _save_nose_mouth_overlay(
+            image=preprocessed_views[view_name]["image"],
+            target_landmarks=target_lmk,
+            projected_landmarks=lmk_proj,
+            out_path=out_dir / f"{view_name}_{prefix}_nose_mouth.png",
+        )
+        nose_base = _landmark_subset_stats(errors, LMK_NOSE_BASE_IDX)
+        outer_mouth = _landmark_subset_stats(errors, LMK_OUTER_MOUTH_IDX)
+        inner_mouth = _landmark_subset_stats(errors, LMK_INNER_MOUTH_IDX)
+        target = _landmark_subset_stats(errors, active_target_idx)
+        protected = _landmark_subset_stats(errors, LMK_NOSE_MOUTH_PROTECT_IDX)
+        record = {
+            "view": view_name,
+            "nose_base_mean_px": nose_base["mean_px"],
+            "outer_mouth_mean_px": outer_mouth["mean_px"],
+            "inner_mouth_mean_px": inner_mouth["mean_px"],
+            "target_mean_px": target["mean_px"],
+            "protected_mean_px": protected["mean_px"],
+        }
+        if view_name == "front":
+            nose_width_target = float(np.linalg.norm(target_lmk[31] - target_lmk[35]))
+            nose_width_model = float(np.linalg.norm(lmk_proj[31] - lmk_proj[35]))
+            mouth_width_target = float(np.linalg.norm(target_lmk[48] - target_lmk[54]))
+            mouth_width_model = float(np.linalg.norm(lmk_proj[48] - lmk_proj[54]))
+            record.update({
+                "nose_width_target_px": round(nose_width_target, 3),
+                "nose_width_model_px": round(nose_width_model, 3),
+                "nose_width_delta_px": round(nose_width_model - nose_width_target, 3),
+                "mouth_width_target_px": round(mouth_width_target, 3),
+                "mouth_width_model_px": round(mouth_width_model, 3),
+                "mouth_width_delta_px": round(mouth_width_model - mouth_width_target, 3),
+            })
+        records.append(record)
+        target_vals.append(float(target["mean_px"]))
+        protected_vals.append(float(protected["mean_px"]))
+        if view_name == "front":
+            front_target_vals.append(float(target["mean_px"]))
+
+    return {
+        "records": records,
+        "target_landmarks": [int(x) for x in active_target_idx],
+        "target_mean_px": round(float(np.mean(target_vals)) if target_vals else 0.0, 3),
+        "front_target_mean_px": round(float(np.mean(front_target_vals)) if front_target_vals else 0.0, 3),
+        "protected_mean_px": round(float(np.mean(protected_vals)) if protected_vals else 0.0, 3),
+    }
+
+
+def _local_profile_contour_mean(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    row_step: int = 6,
+    row_sigma: float = 8.0,
+    tau: float = 10.0,
+    boundary_band_px: float = 95.0,
+    search_margin_px: float = 80.0,
+) -> dict:
+    values = []
+    records = []
+    normals = compute_vertex_normals(vertices, faces)
+    for view_name, view_result in per_view_results.items():
+        if view_name not in view_data or view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        mask = preprocessed_views[view_name].get("shape_mask")
+        if mask is None:
+            mask = preprocessed_views[view_name].get("face_mask")
+        if mask is None:
+            continue
+        K = intrinsics[view_name]
+        R = view_result["R"]
+        t = view_result["t"]
+        lmk = view_data[view_name]["lmk_2d"]
+        mp_lmk = preprocessed_views[view_name].get("landmarks")
+        visible_mask = None
+        if len(normals) == len(vertices):
+            view_dir_world = -R[2, :]
+            visible_mask = (normals @ view_dir_world) > 0.03
+        contour_data = _build_semantic_face_contour_data(
+            vertices=vertices,
+            K=K,
+            R=R,
+            t=t,
+            mask=mask,
+            landmarks_2d=lmk,
+            mediapipe_landmarks=mp_lmk,
+            row_step=row_step,
+            row_sigma=row_sigma,
+            tau=tau,
+            boundary_band_px=boundary_band_px,
+            search_margin_px=search_margin_px,
+            visible_mask=visible_mask,
+            semantic_mask_dilate_px=6.0,
+        )
+        if contour_data is None:
+            continue
+        target_sides, _profile_side = _personal_residual_target_sides(
+            view_name,
+            use_profile_side_contour=True,
+        )
+        proj, _ = _project_vertices_np(vertices, K, R, t)
+        metric, _left, _right = _dense_contour_metric_np_for_sides(proj, contour_data, target_sides)
+        records.append({"view": view_name, "mean_px": round(float(metric), 3)})
+        values.append(float(metric))
+    return {
+        "records": records,
+        "mean_px": round(float(np.mean(values)) if values else 0.0, 3),
+    }
+
+
+def _write_nose_mouth_local_index(out_dir: Path, report: dict) -> None:
+    rows = []
+    for phase_key, label in (("before", "before"), ("after", "after")):
+        metrics = report.get(f"{phase_key}_metrics", {})
+        for rec in metrics.get("records", []):
+            rows.append(
+                f"<tr><td>{label}</td><td>{rec.get('view')}</td>"
+                f"<td>{rec.get('target_mean_px')}</td><td>{rec.get('nose_base_mean_px')}</td>"
+                f"<td>{rec.get('outer_mouth_mean_px')}</td><td>{rec.get('protected_mean_px')}</td></tr>"
+            )
+    cards = []
+    for view_name in ("left", "front", "right"):
+        cards.append(
+            f"""
+            <section class="card">
+              <h2>{view_name}</h2>
+              <img src="{view_name}_before_nose_mouth.png" />
+              <img src="{view_name}_after_nose_mouth.png" />
+              <img src="{view_name}_residual_heatmap.png" />
+            </section>
+            """
+        )
+    doc = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<title>Nose mouth local residual audit</title>
+<style>
+body {{ margin:0; padding:28px; background:#101826; color:#e8f1ff; font-family:Arial,"Microsoft YaHei",sans-serif; }}
+.status {{ padding:16px 18px; border-radius:14px; background:{'#193d2a' if report.get('accepted') else '#432323'}; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:18px; }}
+.card {{ background:#172235; border:1px solid #26364d; border-radius:14px; padding:14px; }}
+img {{ max-width:100%; background:#000; border-radius:10px; margin:8px 0; }}
+table {{ border-collapse:collapse; width:100%; margin:18px 0; background:#111b2a; }}
+td,th {{ border:1px solid #2b3d55; padding:8px 10px; }}
+th {{ background:#20304a; }}
+.muted {{ color:#9fb0c8; }}
+</style></head><body>
+<h1>Nose mouth local residual audit</h1>
+<div class="status">
+  <h2>{'Accepted' if report.get('accepted') else 'Rejected'}</h2>
+  <p>{report.get('reason', '')}</p>
+</div>
+<p class="muted">Green points are targets, red points are current model projections. The local pass only targets nose base and lips while protecting eyes and nose bridge.</p>
+<table>
+<tr><th>phase</th><th>view</th><th>target mean</th><th>nose base</th><th>outer mouth</th><th>protected</th></tr>
+{''.join(rows)}
+</table>
+<pre>{json.dumps({k: report.get(k) for k in ['target_improve_px','front_target_improve_px','protected_worsen_px','profile_worsen_px','nose_width_abs_worsen_px','safety','reject_reasons']}, ensure_ascii=False, indent=2)}</pre>
+<div class="grid">{''.join(cards)}</div>
+</body></html>"""
+    (out_dir / "index.html").write_text(doc, encoding="utf-8")
+
+
+def _nose_mouth_local_residual_deform_mesh(
+    verts_base: np.ndarray,
+    verts_displaced: np.ndarray,
+    faces: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    debug_dir: Path,
+    lmk_vertex_indices: Optional[np.ndarray],
+    lmk_tri_vidx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    enabled: bool = True,
+    max_offset_m: float = 0.010,
+    vertex_radius_px: float = 34.0,
+    protect_radius_px: float = 30.0,
+    max_step_px: float = 18.0,
+    front_weight: float = 1.0,
+    side_weight: float = 0.35,
+    nose_base_weight: float = 1.0,
+    outer_mouth_weight: float = 1.0,
+    inner_mouth_weight: float = 0.45,
+    guard_nose_width: bool = True,
+    smooth_iter: int = 18,
+    smooth_alpha: float = 0.24,
+    constraint_keep: float = 0.70,
+    min_improve_px: float = 1.0,
+    min_front_improve_px: float = 1.5,
+    max_protected_worsen_px: float = 0.35,
+    max_profile_worsen_px: float = 1.0,
+    max_nose_width_abs_worsen_px: float = 2.0,
+    max_moved_ratio: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    out_dir = debug_dir / "nose_mouth_local_residual"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "accepted": False,
+        "protected_landmarks": [int(x) for x in LMK_NOSE_MOUTH_PROTECT_IDX],
+    }
+    if not enabled or lmk_vertex_indices is None or len(verts_displaced) == 0:
+        report["reason"] = "disabled or missing landmark mapping"
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        _write_nose_mouth_local_index(out_dir, report)
+        return verts_base, verts_displaced, report
+
+    active_parts = []
+    inactive_parts = []
+    if float(nose_base_weight) > 1e-8:
+        active_parts.append(LMK_NOSE_BASE_IDX)
+    else:
+        inactive_parts.append(LMK_NOSE_BASE_IDX)
+    if float(outer_mouth_weight) > 1e-8:
+        active_parts.append(LMK_OUTER_MOUTH_IDX)
+    else:
+        inactive_parts.append(LMK_OUTER_MOUTH_IDX)
+    if float(inner_mouth_weight) > 1e-8:
+        active_parts.append(LMK_INNER_MOUTH_IDX)
+    else:
+        inactive_parts.append(LMK_INNER_MOUTH_IDX)
+    if not active_parts:
+        report["reason"] = "no active nose/mouth target groups"
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        _write_nose_mouth_local_index(out_dir, report)
+        return verts_base, verts_displaced, report
+    active_target_idx = np.concatenate(active_parts).astype(np.int64)
+    inactive_target_idx = np.concatenate(inactive_parts).astype(np.int64) if inactive_parts else np.zeros(0, dtype=np.int64)
+    protected_landmarks = np.concatenate([LMK_NOSE_MOUTH_PROTECT_IDX, inactive_target_idx]).astype(np.int64)
+    report["target_landmarks"] = [int(x) for x in active_target_idx]
+    report["protected_landmarks"] = [int(x) for x in protected_landmarks]
+
+    before_metrics = _nose_mouth_metric_report(
+        verts_displaced,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+        lmk_vertex_indices,
+        lmk_tri_vidx,
+        lmk_bary_coords,
+        out_dir,
+        "before",
+        target_idx=active_target_idx,
+    )
+    before_profile = _local_profile_contour_mean(
+        verts_displaced,
+        faces,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+    )
+
+    n = len(verts_displaced)
+    offsets_accum = np.zeros((n, 3), dtype=np.float64)
+    weights_accum = np.zeros(n, dtype=np.float64)
+    editable = np.zeros(n, dtype=bool)
+    protected = np.zeros(n, dtype=bool)
+    normals = compute_vertex_normals(verts_displaced, faces)
+
+    for view_name, view_result in per_view_results.items():
+        if view_name not in view_data or view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        K = intrinsics[view_name]
+        R = view_result["R"]
+        t = view_result["t"]
+        target_lmk = np.asarray(view_data[view_name]["lmk_2d"], dtype=np.float64)
+        proj, v_cam = _project_vertices_np(verts_displaced, K, R, t)
+        lmk_proj, _errors = _landmark_reprojection_details(
+            vertices=verts_displaced,
+            K=K,
+            R=R,
+            t=t,
+            target_landmarks=target_lmk,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+        )
+        view_dir_world = -R[2, :]
+        visible = (normals @ view_dir_world) > 0.03
+        visible &= v_cam[:, 2] > 1e-5
+
+        protect_pts = np.concatenate([
+            target_lmk[protected_landmarks],
+            lmk_proj[protected_landmarks],
+        ], axis=0)
+        view_protected = _vertices_near_points_2d(proj, protect_pts, float(protect_radius_px))
+        protected |= view_protected
+
+        view_weight = float(front_weight if view_name == "front" else side_weight)
+        if view_weight <= 1e-8:
+            continue
+        camera_x_world = R.T @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        camera_y_world = R.T @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        fx = max(abs(float(K[0, 0])), 1e-6)
+        fy = max(abs(float(K[1, 1])), 1e-6)
+        front_nose_width_state = None
+        if bool(guard_nose_width) and view_name == "front":
+            target_width = float(np.linalg.norm(target_lmk[31] - target_lmk[35]))
+            model_width = float(np.linalg.norm(lmk_proj[31] - lmk_proj[35]))
+            center_x = float(lmk_proj[LMK_NOSE_BASE_IDX, 0].mean())
+            if model_width > target_width + 1e-6:
+                front_nose_width_state = ("too_wide", center_x)
+            elif model_width < target_width - 1e-6:
+                front_nose_width_state = ("too_narrow", center_x)
+        for idx in active_target_idx:
+            delta = target_lmk[idx] - lmk_proj[idx]
+            if idx in set(LMK_NOSE_BASE_IDX.tolist()) and front_nose_width_state is not None:
+                state, center_x = front_nose_width_state
+                side_sign = np.sign(float(lmk_proj[idx, 0]) - center_x)
+                horizontal_direction = side_sign * float(delta[0])
+                if state == "too_wide" and horizontal_direction > 0:
+                    delta[0] = 0.0
+                elif state == "too_narrow" and horizontal_direction < 0:
+                    delta[0] = 0.0
+            delta_norm = float(np.linalg.norm(delta))
+            if delta_norm < 1e-4:
+                continue
+            if delta_norm > float(max_step_px):
+                delta = delta * (float(max_step_px) / delta_norm)
+                delta_norm = float(max_step_px)
+            pts = np.stack([target_lmk[idx], lmk_proj[idx]], axis=0)
+            d2 = ((proj - pts[0]) ** 2).sum(axis=1)
+            d2 = np.minimum(d2, ((proj - pts[1]) ** 2).sum(axis=1))
+            near = (d2 <= float(vertex_radius_px) ** 2) & visible & ~view_protected
+            if not np.any(near):
+                continue
+            if idx in set(LMK_NOSE_BASE_IDX.tolist()):
+                local_weight = float(nose_base_weight)
+            elif idx in set(LMK_OUTER_MOUTH_IDX.tolist()):
+                local_weight = float(outer_mouth_weight)
+            else:
+                local_weight = float(inner_mouth_weight)
+            conf = np.exp(-0.5 * d2[near] / max(float(vertex_radius_px) ** 2, 1e-6))
+            conf *= view_weight * local_weight
+            vidx = np.flatnonzero(near)
+            dx_cam = float(delta[0]) * np.clip(v_cam[vidx, 2], 1e-6, None) / fx
+            dy_cam = float(delta[1]) * np.clip(v_cam[vidx, 2], 1e-6, None) / fy
+            local_offsets = dx_cam[:, None] * camera_x_world[None, :] + dy_cam[:, None] * camera_y_world[None, :]
+            np.add.at(offsets_accum, vidx, local_offsets * conf[:, None])
+            np.add.at(weights_accum, vidx, conf)
+            editable[vidx] = True
+
+    constraints = (weights_accum > 1e-6) & editable & ~protected
+    if not np.any(constraints):
+        report.update({
+            "reason": "no usable nose/mouth local constraints",
+            "before_metrics": before_metrics,
+            "before_profile": before_profile,
+        })
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        _write_nose_mouth_local_index(out_dir, report)
+        return verts_base, verts_displaced, report
+
+    constraint_offsets = np.zeros_like(offsets_accum)
+    constraint_offsets[constraints] = offsets_accum[constraints] / weights_accum[constraints, None]
+    norm = np.linalg.norm(constraint_offsets, axis=1)
+    too_far = norm > float(max_offset_m)
+    if np.any(too_far):
+        constraint_offsets[too_far] *= (float(max_offset_m) / np.clip(norm[too_far], 1e-8, None))[:, None]
+
+    offsets = _smooth_vertex_offsets(
+        offsets=constraint_offsets.copy(),
+        faces=faces,
+        editable=editable & ~protected,
+        constraints=constraints,
+        constraint_offsets=constraint_offsets,
+        max_offset_m=float(max_offset_m),
+        iterations=int(smooth_iter),
+        alpha=float(smooth_alpha),
+        constraint_keep=float(constraint_keep),
+    )
+    width_guard_removed_vertices = 0
+    width_guard_removed_mean_m = 0.0
+    if bool(guard_nose_width) and "front" in per_view_results and "front" in view_data and "front" in intrinsics:
+        try:
+            front_result = per_view_results["front"]
+            front_K = intrinsics["front"]
+            front_R = front_result["R"]
+            front_t = front_result["t"]
+            front_target_lmk = np.asarray(view_data["front"]["lmk_2d"], dtype=np.float64)
+            front_lmk_proj, _front_errors = _landmark_reprojection_details(
+                vertices=verts_displaced,
+                K=front_K,
+                R=front_R,
+                t=front_t,
+                target_landmarks=front_target_lmk,
+                lmk_vertex_indices=lmk_vertex_indices,
+                lmk_tri_vidx=lmk_tri_vidx,
+                lmk_bary_coords=lmk_bary_coords,
+            )
+            target_width = float(np.linalg.norm(front_target_lmk[31] - front_target_lmk[35]))
+            model_width = float(np.linalg.norm(front_lmk_proj[31] - front_lmk_proj[35]))
+            width_state = None
+            if model_width > target_width + 1e-6:
+                width_state = "too_wide"
+            elif model_width < target_width - 1e-6:
+                width_state = "too_narrow"
+            if width_state is not None:
+                proj_before, _ = _project_vertices_np(verts_displaced, front_K, front_R, front_t)
+                center_x = float(front_lmk_proj[LMK_NOSE_BASE_IDX, 0].mean())
+                side_sign = np.sign(proj_before[:, 0] - center_x)
+                camera_x_world = front_R.T @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                x_component = offsets @ camera_x_world
+                outward = side_sign * x_component
+                if width_state == "too_wide":
+                    bad = (outward > 0.0) & editable & ~protected
+                else:
+                    bad = (outward < 0.0) & editable & ~protected
+                if np.any(bad):
+                    removed = x_component[bad, None] * camera_x_world[None, :]
+                    offsets[bad] -= removed
+                    width_guard_removed_vertices = int(np.count_nonzero(bad))
+                    width_guard_removed_mean_m = float(np.linalg.norm(removed, axis=1).mean())
+        except Exception as exc:
+            logger.warning("Nose width guard failed: %s", exc)
+
+    norm = np.linalg.norm(offsets, axis=1)
+    too_far = norm > float(max_offset_m)
+    if np.any(too_far):
+        offsets[too_far] *= (float(max_offset_m) / np.clip(norm[too_far], 1e-8, None))[:, None]
+    verts_base_out = verts_base + offsets.astype(verts_base.dtype, copy=False)
+    verts_disp_out = verts_displaced + offsets.astype(verts_displaced.dtype, copy=False)
+
+    after_metrics = _nose_mouth_metric_report(
+        verts_disp_out,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+        lmk_vertex_indices,
+        lmk_tri_vidx,
+        lmk_bary_coords,
+        out_dir,
+        "after",
+        target_idx=active_target_idx,
+    )
+    after_profile = _local_profile_contour_mean(
+        verts_disp_out,
+        faces,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+    )
+    for view_name, view_result in per_view_results.items():
+        if view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        _save_residual_heatmap_projection(
+            image=preprocessed_views[view_name]["image"],
+            vertices=verts_disp_out,
+            K=intrinsics[view_name],
+            R=view_result["R"],
+            t=view_result["t"],
+            offsets=offsets,
+            out_path=out_dir / f"{view_name}_residual_heatmap.png",
+        )
+
+    target_improve = float(before_metrics.get("target_mean_px", 0.0) - after_metrics.get("target_mean_px", 0.0))
+    front_improve = float(before_metrics.get("front_target_mean_px", 0.0) - after_metrics.get("front_target_mean_px", 0.0))
+    protected_worsen = float(after_metrics.get("protected_mean_px", 0.0) - before_metrics.get("protected_mean_px", 0.0))
+    profile_worsen = float(after_profile.get("mean_px", 0.0) - before_profile.get("mean_px", 0.0))
+    before_front = next((r for r in before_metrics.get("records", []) if r.get("view") == "front"), {})
+    after_front = next((r for r in after_metrics.get("records", []) if r.get("view") == "front"), {})
+    before_width_abs = abs(float(before_front.get("nose_width_delta_px", 0.0)))
+    after_width_abs = abs(float(after_front.get("nose_width_delta_px", 0.0)))
+    nose_width_abs_worsen = float(after_width_abs - before_width_abs)
+    safety = _mesh_offset_safety_report(offsets, faces, protected)
+    reject_reasons = []
+    if target_improve < float(min_improve_px):
+        reject_reasons.append("target-improve-too-small")
+    if front_improve < float(min_front_improve_px):
+        reject_reasons.append("front-improve-too-small")
+    if protected_worsen > float(max_protected_worsen_px):
+        reject_reasons.append("protected-worsened")
+    if profile_worsen > float(max_profile_worsen_px):
+        reject_reasons.append("profile-contour-worsened")
+    if nose_width_abs_worsen > float(max_nose_width_abs_worsen_px):
+        reject_reasons.append("nose-width-worsened")
+    if float(safety.get("moved_ratio", 0.0)) > float(max_moved_ratio):
+        reject_reasons.append("moved-ratio")
+    if float(safety.get("max_offset_m", 0.0)) > float(max_offset_m) + 1e-8:
+        reject_reasons.append("max-offset")
+    accepted = not reject_reasons
+    report.update({
+        "applied": bool(accepted),
+        "accepted": bool(accepted),
+        "reason": "accepted nose/mouth local residual" if accepted else "rejected: " + ", ".join(reject_reasons),
+        "reject_reasons": reject_reasons,
+        "before_metrics": before_metrics,
+        "after_metrics": after_metrics,
+        "before_profile": before_profile,
+        "after_profile": after_profile,
+        "target_improve_px": round(float(target_improve), 3),
+        "front_target_improve_px": round(float(front_improve), 3),
+        "protected_worsen_px": round(float(protected_worsen), 3),
+        "profile_worsen_px": round(float(profile_worsen), 3),
+        "nose_width_abs_worsen_px": round(float(nose_width_abs_worsen), 3),
+        "constraint_vertices": int(constraints.sum()),
+        "editable_vertices": int(editable.sum()),
+        "width_guard_removed_vertices": int(width_guard_removed_vertices),
+        "width_guard_removed_mean_m": round(float(width_guard_removed_mean_m), 6),
+        "safety": safety,
+        "thresholds": {
+            "min_improve_px": round(float(min_improve_px), 3),
+            "min_front_improve_px": round(float(min_front_improve_px), 3),
+            "max_protected_worsen_px": round(float(max_protected_worsen_px), 3),
+            "max_profile_worsen_px": round(float(max_profile_worsen_px), 3),
+            "max_nose_width_abs_worsen_px": round(float(max_nose_width_abs_worsen_px), 3),
+            "max_offset_m": round(float(max_offset_m), 6),
+            "max_moved_ratio": round(float(max_moved_ratio), 4),
+        },
+    })
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    _write_nose_mouth_local_index(out_dir, report)
+    logger.info(
+        "Nose/mouth local residual: accepted=%s target %.2fpx front %.2fpx protected_worsen %.2fpx moved=%s",
+        accepted,
+        target_improve,
+        front_improve,
+        protected_worsen,
+        safety.get("moved_vertices"),
+    )
+    if not accepted:
+        return verts_base, verts_displaced, report
+    return verts_base_out, verts_disp_out, report
+
+
+def _nose_region_roi_mask(
+    proj: np.ndarray,
+    target_landmarks: np.ndarray,
+    projected_landmarks: np.ndarray,
+    margin_px: float,
+    image_shape: Optional[Tuple[int, int]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    nose_pts = np.vstack([
+        np.asarray(target_landmarks, dtype=np.float64)[LMK_NOSE_IDX],
+        np.asarray(projected_landmarks, dtype=np.float64)[LMK_NOSE_IDX],
+    ])
+    finite = np.isfinite(nose_pts).all(axis=1)
+    if finite.sum() < 4 or len(proj) == 0:
+        return np.zeros(len(proj), dtype=bool), np.zeros((0, 2), dtype=np.int32)
+    nose_pts = nose_pts[finite]
+    x_min, y_min = nose_pts.min(axis=0)
+    x_max, y_max = nose_pts.max(axis=0)
+    width = max(float(x_max - x_min), 1.0)
+    height = max(float(y_max - y_min), 1.0)
+    margin = float(margin_px)
+    x0 = x_min - max(0.50 * margin, 0.20 * width)
+    x1 = x_max + max(0.50 * margin, 0.20 * width)
+    y0 = y_min - max(0.35 * margin, 0.12 * height)
+    y1 = y_max + max(0.55 * margin, 0.22 * height)
+    center = np.array([(x0 + x1) * 0.5, (y0 + y1) * 0.5], dtype=np.float64)
+    rx = max((x1 - x0) * 0.5, 1.0)
+    ry = max((y1 - y0) * 0.5, 1.0)
+    norm = ((proj[:, 0] - center[0]) / rx) ** 2 + ((proj[:, 1] - center[1]) / ry) ** 2
+    in_roi = norm <= 1.0
+    if image_shape is not None:
+        h, w = image_shape
+        in_roi &= (
+            (proj[:, 0] >= 0.0)
+            & (proj[:, 0] < float(w))
+            & (proj[:, 1] >= 0.0)
+            & (proj[:, 1] < float(h))
+        )
+    angles = np.linspace(0.0, 2.0 * np.pi, 96, endpoint=False)
+    poly = np.stack([center[0] + rx * np.cos(angles), center[1] + ry * np.sin(angles)], axis=1)
+    return in_roi, np.round(poly).astype(np.int32)
+
+
+def _save_nose_region_overlay(
+    image: np.ndarray,
+    target_landmarks: np.ndarray,
+    projected_landmarks: np.ndarray,
+    out_path: Path,
+    roi_poly: Optional[np.ndarray] = None,
+    selected_proj: Optional[np.ndarray] = None,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    if roi_poly is not None and len(roi_poly) >= 3:
+        cv2.polylines(img, [roi_poly.astype(np.int32)], True, (255, 220, 80), 2, cv2.LINE_AA)
+    if selected_proj is not None and len(selected_proj):
+        pts = np.asarray(selected_proj, dtype=np.float64)
+        finite = np.isfinite(pts).all(axis=1)
+        pts = pts[finite]
+        if len(pts) > 5000:
+            pts = pts[np.linspace(0, len(pts) - 1, 5000).astype(np.int64)]
+        h, w = img.shape[:2]
+        for p in pts:
+            x, y = int(round(float(p[0]))), int(round(float(p[1])))
+            if 0 <= x < w and 0 <= y < h:
+                cv2.circle(img, (x, y), 1, (255, 120, 20), -1)
+    for idx in LMK_NOSE_IDX:
+        gt = tuple(np.round(target_landmarks[idx]).astype(int))
+        pred = tuple(np.round(projected_landmarks[idx]).astype(int))
+        color = (0, 180, 255) if idx in set(LMK_NOSE_BASE_IDX.tolist()) else (255, 180, 0)
+        cv2.circle(img, gt, 4, (0, 255, 0), -1)
+        cv2.circle(img, pred, 4, (0, 0, 255), -1)
+        cv2.line(img, gt, pred, color, 2, cv2.LINE_AA)
+        cv2.putText(img, str(int(idx)), (pred[0] + 4, pred[1] - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+    pts = np.vstack([target_landmarks[LMK_NOSE_IDX], projected_landmarks[LMK_NOSE_IDX]])
+    if roi_poly is not None and len(roi_poly) >= 3:
+        pts = np.vstack([pts, roi_poly.astype(np.float64)])
+    x0, y0 = np.floor(pts.min(axis=0) - 60).astype(int)
+    x1, y1 = np.ceil(pts.max(axis=0) + 60).astype(int)
+    h, w = img.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 > x0 and y1 > y0:
+        cv2.rectangle(img, (x0, y0), (x1, y1), (240, 240, 240), 2)
+        cv2.imwrite(str(out_path.with_name(out_path.stem + "_crop.jpg")), img[y0:y1, x0:x1])
+    cv2.imwrite(str(out_path), img)
+
+
+def _nose_region_metric_report(
+    vertices: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    lmk_vertex_indices: np.ndarray,
+    lmk_tri_vidx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    out_dir: Path,
+    prefix: str,
+    selected_by_view: Optional[dict] = None,
+    roi_margin_px: float = 28.0,
+) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    nose_vals = []
+    front_vals = []
+    protected_vals = []
+    for view_name, view_result in per_view_results.items():
+        if view_name not in view_data or view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        target_lmk = np.asarray(view_data[view_name]["lmk_2d"], dtype=np.float64)
+        K = intrinsics[view_name]
+        R = view_result["R"]
+        t = view_result["t"]
+        lmk_proj, errors = _landmark_reprojection_details(
+            vertices=vertices,
+            K=K,
+            R=R,
+            t=t,
+            target_landmarks=target_lmk,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+        )
+        proj, _ = _project_vertices_np(vertices, K, R, t)
+        _roi_mask, roi_poly = _nose_region_roi_mask(
+            proj=proj,
+            target_landmarks=target_lmk,
+            projected_landmarks=lmk_proj,
+            margin_px=roi_margin_px,
+            image_shape=preprocessed_views[view_name]["image"].shape[:2],
+        )
+        selected_proj = None
+        if selected_by_view is not None and view_name in selected_by_view:
+            selected_idx = np.asarray(selected_by_view.get(view_name), dtype=np.int64)
+            if selected_idx.size:
+                selected_proj = proj[selected_idx]
+        _save_nose_region_overlay(
+            image=preprocessed_views[view_name]["image"],
+            target_landmarks=target_lmk,
+            projected_landmarks=lmk_proj,
+            roi_poly=roi_poly,
+            selected_proj=selected_proj,
+            out_path=out_dir / f"{view_name}_{prefix}_nose_region.png",
+        )
+        nose = _landmark_subset_stats(errors, LMK_NOSE_IDX)
+        bridge = _landmark_subset_stats(errors, LMK_NOSE_BRIDGE_IDX)
+        base = _landmark_subset_stats(errors, LMK_NOSE_BASE_IDX)
+        protected = _landmark_subset_stats(errors, LMK_NOSE_REGION_PROTECT_IDX)
+        record = {
+            "view": view_name,
+            "nose_mean_px": nose["mean_px"],
+            "nose_bridge_mean_px": bridge["mean_px"],
+            "nose_base_mean_px": base["mean_px"],
+            "protected_mean_px": protected["mean_px"],
+        }
+        if view_name == "front":
+            target_width = float(np.linalg.norm(target_lmk[31] - target_lmk[35]))
+            model_width = float(np.linalg.norm(lmk_proj[31] - lmk_proj[35]))
+            record.update({
+                "nose_width_target_px": round(target_width, 3),
+                "nose_width_model_px": round(model_width, 3),
+                "nose_width_delta_px": round(model_width - target_width, 3),
+                "nose_center_shift_px": [
+                    round(float(lmk_proj[LMK_NOSE_IDX, 0].mean() - target_lmk[LMK_NOSE_IDX, 0].mean()), 3),
+                    round(float(lmk_proj[LMK_NOSE_IDX, 1].mean() - target_lmk[LMK_NOSE_IDX, 1].mean()), 3),
+                ],
+            })
+        records.append(record)
+        nose_vals.append(float(nose["mean_px"]))
+        protected_vals.append(float(protected["mean_px"]))
+        if view_name == "front":
+            front_vals.append(float(nose["mean_px"]))
+    return {
+        "records": records,
+        "target_landmarks": [int(x) for x in LMK_NOSE_IDX],
+        "nose_mean_px": round(float(np.mean(nose_vals)) if nose_vals else 0.0, 3),
+        "front_nose_mean_px": round(float(np.mean(front_vals)) if front_vals else 0.0, 3),
+        "protected_mean_px": round(float(np.mean(protected_vals)) if protected_vals else 0.0, 3),
+    }
+
+
+def _write_nose_region_dense_index(out_dir: Path, report: dict) -> None:
+    rows = []
+    for phase_key, label in (("before", "before"), ("after", "after")):
+        metrics = report.get(f"{phase_key}_metrics", {})
+        for rec in metrics.get("records", []):
+            rows.append(
+                f"<tr><td>{label}</td><td>{rec.get('view')}</td>"
+                f"<td>{rec.get('nose_mean_px')}</td><td>{rec.get('nose_bridge_mean_px')}</td>"
+                f"<td>{rec.get('nose_base_mean_px')}</td><td>{rec.get('protected_mean_px')}</td>"
+                f"<td>{rec.get('nose_width_delta_px', '')}</td></tr>"
+            )
+    cards = []
+    for view_name in ("left", "front", "right"):
+        cards.append(
+            f"""
+            <section class="card">
+              <h2>{view_name}</h2>
+              <img src="{view_name}_before_nose_region.png" />
+              <img src="{view_name}_after_nose_region.png" />
+              <img src="{view_name}_residual_heatmap.png" />
+            </section>
+            """
+        )
+    doc = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" />
+<title>Nose region dense residual audit</title>
+<style>
+body {{ margin:0; padding:28px; background:#101826; color:#e8f1ff; font-family:Arial,"Microsoft YaHei",sans-serif; }}
+.status {{ padding:16px 18px; border-radius:14px; background:{'#193d2a' if report.get('accepted') else '#432323'}; }}
+.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:18px; }}
+.card {{ background:#172235; border:1px solid #26364d; border-radius:14px; padding:14px; }}
+img {{ max-width:100%; background:#000; border-radius:10px; margin:8px 0; }}
+table {{ border-collapse:collapse; width:100%; margin:18px 0; background:#111b2a; }}
+td,th {{ border:1px solid #2b3d55; padding:8px 10px; }}
+th {{ background:#20304a; }}
+.muted {{ color:#9fb0c8; }}
+</style></head><body>
+<h1>Nose region dense residual audit</h1>
+<div class="status">
+  <h2>{'Accepted' if report.get('accepted') else 'Rejected'}</h2>
+  <p>{report.get('reason', '')}</p>
+</div>
+<p class="muted">Green points are target landmarks, red points are model projections, yellow ellipse is the nose ROI, orange dots are editable dense nose-region vertices.</p>
+<table>
+<tr><th>phase</th><th>view</th><th>nose mean</th><th>bridge</th><th>base</th><th>protected</th><th>front width delta</th></tr>
+{''.join(rows)}
+</table>
+<pre>{json.dumps({k: report.get(k) for k in ['nose_improve_px','front_nose_improve_px','protected_worsen_px','profile_worsen_px','nose_width_abs_worsen_px','constraint_vertices','editable_vertices','safety','reject_reasons']}, ensure_ascii=False, indent=2)}</pre>
+<div class="grid">{''.join(cards)}</div>
+</body></html>"""
+    (out_dir / "index.html").write_text(doc, encoding="utf-8")
+
+
+def _nose_region_dense_residual_deform_mesh(
+    verts_base: np.ndarray,
+    verts_displaced: np.ndarray,
+    faces: np.ndarray,
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    per_view_results: Dict[str, dict],
+    debug_dir: Path,
+    lmk_vertex_indices: Optional[np.ndarray],
+    lmk_tri_vidx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    enabled: bool = True,
+    max_offset_m: float = 0.008,
+    vertex_radius_px: float = 34.0,
+    roi_margin_px: float = 28.0,
+    protect_radius_px: float = 34.0,
+    max_step_px: float = 14.0,
+    front_weight: float = 1.0,
+    side_weight: float = 0.20,
+    bridge_weight: float = 0.45,
+    tip_weight: float = 0.80,
+    wing_weight: float = 1.0,
+    guard_nose_width: bool = True,
+    smooth_iter: int = 14,
+    smooth_alpha: float = 0.20,
+    constraint_keep: float = 0.64,
+    min_improve_px: float = 0.25,
+    min_front_improve_px: float = 0.40,
+    max_protected_worsen_px: float = 0.35,
+    max_profile_worsen_px: float = 1.0,
+    max_nose_width_abs_worsen_px: float = 1.0,
+    max_moved_ratio: float = 0.045,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    out_dir = debug_dir / "nose_region_dense_residual"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "accepted": False,
+        "target_landmarks": [int(x) for x in LMK_NOSE_IDX],
+        "protected_landmarks": [int(x) for x in LMK_NOSE_REGION_PROTECT_IDX],
+    }
+    if not enabled or lmk_vertex_indices is None or len(verts_displaced) == 0:
+        report["reason"] = "disabled or missing landmark mapping"
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        _write_nose_region_dense_index(out_dir, report)
+        return verts_base, verts_displaced, report
+
+    before_metrics = _nose_region_metric_report(
+        verts_displaced,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+        lmk_vertex_indices,
+        lmk_tri_vidx,
+        lmk_bary_coords,
+        out_dir,
+        "before",
+        roi_margin_px=roi_margin_px,
+    )
+    before_profile = _local_profile_contour_mean(
+        verts_displaced,
+        faces,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+    )
+
+    n = len(verts_displaced)
+    offsets_accum = np.zeros((n, 3), dtype=np.float64)
+    weights_accum = np.zeros(n, dtype=np.float64)
+    editable = np.zeros(n, dtype=bool)
+    protected = np.zeros(n, dtype=bool)
+    selected_by_view = {}
+    normals = compute_vertex_normals(verts_displaced, faces)
+    front_roi_prior = None
+    if "front" in per_view_results and "front" in view_data and "front" in preprocessed_views and "front" in intrinsics:
+        try:
+            front_result = per_view_results["front"]
+            front_target_lmk = np.asarray(view_data["front"]["lmk_2d"], dtype=np.float64)
+            front_lmk_proj, _ = _landmark_reprojection_details(
+                vertices=verts_displaced,
+                K=intrinsics["front"],
+                R=front_result["R"],
+                t=front_result["t"],
+                target_landmarks=front_target_lmk,
+                lmk_vertex_indices=lmk_vertex_indices,
+                lmk_tri_vidx=lmk_tri_vidx,
+                lmk_bary_coords=lmk_bary_coords,
+            )
+            front_proj, front_v_cam = _project_vertices_np(
+                verts_displaced,
+                intrinsics["front"],
+                front_result["R"],
+                front_result["t"],
+            )
+            front_roi_prior, _ = _nose_region_roi_mask(
+                proj=front_proj,
+                target_landmarks=front_target_lmk,
+                projected_landmarks=front_lmk_proj,
+                margin_px=roi_margin_px,
+                image_shape=preprocessed_views["front"]["image"].shape[:2],
+            )
+            front_roi_prior &= front_v_cam[:, 2] > 1e-5
+        except Exception as exc:
+            logger.warning("Nose region front ROI prior failed: %s", exc)
+            front_roi_prior = None
+
+    bridge_set = set(LMK_NOSE_BRIDGE_IDX.tolist())
+    wing_set = {31, 35}
+    tip_set = {30, 32, 33, 34}
+    for view_name, view_result in per_view_results.items():
+        if view_name not in view_data or view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        K = intrinsics[view_name]
+        R = view_result["R"]
+        t = view_result["t"]
+        image = preprocessed_views[view_name]["image"]
+        target_lmk = np.asarray(view_data[view_name]["lmk_2d"], dtype=np.float64)
+        proj, v_cam = _project_vertices_np(verts_displaced, K, R, t)
+        lmk_proj, _errors = _landmark_reprojection_details(
+            vertices=verts_displaced,
+            K=K,
+            R=R,
+            t=t,
+            target_landmarks=target_lmk,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_bary_coords,
+        )
+        roi_mask, _roi_poly = _nose_region_roi_mask(
+            proj=proj,
+            target_landmarks=target_lmk,
+            projected_landmarks=lmk_proj,
+            margin_px=roi_margin_px,
+            image_shape=image.shape[:2],
+        )
+        view_dir_world = -R[2, :]
+        visible = (normals @ view_dir_world) > 0.02
+        visible &= v_cam[:, 2] > 1e-5
+        protect_pts = np.concatenate([
+            target_lmk[LMK_NOSE_REGION_PROTECT_IDX],
+            lmk_proj[LMK_NOSE_REGION_PROTECT_IDX],
+        ], axis=0)
+        view_protected = _vertices_near_points_2d(proj, protect_pts, float(protect_radius_px))
+        protected |= view_protected
+        view_editable = roi_mask & visible & ~view_protected
+        if front_roi_prior is not None and len(front_roi_prior) == len(view_editable):
+            view_editable &= front_roi_prior
+        selected_by_view[view_name] = np.flatnonzero(view_editable).astype(np.int64)
+
+        view_weight = float(front_weight if view_name == "front" else side_weight)
+        if view_weight <= 1e-8 or not np.any(view_editable):
+            continue
+        camera_x_world = R.T @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        camera_y_world = R.T @ np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        fx = max(abs(float(K[0, 0])), 1e-6)
+        fy = max(abs(float(K[1, 1])), 1e-6)
+        width_state = None
+        if bool(guard_nose_width) and view_name == "front":
+            target_width = float(np.linalg.norm(target_lmk[31] - target_lmk[35]))
+            model_width = float(np.linalg.norm(lmk_proj[31] - lmk_proj[35]))
+            center_x = float(lmk_proj[LMK_NOSE_BASE_IDX, 0].mean())
+            if model_width > target_width + 1e-6:
+                width_state = ("too_wide", center_x)
+            elif model_width < target_width - 1e-6:
+                width_state = ("too_narrow", center_x)
+        edit_idx = np.flatnonzero(view_editable)
+        for idx in LMK_NOSE_IDX:
+            delta = target_lmk[idx] - lmk_proj[idx]
+            if idx in wing_set and width_state is not None:
+                state, center_x = width_state
+                side_sign = np.sign(float(lmk_proj[idx, 0]) - center_x)
+                horizontal_direction = side_sign * float(delta[0])
+                if state == "too_wide" and horizontal_direction > 0:
+                    delta[0] = 0.0
+                elif state == "too_narrow" and horizontal_direction < 0:
+                    delta[0] = 0.0
+            delta_norm = float(np.linalg.norm(delta))
+            if delta_norm < 1e-4:
+                continue
+            if delta_norm > float(max_step_px):
+                delta = delta * (float(max_step_px) / delta_norm)
+            if idx in wing_set:
+                handle_weight = float(wing_weight)
+            elif idx in tip_set:
+                handle_weight = float(tip_weight)
+            elif idx in bridge_set:
+                handle_weight = float(bridge_weight)
+            else:
+                handle_weight = 0.65
+            if handle_weight <= 1e-8:
+                continue
+            d2_target = ((proj[edit_idx] - target_lmk[idx]) ** 2).sum(axis=1)
+            d2_model = ((proj[edit_idx] - lmk_proj[idx]) ** 2).sum(axis=1)
+            d2 = np.minimum(d2_target, d2_model)
+            near_local = d2 <= float(vertex_radius_px) ** 2
+            if not np.any(near_local):
+                continue
+            vidx = edit_idx[near_local]
+            conf = np.exp(-0.5 * d2[near_local] / max(float(vertex_radius_px) ** 2, 1e-6))
+            conf *= view_weight * handle_weight
+            dx_cam = float(delta[0]) * np.clip(v_cam[vidx, 2], 1e-6, None) / fx
+            dy_cam = float(delta[1]) * np.clip(v_cam[vidx, 2], 1e-6, None) / fy
+            local_offsets = dx_cam[:, None] * camera_x_world[None, :] + dy_cam[:, None] * camera_y_world[None, :]
+            np.add.at(offsets_accum, vidx, local_offsets * conf[:, None])
+            np.add.at(weights_accum, vidx, conf)
+            editable[vidx] = True
+
+    constraints = (weights_accum > 1e-6) & editable & ~protected
+    if not np.any(constraints):
+        report.update({
+            "reason": "no usable nose-region constraints",
+            "before_metrics": before_metrics,
+            "before_profile": before_profile,
+            "editable_vertices": int(editable.sum()),
+        })
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        _write_nose_region_dense_index(out_dir, report)
+        return verts_base, verts_displaced, report
+
+    constraint_offsets = np.zeros_like(offsets_accum)
+    constraint_offsets[constraints] = offsets_accum[constraints] / weights_accum[constraints, None]
+    norm = np.linalg.norm(constraint_offsets, axis=1)
+    too_far = norm > float(max_offset_m)
+    if np.any(too_far):
+        constraint_offsets[too_far] *= (float(max_offset_m) / np.clip(norm[too_far], 1e-8, None))[:, None]
+
+    offsets = _smooth_vertex_offsets(
+        offsets=constraint_offsets.copy(),
+        faces=faces,
+        editable=editable & ~protected,
+        constraints=constraints,
+        constraint_offsets=constraint_offsets,
+        max_offset_m=float(max_offset_m),
+        iterations=int(smooth_iter),
+        alpha=float(smooth_alpha),
+        constraint_keep=float(constraint_keep),
+    )
+    width_guard_removed_vertices = 0
+    width_guard_removed_mean_m = 0.0
+    if bool(guard_nose_width) and "front" in per_view_results and "front" in view_data and "front" in intrinsics:
+        try:
+            front_result = per_view_results["front"]
+            front_K = intrinsics["front"]
+            front_R = front_result["R"]
+            front_t = front_result["t"]
+            front_target_lmk = np.asarray(view_data["front"]["lmk_2d"], dtype=np.float64)
+            front_lmk_proj, _front_errors = _landmark_reprojection_details(
+                vertices=verts_displaced,
+                K=front_K,
+                R=front_R,
+                t=front_t,
+                target_landmarks=front_target_lmk,
+                lmk_vertex_indices=lmk_vertex_indices,
+                lmk_tri_vidx=lmk_tri_vidx,
+                lmk_bary_coords=lmk_bary_coords,
+            )
+            target_width = float(np.linalg.norm(front_target_lmk[31] - front_target_lmk[35]))
+            model_width = float(np.linalg.norm(front_lmk_proj[31] - front_lmk_proj[35]))
+            width_state = None
+            if model_width > target_width + 1e-6:
+                width_state = "too_wide"
+            elif model_width < target_width - 1e-6:
+                width_state = "too_narrow"
+            if width_state is not None:
+                proj_before, _ = _project_vertices_np(verts_displaced, front_K, front_R, front_t)
+                center_x = float(front_lmk_proj[LMK_NOSE_BASE_IDX, 0].mean())
+                side_sign = np.sign(proj_before[:, 0] - center_x)
+                camera_x_world = front_R.T @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                x_component = offsets @ camera_x_world
+                outward = side_sign * x_component
+                if width_state == "too_wide":
+                    bad = (outward > 0.0) & editable & ~protected
+                else:
+                    bad = (outward < 0.0) & editable & ~protected
+                if np.any(bad):
+                    removed = x_component[bad, None] * camera_x_world[None, :]
+                    offsets[bad] -= removed
+                    width_guard_removed_vertices = int(np.count_nonzero(bad))
+                    width_guard_removed_mean_m = float(np.linalg.norm(removed, axis=1).mean())
+        except Exception as exc:
+            logger.warning("Nose region width guard failed: %s", exc)
+
+    norm = np.linalg.norm(offsets, axis=1)
+    too_far = norm > float(max_offset_m)
+    if np.any(too_far):
+        offsets[too_far] *= (float(max_offset_m) / np.clip(norm[too_far], 1e-8, None))[:, None]
+
+    verts_base_out = verts_base + offsets.astype(verts_base.dtype, copy=False)
+    verts_disp_out = verts_displaced + offsets.astype(verts_displaced.dtype, copy=False)
+    after_metrics = _nose_region_metric_report(
+        verts_disp_out,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+        lmk_vertex_indices,
+        lmk_tri_vidx,
+        lmk_bary_coords,
+        out_dir,
+        "after",
+        selected_by_view=selected_by_view,
+        roi_margin_px=roi_margin_px,
+    )
+    after_profile = _local_profile_contour_mean(
+        verts_disp_out,
+        faces,
+        view_data,
+        preprocessed_views,
+        intrinsics,
+        per_view_results,
+    )
+    for view_name, view_result in per_view_results.items():
+        if view_name not in preprocessed_views or view_name not in intrinsics:
+            continue
+        _save_residual_heatmap_projection(
+            image=preprocessed_views[view_name]["image"],
+            vertices=verts_disp_out,
+            K=intrinsics[view_name],
+            R=view_result["R"],
+            t=view_result["t"],
+            offsets=offsets,
+            out_path=out_dir / f"{view_name}_residual_heatmap.png",
+        )
+
+    nose_improve = float(before_metrics.get("nose_mean_px", 0.0) - after_metrics.get("nose_mean_px", 0.0))
+    front_improve = float(before_metrics.get("front_nose_mean_px", 0.0) - after_metrics.get("front_nose_mean_px", 0.0))
+    protected_worsen = float(after_metrics.get("protected_mean_px", 0.0) - before_metrics.get("protected_mean_px", 0.0))
+    profile_worsen = float(after_profile.get("mean_px", 0.0) - before_profile.get("mean_px", 0.0))
+    before_front = next((r for r in before_metrics.get("records", []) if r.get("view") == "front"), {})
+    after_front = next((r for r in after_metrics.get("records", []) if r.get("view") == "front"), {})
+    nose_width_abs_worsen = abs(float(after_front.get("nose_width_delta_px", 0.0))) - abs(float(before_front.get("nose_width_delta_px", 0.0)))
+    safety = _mesh_offset_safety_report(offsets, faces, protected)
+    reject_reasons = []
+    if nose_improve < float(min_improve_px):
+        reject_reasons.append("nose-improve-too-small")
+    if front_improve < float(min_front_improve_px):
+        reject_reasons.append("front-nose-improve-too-small")
+    if protected_worsen > float(max_protected_worsen_px):
+        reject_reasons.append("protected-worsened")
+    if profile_worsen > float(max_profile_worsen_px):
+        reject_reasons.append("profile-contour-worsened")
+    if nose_width_abs_worsen > float(max_nose_width_abs_worsen_px):
+        reject_reasons.append("nose-width-worsened")
+    if float(safety.get("moved_ratio", 0.0)) > float(max_moved_ratio):
+        reject_reasons.append("moved-ratio")
+    if float(safety.get("max_offset_m", 0.0)) > float(max_offset_m) + 1e-8:
+        reject_reasons.append("max-offset")
+    accepted = not reject_reasons
+    report.update({
+        "applied": bool(accepted),
+        "accepted": bool(accepted),
+        "reason": "accepted nose region dense residual" if accepted else "rejected: " + ", ".join(reject_reasons),
+        "reject_reasons": reject_reasons,
+        "before_metrics": before_metrics,
+        "after_metrics": after_metrics,
+        "before_profile": before_profile,
+        "after_profile": after_profile,
+        "nose_improve_px": round(float(nose_improve), 3),
+        "front_nose_improve_px": round(float(front_improve), 3),
+        "protected_worsen_px": round(float(protected_worsen), 3),
+        "profile_worsen_px": round(float(profile_worsen), 3),
+        "nose_width_abs_worsen_px": round(float(nose_width_abs_worsen), 3),
+        "constraint_vertices": int(constraints.sum()),
+        "editable_vertices": int(editable.sum()),
+        "width_guard_removed_vertices": int(width_guard_removed_vertices),
+        "width_guard_removed_mean_m": round(float(width_guard_removed_mean_m), 6),
+        "selected_vertices_by_view": {k: int(len(v)) for k, v in selected_by_view.items()},
+        "safety": safety,
+        "thresholds": {
+            "min_improve_px": round(float(min_improve_px), 3),
+            "min_front_improve_px": round(float(min_front_improve_px), 3),
+            "max_protected_worsen_px": round(float(max_protected_worsen_px), 3),
+            "max_profile_worsen_px": round(float(max_profile_worsen_px), 3),
+            "max_nose_width_abs_worsen_px": round(float(max_nose_width_abs_worsen_px), 3),
+            "max_offset_m": round(float(max_offset_m), 6),
+            "max_moved_ratio": round(float(max_moved_ratio), 4),
+        },
+    })
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    _write_nose_region_dense_index(out_dir, report)
+    logger.info(
+        "Nose region dense residual: accepted=%s nose %.2fpx front %.2fpx protected_worsen %.2fpx moved=%s",
+        accepted,
+        nose_improve,
+        front_improve,
+        protected_worsen,
+        safety.get("moved_vertices"),
+    )
+    if not accepted:
+        return verts_base, verts_displaced, report
+    return verts_base_out, verts_disp_out, report
 
 
 def _free_identity_deform_mesh(
@@ -4085,6 +5390,120 @@ def export_mesh_glb(
     logger.info(f"GLB 已导出: {output_path}")
 
 
+def _load_calibrated_rig_views(view_names) -> Optional[dict]:
+    try:
+        from src import config as cfg
+        enabled = bool(getattr(cfg, "STABLE_USE_CALIBRATED_RIG_EXTRINSICS", False))
+        calibration_path = Path(getattr(cfg, "CAMERA_CALIBRATION_PATH", ""))
+    except Exception:
+        return None
+    if not enabled or not calibration_path.exists():
+        return None
+    try:
+        data = json.loads(calibration_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("无法读取 rig 标定文件 %s: %s", calibration_path, exc)
+        return None
+
+    cameras = data.get("cameras", {})
+    camera_by_view = {
+        camera_data.get("view", camera_name): (camera_name, camera_data)
+        for camera_name, camera_data in cameras.items()
+    }
+    reference_camera = data.get("reference_camera")
+    reference_view = None
+    if reference_camera in cameras:
+        reference_view = cameras[reference_camera].get("view", reference_camera)
+    if reference_view not in view_names and "front" in view_names:
+        reference_view = "front"
+    if reference_view not in view_names or reference_view not in camera_by_view:
+        logger.warning("rig 标定 reference view 不可用: %s", reference_view)
+        return None
+
+    raw = {}
+    for view_name in view_names:
+        item = camera_by_view.get(view_name)
+        if item is None:
+            logger.warning("rig 标定缺少视角 %s 的相机数据", view_name)
+            return None
+        camera_name, camera_data = item
+        rig = camera_data.get("rig_to_camera", {})
+        if "R" not in rig or "t" not in rig:
+            logger.warning("rig 标定视角 %s 缺少 rig_to_camera", view_name)
+            return None
+        raw[view_name] = {
+            "camera": camera_name,
+            "R": np.asarray(rig["R"], dtype=np.float64),
+            "t": np.asarray(rig["t"], dtype=np.float64).reshape(3),
+        }
+
+    R_ref = raw[reference_view]["R"]
+    t_ref = raw[reference_view]["t"]
+    views = {}
+    for view_name, item in raw.items():
+        R_rel = item["R"] @ R_ref.T
+        t_rel = item["t"] - R_rel @ t_ref
+        views[view_name] = {
+            "camera": item["camera"],
+            "R_ref_to_camera": R_rel.astype(np.float32),
+            "t_ref_to_camera": t_rel.astype(np.float32),
+        }
+    return {
+        "enabled": True,
+        "calibration_path": str(calibration_path),
+        "reference_view": reference_view,
+        "reference_camera": raw[reference_view]["camera"],
+        "views": views,
+    }
+
+
+def _apply_calibrated_rig_initial_poses(view_data: dict, rig_data: dict, debug_dir: Path) -> bool:
+    if not rig_data or rig_data.get("reference_view") not in view_data:
+        return False
+    reference_view = rig_data["reference_view"]
+    ref_R = np.asarray(view_data[reference_view]["R_init"], dtype=np.float32)
+    ref_t = np.asarray(view_data[reference_view]["t_init"], dtype=np.float32).reshape(3)
+    meta = {
+        "enabled": True,
+        "calibration_path": rig_data.get("calibration_path"),
+        "reference_view": reference_view,
+        "reference_camera": rig_data.get("reference_camera"),
+        "views": {},
+    }
+    for view_name, vd in view_data.items():
+        rel = rig_data["views"].get(view_name)
+        if rel is None:
+            return False
+        R_rel = np.asarray(rel["R_ref_to_camera"], dtype=np.float32)
+        t_rel = np.asarray(rel["t_ref_to_camera"], dtype=np.float32).reshape(3)
+        R_init = R_rel @ ref_R
+        t_init = R_rel @ ref_t + t_rel
+        vd["R_init"] = R_init.astype(np.float32)
+        vd["t_init"] = t_init.astype(np.float32)
+        vd["rig_R_ref_to_camera"] = R_rel.astype(np.float32)
+        vd["rig_t_ref_to_camera"] = t_rel.astype(np.float32)
+        vd["rig_reference_view"] = reference_view
+        meta["views"][view_name] = {
+            "camera": rel.get("camera"),
+            "R_ref_to_camera": R_rel.astype(float).tolist(),
+            "t_ref_to_camera": t_rel.astype(float).tolist(),
+            "derived_R_init": R_init.astype(float).tolist(),
+            "derived_t_init": t_init.astype(float).tolist(),
+        }
+
+    try:
+        with open(debug_dir / "calibrated_rig_pose_init.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logger.warning("保存 calibrated rig debug 失败: %s", exc)
+    logger.info(
+        "已应用固定 rig 外参初值：reference=%s, calibration=%s",
+        reference_view,
+        rig_data.get("calibration_path"),
+    )
+    return True
+
+
 def run_geometry_reconstruction(
     preprocessed_views: Dict[str, dict],
     intrinsics: Dict[str, np.ndarray],
@@ -4102,6 +5521,7 @@ def run_geometry_reconstruction(
     lbfgs_lr: float = 0.5,
     depth_model_size: str = "large",
     max_displacement: float = 0.005,
+    enable_depth_displacement: bool = True,
     init_backend: str = "face_alignment",
     mica_dir: Optional[Path] = None,
     mica_checkpoint: Optional[Path] = None,
@@ -4178,6 +5598,7 @@ def run_geometry_reconstruction(
         {k: v["image"] for k, v in preprocessed_views.items()},
         device,
     )
+    rig_data = _load_calibrated_rig_views(preprocessed_views.keys())
 
     for view_name, pdata in preprocessed_views.items():
         K_np = intrinsics[view_name]
@@ -4224,20 +5645,24 @@ def run_geometry_reconstruction(
         raise RuntimeError("所有视角关键点检测失败，无法进行 3DMM 重建")
 
     # ── 保存每视角初始化参数 + 预优化重投影图 ────────────────────────────────
+    rig_applied = _apply_calibrated_rig_initial_poses(view_data, rig_data, debug_dir) if rig_data else False
     lmk_tri_vidx = flame_faces_np[lmk_data["face_idx"]] if lmk_data is not None else None
-    _audit_and_repair_initial_poses(
-        view_data=view_data,
-        init_result=init_result,
-        init_exps=init_exps,
-        init_shape=init_shape,
-        flame=flame,
-        lmk_vertex_indices=lmk_vertex_indices,
-        lmk_tri_vidx=lmk_tri_vidx,
-        lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
-        preprocessed_views=preprocessed_views,
-        intrinsics=intrinsics,
-        debug_dir=debug_dir,
-    )
+    if not rig_applied:
+        _audit_and_repair_initial_poses(
+            view_data=view_data,
+            init_result=init_result,
+            init_exps=init_exps,
+            init_shape=init_shape,
+            flame=flame,
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            preprocessed_views=preprocessed_views,
+            intrinsics=intrinsics,
+            debug_dir=debug_dir,
+        )
+    else:
+        logger.info("固定 rig 外参已启用：跳过 per-view PnP 初始位姿修正。")
     _save_init_per_view_debug(
         view_data=view_data,
         init_result=init_result,
@@ -4447,6 +5872,24 @@ def run_geometry_reconstruction(
         exp_final = np.mean(np.stack(exp_stack, axis=0), axis=0).astype(np.float32)
     else:
         exp_final = np.zeros(n_exp, dtype=np.float32)
+    with open(debug_dir / "optimized_parameters.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "shape_params": shape_opt.tolist() if shape_opt is not None else [],
+                "expression_params": exp_final.tolist(),
+                "per_view": {
+                    name: {
+                        "expression_params": np.asarray(res.get("exp", []), dtype=np.float32).tolist(),
+                        "R": np.asarray(res.get("R", []), dtype=np.float32).tolist(),
+                        "t": np.asarray(res.get("t", []), dtype=np.float32).tolist(),
+                    }
+                    for name, res in per_view_results.items()
+                },
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     with torch.no_grad():
         verts_final = flame(
@@ -4558,9 +6001,118 @@ def run_geometry_reconstruction(
 
     # ── 深度置换：多视角融合（Fix 1 逐顶点采样 + Fix 2 多视角加权融合）──────
     logger.info("估计多视角深度并融合置换...")
+    nose_mouth_local_report = {"enabled": False, "applied": False, "accepted": False}
+    if _free_cfg_bool("ENABLE_NOSE_MOUTH_LOCAL_RESIDUAL", False):
+        verts_sub, _verts_nose_mouth, nose_mouth_local_report = _nose_mouth_local_residual_deform_mesh(
+            verts_base=verts_sub,
+            verts_displaced=verts_sub,
+            faces=faces_sub,
+            view_data=view_data,
+            preprocessed_views=preprocessed_views,
+            intrinsics=intrinsics,
+            per_view_results=per_view_results,
+            debug_dir=output_dir.parent / "debug",
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            enabled=True,
+            max_offset_m=_free_cfg_float("NOSE_MOUTH_LOCAL_MAX_OFFSET_M", 0.010),
+            vertex_radius_px=_free_cfg_float("NOSE_MOUTH_LOCAL_VERTEX_RADIUS_PX", 34.0),
+            protect_radius_px=_free_cfg_float("NOSE_MOUTH_LOCAL_PROTECT_RADIUS_PX", 30.0),
+            max_step_px=_free_cfg_float("NOSE_MOUTH_LOCAL_MAX_STEP_PX", 18.0),
+            front_weight=_free_cfg_float("NOSE_MOUTH_LOCAL_FRONT_WEIGHT", 1.0),
+            side_weight=_free_cfg_float("NOSE_MOUTH_LOCAL_SIDE_WEIGHT", 0.35),
+            nose_base_weight=_free_cfg_float("NOSE_MOUTH_LOCAL_NOSE_BASE_WEIGHT", 1.0),
+            outer_mouth_weight=_free_cfg_float("NOSE_MOUTH_LOCAL_OUTER_MOUTH_WEIGHT", 1.0),
+            inner_mouth_weight=_free_cfg_float("NOSE_MOUTH_LOCAL_INNER_MOUTH_WEIGHT", 0.45),
+            guard_nose_width=_free_cfg_bool("NOSE_MOUTH_LOCAL_GUARD_NOSE_WIDTH", True),
+            smooth_iter=int(_free_cfg_float("NOSE_MOUTH_LOCAL_SMOOTH_ITER", 18)),
+            smooth_alpha=_free_cfg_float("NOSE_MOUTH_LOCAL_SMOOTH_ALPHA", 0.24),
+            constraint_keep=_free_cfg_float("NOSE_MOUTH_LOCAL_CONSTRAINT_KEEP", 0.70),
+            min_improve_px=_free_cfg_float("NOSE_MOUTH_LOCAL_MIN_IMPROVE_PX", 1.0),
+            min_front_improve_px=_free_cfg_float("NOSE_MOUTH_LOCAL_MIN_FRONT_IMPROVE_PX", 1.5),
+            max_protected_worsen_px=_free_cfg_float("NOSE_MOUTH_LOCAL_MAX_PROTECTED_WORSEN_PX", 0.35),
+            max_profile_worsen_px=_free_cfg_float("NOSE_MOUTH_LOCAL_MAX_PROFILE_WORSEN_PX", 1.0),
+            max_nose_width_abs_worsen_px=_free_cfg_float("NOSE_MOUTH_LOCAL_MAX_NOSE_WIDTH_ABS_WORSEN_PX", 2.0),
+            max_moved_ratio=_free_cfg_float("NOSE_MOUTH_LOCAL_MAX_MOVED_RATIO", 0.05),
+        )
+        vertex_normals = compute_vertex_normals(verts_sub, faces_sub)
+    else:
+        nose_mouth_debug_dir = output_dir.parent / "debug" / "nose_mouth_local_residual"
+        nose_mouth_debug_dir.mkdir(parents=True, exist_ok=True)
+        nose_mouth_local_report = {
+            "enabled": False,
+            "applied": False,
+            "accepted": False,
+            "reason": "disabled",
+        }
+        with open(nose_mouth_debug_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(nose_mouth_local_report, f, ensure_ascii=False, indent=2)
+        _write_nose_mouth_local_index(nose_mouth_debug_dir, nose_mouth_local_report)
+    with open(output_dir.parent / "debug" / "nose_mouth_local_residual_summary.json", "w", encoding="utf-8") as f:
+        json.dump(nose_mouth_local_report, f, ensure_ascii=False, indent=2)
+
+    nose_region_dense_report = {"enabled": False, "applied": False, "accepted": False}
+    if _free_cfg_bool("ENABLE_NOSE_REGION_DENSE_RESIDUAL", False):
+        verts_sub, _verts_nose_region, nose_region_dense_report = _nose_region_dense_residual_deform_mesh(
+            verts_base=verts_sub,
+            verts_displaced=verts_sub,
+            faces=faces_sub,
+            view_data=view_data,
+            preprocessed_views=preprocessed_views,
+            intrinsics=intrinsics,
+            per_view_results=per_view_results,
+            debug_dir=output_dir.parent / "debug",
+            lmk_vertex_indices=lmk_vertex_indices,
+            lmk_tri_vidx=lmk_tri_vidx,
+            lmk_bary_coords=lmk_data["bary_coords"] if lmk_data is not None else None,
+            enabled=True,
+            max_offset_m=_free_cfg_float("NOSE_REGION_DENSE_MAX_OFFSET_M", 0.008),
+            vertex_radius_px=_free_cfg_float("NOSE_REGION_DENSE_VERTEX_RADIUS_PX", 34.0),
+            roi_margin_px=_free_cfg_float("NOSE_REGION_DENSE_ROI_MARGIN_PX", 28.0),
+            protect_radius_px=_free_cfg_float("NOSE_REGION_DENSE_PROTECT_RADIUS_PX", 34.0),
+            max_step_px=_free_cfg_float("NOSE_REGION_DENSE_MAX_STEP_PX", 14.0),
+            front_weight=_free_cfg_float("NOSE_REGION_DENSE_FRONT_WEIGHT", 1.0),
+            side_weight=_free_cfg_float("NOSE_REGION_DENSE_SIDE_WEIGHT", 0.20),
+            bridge_weight=_free_cfg_float("NOSE_REGION_DENSE_BRIDGE_WEIGHT", 0.45),
+            tip_weight=_free_cfg_float("NOSE_REGION_DENSE_TIP_WEIGHT", 0.80),
+            wing_weight=_free_cfg_float("NOSE_REGION_DENSE_WING_WEIGHT", 1.0),
+            guard_nose_width=_free_cfg_bool("NOSE_REGION_DENSE_GUARD_NOSE_WIDTH", True),
+            smooth_iter=int(_free_cfg_float("NOSE_REGION_DENSE_SMOOTH_ITER", 14)),
+            smooth_alpha=_free_cfg_float("NOSE_REGION_DENSE_SMOOTH_ALPHA", 0.20),
+            constraint_keep=_free_cfg_float("NOSE_REGION_DENSE_CONSTRAINT_KEEP", 0.64),
+            min_improve_px=_free_cfg_float("NOSE_REGION_DENSE_MIN_IMPROVE_PX", 0.25),
+            min_front_improve_px=_free_cfg_float("NOSE_REGION_DENSE_MIN_FRONT_IMPROVE_PX", 0.40),
+            max_protected_worsen_px=_free_cfg_float("NOSE_REGION_DENSE_MAX_PROTECTED_WORSEN_PX", 0.35),
+            max_profile_worsen_px=_free_cfg_float("NOSE_REGION_DENSE_MAX_PROFILE_WORSEN_PX", 1.0),
+            max_nose_width_abs_worsen_px=_free_cfg_float("NOSE_REGION_DENSE_MAX_NOSE_WIDTH_ABS_WORSEN_PX", 1.0),
+            max_moved_ratio=_free_cfg_float("NOSE_REGION_DENSE_MAX_MOVED_RATIO", 0.045),
+        )
+        vertex_normals = compute_vertex_normals(verts_sub, faces_sub)
+    else:
+        nose_region_debug_dir = output_dir.parent / "debug" / "nose_region_dense_residual"
+        nose_region_debug_dir.mkdir(parents=True, exist_ok=True)
+        nose_region_dense_report = {
+            "enabled": False,
+            "applied": False,
+            "accepted": False,
+            "reason": "disabled",
+        }
+        with open(nose_region_debug_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(nose_region_dense_report, f, ensure_ascii=False, indent=2)
+        _write_nose_region_dense_index(nose_region_debug_dir, nose_region_dense_report)
+    with open(output_dir.parent / "debug" / "nose_region_dense_residual_summary.json", "w", encoding="utf-8") as f:
+        json.dump(nose_region_dense_report, f, ensure_ascii=False, indent=2)
+
     import cv2 as _cv2
     from scipy.ndimage import distance_transform_edt
+    class _DepthDisplacementDisabled(Exception):
+        pass
+
     try:
+        if not enable_depth_displacement:
+            logger.info("Depth-Anything geometry displacement disabled for stable pipeline")
+            raise _DepthDisplacementDisabled()
         depth_pipe = load_depth_model(depth_model_dir, depth_model_size, device)
 
         N = len(verts_sub)
@@ -4670,6 +6222,8 @@ def run_geometry_reconstruction(
         logger.info(f"应用多视角融合深度置换到 {N} 个顶点...")
         verts_displaced = verts_sub + vertex_normals * disp_final[:, None]
 
+    except _DepthDisplacementDisabled:
+        verts_displaced = np.array(verts_sub, copy=True)
     except Exception as e:
         import traceback
         logger.warning(f"深度置换失败（{e}），跳过置换步骤，使用细分 3DMM Mesh")
@@ -4677,13 +6231,16 @@ def run_geometry_reconstruction(
         verts_displaced = verts_sub
 
     # ── 步骤4：Laplacian 平滑（消除深度置换尖刺）──────────────────────────
-    logger.info("Laplacian 平滑置换后 Mesh...")
-    try:
-        _sm = _trimesh.Trimesh(vertices=verts_displaced, faces=faces_sub, process=False)
-        _trimesh.smoothing.filter_laplacian(_sm, iterations=3, lamb=0.25)  # 减少迭代防止鼻尖过度平滑
-        verts_displaced = np.array(_sm.vertices)
-    except Exception as _e:
-        logger.warning(f"Laplacian 平滑失败（{_e}），跳过")
+    if enable_depth_displacement:
+        logger.info("Laplacian 平滑置换后 Mesh...")
+        try:
+            _sm = _trimesh.Trimesh(vertices=verts_displaced, faces=faces_sub, process=False)
+            _trimesh.smoothing.filter_laplacian(_sm, iterations=3, lamb=0.25)  # 减少迭代防止鼻尖过度平滑
+            verts_displaced = np.array(_sm.vertices)
+        except Exception as _e:
+            logger.warning(f"Laplacian 平滑失败（{_e}），跳过")
+    else:
+        logger.info("Stable pipeline: skipping displacement smoothing")
 
     try:
         from src import config as _free_cfg
