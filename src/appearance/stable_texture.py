@@ -57,12 +57,16 @@ def _write_texture_confidence_proxy(texture_path: Path, output_texture_dir: Path
     try:
         import cv2
 
-        img = cv2.imread(str(texture_path), cv2.IMREAD_COLOR)
+        img = cv2.imread(str(texture_path), cv2.IMREAD_UNCHANGED)
         if img is None:
             return {"exists": False, "path": str(out_path), "reason": "texture_not_readable"}
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        intensity = rgb.mean(axis=2)
-        high = intensity > 5.0
+        if img.ndim == 3 and img.shape[2] == 4:
+            high = img[:, :, 3] > 0
+            method = "observed_alpha"
+        else:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            high = rgb.mean(axis=2) > 5.0
+            method = "near_black_proxy"
         low = ~high
         confidence = np.zeros((*high.shape, 3), dtype=np.uint8)
         confidence[high] = np.array([48, 184, 112], dtype=np.uint8)
@@ -73,7 +77,7 @@ def _write_texture_confidence_proxy(texture_path: Path, output_texture_dir: Path
             "path": str(out_path),
             "high_confidence_ratio": float(np.mean(high)),
             "low_confidence_ratio": float(np.mean(low)),
-            "method": "near_black_proxy",
+            "method": method,
         }
     except Exception as exc:
         return {"exists": False, "path": str(out_path), "reason": str(exc)}
@@ -86,6 +90,7 @@ def run_stable_texture_pipeline(
     output_texture_dir: Path,
     output_mesh_dir: Path,
     cfg: Any,
+    preprocessed_views: Optional[Dict[str, dict]] = None,
     face_masks: Optional[Dict[str, np.ndarray]] = None,
     hires_images: Optional[Dict[str, np.ndarray]] = None,
     working_image_size: int = 1024,
@@ -99,9 +104,29 @@ def run_stable_texture_pipeline(
 
     from src.module3_texture import run_texture_pipeline
 
+    registration = None
+    texture_hires = hires_images
+    sampling_warps = None
+    feature_masks = None
+    bake_diagnostics: Dict[str, Any] = {}
+    if preprocessed_views is not None and hires_images is not None:
+        from src.appearance.stable_texture_registration import prepare_stable_texture_registration
+
+        registration = prepare_stable_texture_registration(
+            mesh_dir=mesh_dir,
+            preprocessed_views=preprocessed_views,
+            hires_images=hires_images,
+            cfg=cfg,
+            debug_dir=output_texture_dir.parent / "debug" / "stable_texture_registration",
+        )
+        texture_hires = registration["hires_images"]
+        sampling_warps = registration["sampling_warps"]
+        feature_masks = registration["feature_masks"]
+
     with temporary_config_overrides(
         cfg,
         ENABLE_VISIBLE_FACE_CROP=bool(getattr(cfg, "STABLE_DELETE_INVISIBLE_FACES", False)),
+        ENABLE_SIDE_EAR_TEXTURE_REPAIR=False,
     ):
         glb_path = run_texture_pipeline(
             mesh_dir=mesh_dir,
@@ -112,8 +137,13 @@ def run_stable_texture_pipeline(
             lighting_type="white",
             lighting_display_name="白光",
             face_masks=face_masks,
-            hires_images=hires_images,
+            hires_images=texture_hires,
             working_image_size=working_image_size,
+            sampling_warps=sampling_warps,
+            feature_masks=feature_masks,
+            diagnostics=bake_diagnostics,
+            transparent_unobserved=True,
+            transparent_bottom_quantile=0.05,
         )
 
     stable_glb = output_mesh_dir / "face_stable.glb"
@@ -155,6 +185,8 @@ def run_stable_texture_pipeline(
             "medical_measurement_claim": False,
             "confidence_map": confidence_map,
         },
+        "registration": registration["report"] if registration is not None else None,
+        "bake_diagnostics": bake_diagnostics,
     }
     with open(output_mesh_dir / "stable_texture_meta.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

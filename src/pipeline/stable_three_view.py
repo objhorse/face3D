@@ -118,6 +118,7 @@ def run_stable_three_view_pipeline(
         output_texture_dir=texture_dir,
         output_mesh_dir=mesh_dir,
         cfg=cfg,
+        preprocessed_views=view_data,
         face_masks=face_masks,
         hires_images=original_hires,
         working_image_size=cfg.WORK_IMAGE_SIZE,

@@ -134,11 +134,8 @@ def _get_face_parsing_model():
     return _PARSING_MODEL
 
 
-def segment_face_with_parser(image: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Use facexlib BiSeNet face parsing to get a face-only mask.
-    Keeps facial semantic regions while excluding neck, hair, cloth, and background.
-    """
+def segment_face_labels_with_parser(image: np.ndarray) -> Optional[np.ndarray]:
+    """Return the CelebAMask-HQ semantic label map at image resolution."""
     model = _get_face_parsing_model()
     if model is None:
         return None
@@ -154,21 +151,38 @@ def segment_face_with_parser(image: np.ndarray) -> Optional[np.ndarray]:
 
     with torch.no_grad():
         out = model(face_input)[0]
-    parsing = out.argmax(dim=1).squeeze().detach().cpu().numpy()
+    parsing = out.argmax(dim=1).squeeze().detach().cpu().numpy().astype(np.uint8)
+    return cv2.resize(
+        parsing,
+        (image.shape[1], image.shape[0]),
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+
+def face_mask_from_parser_labels(parsing: np.ndarray) -> np.ndarray:
+    """Convert CelebAMask-HQ labels into the existing face-only mask."""
+    labels = np.asarray(parsing, dtype=np.uint8)
 
     # CelebAMask-HQ layout used by BiSeNet:
     # 0 bg, 1 skin, 2/3 brows, 4/5 eyes, 6 glasses, 7/8 ears, 9 ear_r,
     # 10 nose, 11 mouth, 12/13 lips, 14 neck, 15 neck_l, 16 cloth, 17 hair, 18 hat
     keep_labels = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}
-    mask = np.isin(parsing, list(keep_labels)).astype(np.uint8) * 255
+    mask = np.isin(labels, list(keep_labels)).astype(np.uint8) * 255
 
     mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
     )
-    mask = cv2.resize(mask, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask
+
+
+def segment_face_with_parser(image: np.ndarray) -> Optional[np.ndarray]:
+    """Use facexlib BiSeNet to get a face-only mask."""
+    parsing = segment_face_labels_with_parser(image)
+    if parsing is None:
+        return None
+    return face_mask_from_parser_labels(parsing)
 
 
 
@@ -388,7 +402,8 @@ def preprocess_all_views(
 
         image = _resize_to_target(original_image, target_size)
         bg_mask = segment_face_black_bg(image)
-        parser_mask = segment_face_with_parser(image)
+        parser_labels = segment_face_labels_with_parser(image)
+        parser_mask = face_mask_from_parser_labels(parser_labels) if parser_labels is not None else None
         if parser_mask is not None:
             bg_mask = parser_mask
 
@@ -416,6 +431,12 @@ def preprocess_all_views(
             'shape_mask': shape_mask,
             'bg_mask': bg_mask,
             'parser_mask': parser_mask,
+            'parser_labels': parser_labels,
+            'nose_mask': (
+                (parser_labels == 10).astype(np.uint8) * 255
+                if parser_labels is not None
+                else np.zeros(image.shape[:2], dtype=np.uint8)
+            ),
         }
 
         if debug_dir is not None:
