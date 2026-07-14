@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import argparse
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -20,6 +21,23 @@ def main() -> None:
     from src import config as cfg
     from src.pipeline.stable_three_view import run_stable_three_view_pipeline
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--capture-dir", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    args = parser.parse_args()
+    if args.capture_dir:
+        capture_dir = args.capture_dir.resolve()
+        cfg.DEFAULT_IMAGE_DIR = capture_dir
+        cfg.DEFAULT_VIEW_NAMES = {
+            "left": next(capture_dir.glob("camera1_*.jpg")).name,
+            "front": next(capture_dir.glob("camera2_*.jpg")).name,
+            "right": next(capture_dir.glob("camera3_*.jpg")).name,
+        }
+    if args.output_dir:
+        cfg.OUTPUT_DIR = args.output_dir.resolve()
+        cfg.OUTPUT_MESH_DIR = cfg.OUTPUT_DIR / "meshes"
+        cfg.OUTPUT_TEXTURE_DIR = cfg.OUTPUT_DIR / "textures"
+        cfg.OUTPUT_DEBUG_DIR = cfg.OUTPUT_DIR / "debug"
     cfg.ensure_dirs()
     image_paths = {
         view: cfg.DEFAULT_IMAGE_DIR / filename
@@ -43,4 +61,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

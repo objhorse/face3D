@@ -588,6 +588,7 @@ class JointFLAMEOptimizer:
         max_iter: int = 100,
         lr: float = 0.5,
         device: str = "cuda",
+        shared_expression: bool = False,
         lmk_face_idx: Optional[np.ndarray] = None,    # (68,) — 精确重心坐标用
         lmk_bary_coords: Optional[np.ndarray] = None, # (68, 3)
     ):
@@ -604,6 +605,7 @@ class JointFLAMEOptimizer:
         self.max_iter = max_iter
         self.lr       = lr
         self.device   = device
+        self.shared_expression = bool(shared_expression)
 
         # 优先使用重心坐标插值
         if lmk_face_idx is not None and lmk_bary_coords is not None:
@@ -649,14 +651,32 @@ class JointFLAMEOptimizer:
         view_names = list(views.keys())
         exp_params, rvec_params, t_params = {}, {}, {}
 
+        shared_exp_param = None
+        if self.shared_expression:
+            initial_expressions = [
+                np.asarray(init_exps[name][:n_exp], dtype=np.float32)
+                for name in view_names
+                if init_exps and name in init_exps and init_exps[name] is not None
+            ]
+            shared_init = np.zeros(n_exp, dtype=np.float32)
+            if initial_expressions:
+                mean_expression = np.mean(np.stack(initial_expressions, axis=0), axis=0)
+                shared_init[:len(mean_expression)] = mean_expression
+            shared_exp_param = torch.tensor(
+                shared_init, device=dev, dtype=torch.float32, requires_grad=True
+            )
+
         for name in view_names:
             v = views[name]
 
-            ep = torch.zeros(n_exp, device=dev, dtype=torch.float32)
-            if init_exps and name in init_exps and init_exps[name] is not None:
-                e = init_exps[name][:n_exp]
-                ep.data[:len(e)] = torch.tensor(e, dtype=torch.float32, device=dev)
-            ep.requires_grad_(True)
+            if shared_exp_param is not None:
+                ep = shared_exp_param
+            else:
+                ep = torch.zeros(n_exp, device=dev, dtype=torch.float32)
+                if init_exps and name in init_exps and init_exps[name] is not None:
+                    e = init_exps[name][:n_exp]
+                    ep.data[:len(e)] = torch.tensor(e, dtype=torch.float32, device=dev)
+                ep.requires_grad_(True)
             exp_params[name] = ep
 
             # 从初始 R 转换为轴角
@@ -769,7 +789,7 @@ class JointFLAMEOptimizer:
         )
         all_params = (
             [shape_param]
-            + list(exp_params.values())
+            + ([shared_exp_param] if shared_exp_param is not None else list(exp_params.values()))
             + pose_params
         )
         optimizer = torch.optim.LBFGS(
@@ -830,8 +850,11 @@ class JointFLAMEOptimizer:
                             total_loss = total_loss + self.lambda_contour * contour_loss
 
             total_loss = total_loss + self.lambda_shape * (shape_param ** 2).mean()
-            for name in view_names:
-                total_loss = total_loss + self.lambda_exp * (exp_params[name] ** 2).mean()
+            if shared_exp_param is not None:
+                total_loss = total_loss + self.lambda_exp * (shared_exp_param ** 2).mean()
+            else:
+                for name in view_names:
+                    total_loss = total_loss + self.lambda_exp * (exp_params[name] ** 2).mean()
 
             total_loss.backward()
             # 梯度裁剪防止 NaN
@@ -5712,6 +5735,7 @@ def run_geometry_reconstruction(
             side_jaw_weight=_cfg_float("SIDE_JAW_WEIGHT", 1.8),
             side_brow_weight=_cfg_float("SIDE_BROW_WEIGHT", 0.25),
             side_extra_soft_weight=_cfg_float("SIDE_EXTRA_SOFT_WEIGHT", 0.6),
+            shared_expression=_cfg_bool("STABLE_SHARED_EXPRESSION", True),
             max_iter=lbfgs_max_iter,
             lr=lbfgs_lr,
             device=device,

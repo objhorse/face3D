@@ -39,6 +39,7 @@ STABLE_ENABLE_DEPTH_DISPLACEMENT = False
 STABLE_DELETE_INVISIBLE_FACES = False
 STABLE_USE_CALIBRATED_RIG_EXTRINSICS = os.getenv("FACE3D_USE_RIG_EXTRINSICS", "0").lower() in ("1", "true", "yes", "on")
 STABLE_DISABLE_POSE_REFINEMENT_WITH_RIG = True
+STABLE_SHARED_EXPRESSION = True
 
 JOINT_CALIBRATION_CANDIDATE_PATH = ROOT / "output" / "debug" / "calibration_check" / "camera_calibration_joint_candidate.json"
 CAMERA_CALIBRATION_PATH = Path(

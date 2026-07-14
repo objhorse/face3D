@@ -15,6 +15,92 @@ import cv2
 import numpy as np
 
 
+def bundle_adjust_three_view_cameras(tracks, cameras, fitted):
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation
+    from src.cross_view_geometry import relative_camera_transform, triangulate_correspondences
+
+    if len(tracks) < 6:
+        return fitted, {"accepted": False, "reason": "too_few_three_view_tracks"}
+    sides = ("left", "right")
+    initial_rvecs, initial_translations = {}, {}
+    for side in sides:
+        rotation, translation = relative_camera_transform(cameras["front"], cameras[side])
+        initial_rvecs[side] = Rotation.from_matrix(rotation).as_rotvec()
+        initial_translations[side] = np.asarray(translation, dtype=np.float64)
+
+    initial_points = []
+    for track in tracks:
+        estimates = []
+        for side in sides:
+            rotation = Rotation.from_rotvec(initial_rvecs[side]).as_matrix()
+            xyz, _positive = triangulate_correspondences(
+                np.asarray(track.pixels_by_view["front"])[None],
+                np.asarray(track.pixels_by_view[side])[None],
+                cameras["front"].K, cameras[side].K,
+                rotation, initial_translations[side],
+            )
+            if np.isfinite(xyz[0]).all():
+                estimates.append(xyz[0])
+        initial_points.append(np.mean(estimates, axis=0) if estimates else np.array([0.0, 0.0, 0.3]))
+    initial_points = np.asarray(initial_points, dtype=np.float64)
+    x0 = np.concatenate([
+        initial_rvecs["left"], initial_translations["left"],
+        initial_rvecs["right"], initial_translations["right"],
+        initial_points.reshape(-1),
+    ])
+
+    def unpack(values):
+        poses = {
+            "left": (Rotation.from_rotvec(values[0:3]).as_matrix(), values[3:6]),
+            "right": (Rotation.from_rotvec(values[6:9]).as_matrix(), values[9:12]),
+        }
+        return poses, values[12:].reshape(-1, 3)
+
+    def project(point, view, poses):
+        camera_point = point if view == "front" else poses[view][0] @ point + poses[view][1]
+        homogeneous = cameras[view].K @ camera_point
+        return homogeneous[:2] / max(float(homogeneous[2]), 1e-8)
+
+    def residual(values):
+        poses, points = unpack(values)
+        terms = []
+        for track, point in zip(tracks, points):
+            for view in ("front", "left", "right"):
+                terms.extend((project(point, view, poses) - track.pixels_by_view[view]) / 2.0)
+            terms.append((point[2] - np.clip(point[2], 0.12, 1.5)) / 0.01)
+        for side in sides:
+            rotation, translation = poses[side]
+            current_rvec = Rotation.from_matrix(rotation).as_rotvec()
+            terms.extend((current_rvec - initial_rvecs[side]) / np.deg2rad(3.0))
+            terms.extend((translation - initial_translations[side]) / 0.008)
+            terms.append((np.linalg.norm(translation) - np.linalg.norm(initial_translations[side])) / 0.002)
+        return np.asarray(terms, dtype=np.float64)
+
+    before = residual(x0)
+    result = least_squares(residual, x0, loss="soft_l1", f_scale=1.0, max_nfev=300)
+    poses, _points = unpack(result.x)
+    front_rotation = np.asarray(fitted["front"]["R"], dtype=np.float64)
+    front_translation = np.asarray(fitted["front"]["t"], dtype=np.float64)
+    adjusted = {view: {key: np.asarray(value).copy() for key, value in data.items()} for view, data in fitted.items()}
+    pose_changes = {}
+    for side in sides:
+        relative_rotation, relative_translation = poses[side]
+        adjusted[side]["R"] = relative_rotation @ front_rotation
+        adjusted[side]["t"] = relative_rotation @ front_translation + relative_translation
+        pose_changes[side] = {
+            "rotation_delta_deg": float(np.degrees(np.linalg.norm(
+                Rotation.from_matrix(relative_rotation @ Rotation.from_rotvec(initial_rvecs[side]).as_matrix().T).as_rotvec()
+            ))),
+            "translation_delta_m": float(np.linalg.norm(relative_translation - initial_translations[side])),
+        }
+    return adjusted, {
+        "accepted": bool(result.success), "status": int(result.status), "message": result.message,
+        "tracks": len(tracks), "cost_before": float(np.mean(before ** 2)),
+        "cost_after": float(np.mean(residual(result.x) ** 2)), "pose_changes": pose_changes,
+    }
+
+
 def write_obj_with_vertices(template: Path, output: Path, vertices: np.ndarray) -> None:
     result, vertex_index = [], 0
     for line in template.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -138,6 +224,7 @@ def main() -> None:
     args = parser.parse_args()
 
     from src.geometry.cross_view_surface_observations import (
+        CrossViewTrack,
         ObservationFilterConfig,
         attach_observations_to_mesh,
         build_front_centered_tracks,
@@ -186,6 +273,101 @@ def main() -> None:
         pair_matches[side] = pair
         pair_audit.extend(audit)
 
+    lr_cache = output / f"loftr_left_right_{args.match_size}.npz"
+    if lr_cache.exists() and not args.refresh_matches:
+        data = np.load(lr_cache)
+        lr_raw = tuple(data[key] for key in ("ff", "fs", "fc", "rs", "rf", "rc"))
+    else:
+        left_small = cv2.resize(working["left"], (args.match_size, args.match_size))
+        right_small = cv2.resize(working["right"], (args.match_size, args.match_size))
+        lp, rp, lc = run_loftr_matches(matcher, device, left_small, right_small)
+        rp2, lp2, rc = run_loftr_matches(matcher, device, right_small, left_small)
+        scale = 1024.0 / args.match_size
+        lr_raw = (lp * scale, rp * scale, lc, rp2 * scale, lp2 * scale, rc)
+        np.savez_compressed(
+            lr_cache, ff=lr_raw[0], fs=lr_raw[1], fc=lr_raw[2],
+            rs=lr_raw[3], rf=lr_raw[4], rc=lr_raw[5]
+        )
+    left_right, left_right_audit = filter_reciprocal_pair_matches(
+        "left_right", *lr_raw,
+        front_semantic_map=semantic["left"], side_semantic_map=semantic["right"]
+    )
+    pair_audit.extend(left_right_audit)
+
+    from scipy.spatial import cKDTree
+    left_pair = pair_matches["left"]
+    right_pair = pair_matches["right"]
+    left_tree = cKDTree(left_pair.side_points)
+    right_tree = cKDTree(right_pair.side_points)
+    left_dist, left_index = left_tree.query(left_right.front_points, k=1)
+    right_dist, right_index = right_tree.query(left_right.side_points, k=1)
+    loop_tracks = []
+    loop_audit = []
+    for index in range(len(left_right.front_points)):
+        li, ri = int(left_index[index]), int(right_index[index])
+        front_delta = float(np.linalg.norm(left_pair.front_points[li] - right_pair.front_points[ri]))
+        accepted_loop = bool(left_dist[index] <= 3.0 and right_dist[index] <= 3.0 and front_delta <= 3.0)
+        loop_audit.append({
+            "index": index, "accepted": accepted_loop,
+            "left_link_px": float(left_dist[index]), "right_link_px": float(right_dist[index]),
+            "front_closure_px": front_delta,
+        })
+        if accepted_loop:
+            loop_tracks.append(CrossViewTrack(
+                pixels_by_view={
+                    "front": 0.5 * (left_pair.front_points[li] + right_pair.front_points[ri]),
+                    "left": 0.5 * (left_pair.side_points[li] + left_right.front_points[index]),
+                    "right": 0.5 * (right_pair.side_points[ri] + left_right.side_points[index]),
+                },
+                confidence_by_pair={
+                    "front_left": float(left_pair.confidence[li]),
+                    "front_right": float(right_pair.confidence[ri]),
+                    "left_right": float(left_right.confidence[index]),
+                },
+                semantic_region=left_pair.semantic_regions[li],
+            ))
+
+    mediapipe_regions = {
+        "nose": [1, 2, 4, 5, 6, 19, 94, 168, 195, 197],
+        "mouth": [0, 13, 14, 17, 61, 78, 82, 87, 91, 95, 291, 308, 312, 317, 321, 324],
+        "upper_face": [33, 133, 263, 362],
+        "chin_or_jaw": [152, 175, 199],
+    }
+    landmark_tracks = []
+    landmark_arrays = {}
+    for view in ("left", "front", "right"):
+        values = np.asarray(preprocessed[view]["landmarks"], dtype=np.float64)
+        landmark_arrays[view] = values.reshape(len(values), -1)[:, :2]
+    for region, indices in mediapipe_regions.items():
+        for landmark_index in indices:
+            if any(landmark_index >= len(landmark_arrays[view]) for view in landmark_arrays):
+                continue
+            pixels = {view: landmark_arrays[view][landmark_index] for view in landmark_arrays}
+            trusted = True
+            for view, point in pixels.items():
+                xy = np.rint(point).astype(int)
+                if not (0 <= xy[0] < semantic[view].shape[1] and 0 <= xy[1] < semantic[view].shape[0]):
+                    trusted = False
+                    break
+                if semantic[view][xy[1], xy[0]] == 0:
+                    trusted = False
+                    break
+            if trusted:
+                landmark_tracks.append(CrossViewTrack(
+                    pixels_by_view=pixels,
+                    confidence_by_pair={"semantic_landmark": 0.75},
+                    semantic_region=region,
+                ))
+    loop_tracks.extend(landmark_tracks)
+    (output / "three_view_loop_audit.json").write_text(
+        json.dumps({
+            "loftr_loops": len(loop_tracks) - len(landmark_tracks),
+            "semantic_landmark_tracks": len(landmark_tracks),
+            "total_tracks": len(loop_tracks),
+            "records": loop_audit,
+        }, indent=2), encoding="utf-8"
+    )
+
     cameras, fitted = fitted_camera_records(camera_path)
     pose_candidates = {
         side: estimate_relative_pose_candidate(
@@ -198,7 +380,17 @@ def main() -> None:
     }
     joint_camera_path = output / "cameras_joint_candidate.json"
     write_joint_camera_candidate(joint_camera_path, fitted, pose_candidates)
-    tracks = build_front_centered_tracks(pair_matches)
+    candidate_camera_records, candidate_fitted = fitted_camera_records(joint_camera_path)
+    bundle_fitted, bundle_report = bundle_adjust_three_view_cameras(
+        loop_tracks, candidate_camera_records, candidate_fitted
+    )
+    bundle_camera_path = output / "cameras_bundle_adjusted.json"
+    bundle_camera_path.write_text(json.dumps({"views": {
+        view: {key: np.asarray(value, dtype=np.float64).tolist() for key, value in data.items()}
+        for view, data in bundle_fitted.items()
+    }}, indent=2), encoding="utf-8")
+    pair_tracks = build_front_centered_tracks(pair_matches)
+    tracks = loop_tracks
     triangulated, triangulation_audit = triangulate_and_filter_tracks(
         tracks, cameras, {view: item["K"] for view, item in fitted.items()}
     )
@@ -210,25 +402,33 @@ def main() -> None:
     summary = build_observation_summary(attached, attachment_audit, pair_audit, triangulation_audit)
     write_observation_audit(output, working, pair_audit, triangulation_audit, attachment_audit, attached, summary)
 
-    joint_cameras, joint_fitted = fitted_camera_records(joint_camera_path)
+    joint_cameras, joint_fitted = fitted_camera_records(bundle_camera_path)
+    loop_config = ObservationFilterConfig(
+        min_total_observations=12,
+        min_observations_per_side=12,
+        min_required_regions=2,
+    )
     joint_triangulated, joint_triangulation_audit = triangulate_and_filter_tracks(
-        tracks, joint_cameras, {view: item["K"] for view, item in joint_fitted.items()}
+        tracks, joint_cameras, {view: item["K"] for view, item in joint_fitted.items()},
+        loop_config,
     )
     joint_front = joint_fitted["front"]
     joint_attached, joint_attachment_audit = attach_observations_to_mesh(
         joint_triangulated, vertices, faces, joint_front["R"], joint_front["t"],
-        joint_front["K"], ObservationFilterConfig()
+        joint_front["K"], loop_config
     )
     joint_summary = build_observation_summary(
-        joint_attached, joint_attachment_audit, pair_audit, joint_triangulation_audit
+        joint_attached, joint_attachment_audit, pair_audit, joint_triangulation_audit,
+        loop_config,
     )
     write_observation_audit(
         output / "joint_camera_audit", working, pair_audit, joint_triangulation_audit,
         joint_attachment_audit, joint_attached, joint_summary
     )
 
-    candidate_report = {"generated": False, "reason": "joint observation gate failed", "profiles": []}
-    if joint_summary["m1_passed"]:
+    candidate_report = {"generated": False, "reason": "three-view loop gate failed", "profiles": []}
+    three_view_ready = len(loop_tracks) >= 12 and joint_summary["m1_passed"]
+    if three_view_ready:
         from scipy.spatial import cKDTree
         from src.geometry.controlled_identity_deformation import (
             default_controlled_identity_profiles,
@@ -241,7 +441,8 @@ def main() -> None:
             select_identity_backtrack,
         )
 
-        normalized, registration = normalize_observation_groups(joint_attached)
+        normalized = list(joint_attached)
+        registration = {"mode": "disabled", "reason": "preserve one metric coordinate frame"}
         surface_points = np.asarray([item.surface_point for item in normalized])
         labels = np.asarray([item.semantic_region for item in normalized], dtype=object)
         _distance, nearest = cKDTree(surface_points).query(vertices, k=1)
@@ -279,9 +480,13 @@ def main() -> None:
         "capture_paths": {view: str(path) for view, path in capture_paths.items()},
         "camera_source": str(camera_path), "camera_mode": "fixed_fitted_shared_world",
         "joint_camera_candidate": str(joint_camera_path),
+        "bundle_adjusted_cameras": str(bundle_camera_path),
+        "bundle_adjustment": bundle_report,
         "relative_pose_candidates": pose_candidates,
         "summary": summary,
         "joint_summary": joint_summary,
+        "pair_track_count": len(pair_tracks),
+        "three_view_loop_count": len(loop_tracks),
         "geometry_candidates": candidate_report,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
