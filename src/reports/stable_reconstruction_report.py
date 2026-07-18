@@ -67,6 +67,52 @@ def _metric_rows(metrics: Dict[str, Any]) -> str:
     return "\n".join(rows)
 
 
+def _shape_refinement_rows(report: Dict[str, Any]) -> str:
+    decision = report.get("geometry_decision", {})
+    metrics = decision.get("metrics", {})
+    rows = [
+        ("candidate", "accepted" if decision.get("accepted") else "rejected; baseline kept"),
+        ("trusted contour improvement", f"{metrics.get('trusted_boundary_improve_pct_points', '')} % face width"),
+        ("measurably improved views", metrics.get("improved_views", "")),
+        ("views preserved within render resolution", metrics.get("preserved_views", "")),
+        ("maximum view worsening", f"{metrics.get('max_view_worsen_pct_points', '')} % face width"),
+        ("trusted overlap drop", metrics.get("trusted_overlap_drop", "")),
+        ("interior landmark mean worsening", f"{metrics.get('interior_mean_worsen_pct_points', '')} % face width"),
+        ("mesh quality", decision.get("gates", {}).get("mesh_quality", "")),
+        ("legacy 0-16 contour", "diagnostic only; excluded from acceptance"),
+        ("texture", "excluded from geometry metrics"),
+    ]
+    return "\n".join(
+        "<tr><th>%s</th><td>%s</td></tr>"
+        % (html.escape(str(key)), html.escape(str(value)))
+        for key, value in rows
+    )
+
+
+def _identity_preservation_rows(report: Dict[str, Any]) -> str:
+    joint = report.get("joint", {})
+    final_gate = report.get("final", {})
+    metrics = final_gate.get("metrics", {})
+    thresholds = final_gate.get("thresholds", {})
+    rows = [
+        ("joint optimization", "pass" if joint.get("passed") else "failed"),
+        ("selected anchor attempt", joint.get("selected_attempt", "")),
+        ("coefficient L2 drift", metrics.get("coefficient_delta_l2", "")),
+        ("coefficient L2 limit", thresholds.get("max_coefficient_l2", "")),
+        ("mean neutral-mesh drift", f"{metrics.get('mean_displacement_pct', '')}% face width"),
+        ("P95 neutral-mesh drift", f"{metrics.get('p95_displacement_pct', '')}% face width"),
+        ("maximum neutral-mesh drift", f"{metrics.get('max_displacement_pct', '')}% face width"),
+        ("final identity gate", "pass" if final_gate.get("passed") else "failed"),
+        ("failed checks", ", ".join(final_gate.get("issues", []))),
+        ("texture", "excluded from identity metrics"),
+    ]
+    return "\n".join(
+        "<tr><th>%s</th><td>%s</td></tr>"
+        % (html.escape(str(key)), html.escape(str(value)))
+        for key, value in rows
+    )
+
+
 def write_stable_reconstruction_report(
     *,
     report_dir: Path,
@@ -89,6 +135,8 @@ def write_stable_reconstruction_report(
     final_quality = quality.get("texture", {}).get("final", {})
     fit_gate = quality.get("fit", {}).get("gate", {})
     texture_gate = quality.get("texture", {}).get("gate", {})
+    shape_refinement = quality.get("fit", {}).get("shape_refinement", {})
+    identity_preservation = quality.get("fit", {}).get("identity", {})
     confidence_map_path = (
         quality.get("texture", {})
         .get("confidence", {})
@@ -133,6 +181,24 @@ def write_stable_reconstruction_report(
                 % html.escape(confidence_rel)
             )
 
+    silhouette_cards = ""
+    silhouette_dir = debug_root / "shape_only_fine_tune"
+    if silhouette_dir.exists():
+        for view in ("left", "front", "right"):
+            for stage in ("before", "after"):
+                path = silhouette_dir / f"{view}_{stage}_silhouette.png"
+                path_rel = _copy_report_image(path, report_dir, "silhouette")
+                if path_rel:
+                    caption = f"{view} {stage}: source / target / model / trust / overlay"
+                    silhouette_cards += (
+                        '<figure><img src="%s" alt="%s"><figcaption>%s</figcaption></figure>'
+                        % (
+                            html.escape(path_rel),
+                            html.escape(caption),
+                            html.escape(caption),
+                        )
+                    )
+
     gate_badge = "pass" if fit_gate.get("passed") and texture_gate.get("passed") else "risk"
     html_text = f"""<!doctype html>
 <html lang="zh-CN">
@@ -176,6 +242,15 @@ def write_stable_reconstruction_report(
     <section>
       <h2>Stable Geometry Quality</h2>
       <table>{_metric_rows(fit_quality)}</table>
+    </section>
+    <section>
+      <h2>Identity Preservation</h2>
+      <table>{_identity_preservation_rows(identity_preservation)}</table>
+    </section>
+    <section>
+      <h2>Geometry Refinement Decision</h2>
+      <table>{_shape_refinement_rows(shape_refinement)}</table>
+      <div class="grid">{silhouette_cards or '<p>No silhouette diagnostics available.</p>'}</div>
     </section>
     <section>
       <h2>Textured Final Quality</h2>

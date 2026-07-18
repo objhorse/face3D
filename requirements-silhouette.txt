@@ -1,0 +1,2 @@
+# Install with: python -m pip install --no-build-isolation -r requirements-silhouette.txt
+nvdiffrast @ https://github.com/NVlabs/nvdiffrast/archive/refs/tags/v0.4.0.zip

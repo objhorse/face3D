@@ -19,7 +19,7 @@ from src.geometry.template_fit import temporary_config_overrides
 ProgressFn = Callable[[str, int, str], None]
 
 
-def _image_summary(path: Path) -> Dict[str, Any]:
+def _image_summary(path: Path, valid_mask_path: Optional[Path] = None) -> Dict[str, Any]:
     if not path.exists():
         return {"exists": False}
     try:
@@ -32,20 +32,44 @@ def _image_summary(path: Path) -> Dict[str, Any]:
             channels = 1
         else:
             channels = int(img.shape[2])
-        dark_ratio = float(np.mean(img[..., :3].mean(axis=2) < 3)) if img.ndim == 3 else float(np.mean(img < 3))
-        return {
+        dark = img[..., :3].mean(axis=2) < 3 if img.ndim == 3 else img < 3
+        summary = {
             "exists": True,
             "readable": True,
             "width": int(img.shape[1]),
             "height": int(img.shape[0]),
             "channels": channels,
-            "near_black_ratio": dark_ratio,
+            "near_black_ratio": float(np.mean(dark)),
         }
+        metric_mask = None
+        if valid_mask_path is not None and valid_mask_path.exists():
+            valid_mask = cv2.imread(str(valid_mask_path), cv2.IMREAD_GRAYSCALE)
+            if valid_mask is not None and valid_mask.shape == img.shape[:2]:
+                metric_mask = valid_mask > 0
+                summary["valid_texture_ratio"] = float(np.mean(metric_mask))
+        if metric_mask is None and img.ndim == 3 and channels == 4:
+            metric_mask = img[:, :, 3] > 0
+        if metric_mask is None:
+            metric_mask = np.ones(img.shape[:2], dtype=bool)
+        if channels == 3:
+            summary["opaque_ratio"] = 1.0
+        elif channels == 4:
+            summary["opaque_ratio"] = float(np.mean(img[:, :, 3] > 0))
+        else:
+            summary["opaque_ratio"] = 0.0
+        summary["near_black_opaque_ratio"] = (
+            float(np.mean(dark[metric_mask])) if np.any(metric_mask) else 1.0
+        )
+        return summary
     except Exception as exc:
         return {"exists": True, "readable": False, "error": str(exc)}
 
 
-def _write_texture_confidence_proxy(texture_path: Path, output_texture_dir: Path) -> Dict[str, Any]:
+def _write_texture_confidence_proxy(
+    texture_path: Path,
+    output_texture_dir: Path,
+    observation_path: Optional[Path] = None,
+) -> Dict[str, Any]:
     """Write a conservative visual proxy for texture confidence.
 
     The current baker does not export per-pixel source weights, so v1 marks
@@ -57,12 +81,18 @@ def _write_texture_confidence_proxy(texture_path: Path, output_texture_dir: Path
     try:
         import cv2
 
+        observation = None
+        if observation_path is not None and observation_path.exists():
+            observation = cv2.imread(str(observation_path), cv2.IMREAD_GRAYSCALE)
         img = cv2.imread(str(texture_path), cv2.IMREAD_UNCHANGED)
         if img is None:
             return {"exists": False, "path": str(out_path), "reason": "texture_not_readable"}
-        if img.ndim == 3 and img.shape[2] == 4:
+        if observation is not None and observation.shape == img.shape[:2]:
+            high = observation > 0
+            method = "bake_observation_mask"
+        elif img.ndim == 3 and img.shape[2] == 4:
             high = img[:, :, 3] > 0
-            method = "observed_alpha"
+            method = "visible_alpha_fallback"
         else:
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             high = rgb.mean(axis=2) > 5.0
@@ -142,8 +172,9 @@ def run_stable_texture_pipeline(
             sampling_warps=sampling_warps,
             feature_masks=feature_masks,
             diagnostics=bake_diagnostics,
-            transparent_unobserved=True,
+            transparent_unobserved=False,
             transparent_bottom_quantile=0.05,
+            smooth_geometry_on_export=False,
         )
 
     stable_glb = output_mesh_dir / "face_stable.glb"
@@ -167,17 +198,42 @@ def run_stable_texture_pipeline(
     assert_quality_gate(gate, context="stable texture no-delete mesh")
 
     texture_path = output_texture_dir / "albedo_white.png"
-    confidence_map = _write_texture_confidence_proxy(texture_path, output_texture_dir)
+    texture_summary = _image_summary(
+        texture_path,
+        valid_mask_path=output_texture_dir / "texture_valid_white.png",
+    )
+    confidence_map = _write_texture_confidence_proxy(
+        texture_path,
+        output_texture_dir,
+        observation_path=output_texture_dir / "texture_observation_white.png",
+    )
+    appearance_issues = []
+    if not texture_summary.get("readable", False):
+        appearance_issues.append("texture_not_readable")
+    if int(texture_summary.get("channels", 0)) not in (3, 4):
+        appearance_issues.append("unexpected_texture_channels")
+    if not bool(bake_diagnostics.get("inpainted_valid_opaque", False)):
+        appearance_issues.append("inpainted_valid_uv_not_opaque")
+    if float(texture_summary.get("near_black_opaque_ratio", 1.0)) > 0.08:
+        appearance_issues.append("opaque_texture_contains_excess_near_black")
+    if bake_diagnostics.get("face_material_alpha_mode") != "OPAQUE":
+        appearance_issues.append("face_material_not_opaque")
+    appearance_gate = {
+        "passed": not appearance_issues,
+        "issues": appearance_issues,
+        "thresholds": {"max_near_black_opaque_ratio": 0.08},
+    }
     summary = {
         "mode": "no_delete",
         "delete_invisible_faces": False,
         "glb_path": str(glb_path),
         "stable_glb_path": str(stable_glb),
         "texture_path": str(texture_path),
-        "texture": _image_summary(texture_path),
+        "texture": texture_summary,
         "quality": {
             "final": final_quality,
             "gate": gate,
+            "appearance_gate": appearance_gate,
         },
         "confidence": {
             "geometry_low_confidence_policy": "mark_or_inpaint_texture_only",
@@ -190,4 +246,9 @@ def run_stable_texture_pipeline(
     }
     with open(output_mesh_dir / "stable_texture_meta.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+    if not appearance_gate["passed"]:
+        raise RuntimeError(
+            "Stable texture appearance gate failed: "
+            + ", ".join(appearance_gate["issues"])
+        )
     return summary

@@ -47,6 +47,14 @@ def _copy_if_exists(src: Path, dst: Path) -> Optional[str]:
     return str(dst)
 
 
+def stable_neutral_source(output_dir: Path) -> Path:
+    """Return the geometry export produced with zero expression parameters."""
+    source = Path(output_dir) / "face_mesh_neutral.glb"
+    if not source.exists():
+        raise FileNotFoundError(f"True neutral FLAME export is missing: {source}")
+    return source
+
+
 def _load_json(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
@@ -163,7 +171,7 @@ def run_stable_template_fit(
             emoca_checkpoint=cfg.EMOCA_CHECKPOINT,
         )
 
-    neutral_glb = output_dir / "face_mesh.glb"
+    neutral_glb = stable_neutral_source(output_dir)
     stable_neutral_glb = output_dir / "face_stable_neutral.glb"
     stable_geometry_glb = output_dir / "face_stable_geometry.glb"
     _copy_if_exists(neutral_glb, stable_neutral_glb)
@@ -192,6 +200,10 @@ def run_stable_template_fit(
     debug_dir = output_dir.parent / "debug"
     optimized_params = _load_json(debug_dir / "optimized_parameters.json")
     optimized_shape = _load_json(debug_dir / "optimized_shape.json")
+    identity_quality = {
+        "joint": optimized_shape.get("joint_identity_anchor", {}),
+        "final": optimized_params.get("identity_preservation", {}),
+    }
     fit_meta = {
         "pipeline": "stable_three_view",
         "disabled_stages": disabled_stages,
@@ -204,6 +216,7 @@ def run_stable_template_fit(
             "neutral": neutral_quality,
             "geometry": geometry_quality,
             "gate": gate,
+            "identity": identity_quality,
         },
         "parameters": {
             "optimized_parameters": optimized_params,

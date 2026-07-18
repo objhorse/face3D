@@ -1335,6 +1335,9 @@ def bake_texture(
                     effective_weights[center_fallback],
                     np.abs(cosines[center_fallback]) ** 2,
                 )
+                # UV seam fallback may relax the normal test, but it must never
+                # bypass depth visibility and sample an occluded eye/nose surface.
+                center_fallback &= visible
                 valid_pts = (valid_pts & visible) | center_fallback
             else:
                 valid_pts &= visible & ~force_front
@@ -1507,11 +1510,13 @@ def bake_texture(
                     "y_floor": y_floor,
                     "hidden_uv_pixels": int((valid_mask & ~geometry_keep).sum()),
                 }
-        alpha_mask_out["mask"] = _texture_alpha_from_observation(
+        visible_alpha, observation_confidence = texture_alpha_masks(
             valid_mask,
             has_color_img,
             geometry_keep=geometry_keep,
         )
+        alpha_mask_out["mask"] = visible_alpha
+        alpha_mask_out["observation_confidence"] = observation_confidence
     missing_valid_mask = (valid_mask & ~has_color_img).astype(np.uint8)
     if missing_valid_mask.any():
         # 用有效像素的中位肤色预填充空洞，避免 TELEA 将边界污染色向内扩散
@@ -1583,6 +1588,34 @@ def _texture_alpha_from_observation(
             observed[labels == label] = 0
     observed[~allowed] = 0
     return observed
+
+
+def texture_alpha_masks(
+    valid_mask: np.ndarray,
+    observed_mask: np.ndarray,
+    geometry_keep: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return visible filled alpha and independent observation confidence."""
+    allowed = np.asarray(valid_mask, dtype=bool)
+    if geometry_keep is not None:
+        allowed &= np.asarray(geometry_keep, dtype=bool)
+    visible_alpha = allowed.astype(np.uint8) * 255
+    observation_confidence = (
+        (np.asarray(observed_mask) > 0) & allowed
+    ).astype(np.uint8) * 255
+    return visible_alpha, observation_confidence
+
+
+def transparent_bottom_face_mask(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    vertex_y_quantile: float,
+) -> Tuple[np.ndarray, float]:
+    """Select low-neck faces for a separate transparent GLB primitive."""
+    quantile = float(np.clip(vertex_y_quantile, 0.0, 0.25))
+    y_floor = float(np.quantile(np.asarray(vertices)[:, 1], quantile))
+    face_mask = np.asarray(vertices)[np.asarray(faces), 1].mean(axis=1) <= y_floor
+    return face_mask, y_floor
 
 
 def weight_acc_img(texture, vy, vx, has_color, H, W):
@@ -1810,6 +1843,8 @@ def export_glb(
     output_path: Path,
     lighting_type: str = "white",
     lighting_display_name: str = "白光",
+    smooth_geometry: bool = True,
+    transparent_face_mask: Optional[np.ndarray] = None,
 ):
     """
     将 Mesh + 纹理打包为 GLB 文件。
@@ -1831,11 +1866,14 @@ def export_glb(
     uv_verts = uv_verts[uv_used]
     uv_faces = uv_inverse.reshape(uv_faces.shape).astype(np.int32)
 
-    # module2 已完成 Loop Subdivision（~160K faces）+ Laplacian，此处仅做最终精修
-    # ── Step 1：轻度 Laplacian 平滑（2次，修复 per-face-vertex 展开前的微小锯齿）
-    shared_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    trimesh.smoothing.filter_laplacian(shared_mesh, iterations=2, lamb=0.3)
-    smooth_verts = np.array(shared_mesh.vertices)
+    # Legacy export optionally smooths geometry before UV expansion. Stable
+    # reconstruction disables this because texture packaging must not deform mesh.
+    if smooth_geometry:
+        shared_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        trimesh.smoothing.filter_laplacian(shared_mesh, iterations=2, lamb=0.3)
+        smooth_verts = np.array(shared_mesh.vertices)
+    else:
+        smooth_verts = np.asarray(vertices).copy()
 
     # ── Step 2：展开为 per-face-vertex（UV 必须独立寻址）────────────────────
     flat_geom_idx = faces.flatten()
@@ -1845,37 +1883,69 @@ def export_glb(
     exp_faces = np.arange(len(exp_verts)).reshape(-1, 3)
 
     # ── Step 3：重算平滑顶点法线 ────────────────────────────────────────────
-    sub_mesh    = trimesh.Trimesh(vertices=exp_verts, faces=exp_faces, process=False)
-    exp_normals = np.array(sub_mesh.vertex_normals)
+    transparent_faces = np.zeros(len(exp_faces), dtype=bool)
+    if transparent_face_mask is not None:
+        transparent_faces = np.asarray(transparent_face_mask, dtype=bool)
+        if transparent_faces.shape != (len(exp_faces),):
+            raise ValueError("transparent_face_mask must match the face count")
+    opaque_faces = ~transparent_faces
+    if not np.any(opaque_faces):
+        raise ValueError("At least one opaque face is required")
 
-    # 创建带法线的 trimesh Mesh
-    mesh = trimesh.Trimesh(
-        vertices=exp_verts,
-        faces=exp_faces,
-        vertex_normals=exp_normals,
-        process=False,
-    )
-
-    # 创建材质
-    tex_pil = PILImage.fromarray(texture)
-    material = trimesh.visual.material.PBRMaterial(
-        baseColorTexture=tex_pil,
+    opaque_texture = texture[..., :3] if texture.ndim == 3 else texture
+    opaque_material = trimesh.visual.material.PBRMaterial(
+        baseColorTexture=PILImage.fromarray(opaque_texture),
         metallicFactor=0.0,
         roughnessFactor=0.9,
-        alphaMode="BLEND" if texture.ndim == 3 and texture.shape[2] == 4 else "OPAQUE",
+        alphaMode="OPAQUE",
         name=f"skin_{lighting_type}",
     )
 
-    # 绑定 UV
-    visual = trimesh.visual.texture.TextureVisuals(
-        uv=exp_uv,
-        material=material,
-    )
-    mesh.visual = visual
+    def _textured_face_subset(face_mask: np.ndarray, material) -> "trimesh.Trimesh":
+        corner_indices = exp_faces[face_mask].reshape(-1)
+        subset_vertices = exp_verts[corner_indices]
+        subset_uv = exp_uv[corner_indices]
+        subset_faces = np.arange(len(subset_vertices)).reshape(-1, 3)
+        normal_source = trimesh.Trimesh(
+            vertices=subset_vertices,
+            faces=subset_faces,
+            process=False,
+        )
+        subset = trimesh.Trimesh(
+            vertices=subset_vertices,
+            faces=subset_faces,
+            vertex_normals=np.asarray(normal_source.vertex_normals),
+            process=False,
+        )
+        subset.visual = trimesh.visual.texture.TextureVisuals(
+            uv=subset_uv,
+            material=material,
+        )
+        return subset
 
+    geometry = {
+        f"face_{lighting_type}": _textured_face_subset(opaque_faces, opaque_material)
+    }
+    if np.any(transparent_faces):
+        transparent_texture = np.zeros((2, 2, 4), dtype=np.uint8)
+        transparent_material = trimesh.visual.material.PBRMaterial(
+            baseColorTexture=PILImage.fromarray(transparent_texture),
+            metallicFactor=0.0,
+            roughnessFactor=1.0,
+            alphaMode="BLEND",
+            name=f"hidden_bottom_{lighting_type}",
+        )
+        geometry[f"hidden_bottom_{lighting_type}"] = _textured_face_subset(
+            transparent_faces,
+            transparent_material,
+        )
+
+    # 创建带法线的 trimesh Mesh
+    # 创建材质
+    # 绑定 UV
     # GLB extras 元数据（前端图层切换用）
     scene = trimesh.Scene(
-        geometry={f"face_{lighting_type}": mesh},
+        geometry=geometry,
         metadata={
             "face3d_layers": [
                 {
@@ -1935,6 +2005,7 @@ def run_texture_pipeline(
     tex_size: int = 2048,
     lighting_type: str = "white",
     lighting_display_name: str = "白光",
+    smooth_geometry_on_export: bool = True,
     face_masks: Optional[Dict[str, np.ndarray]] = None,
     unified_texture: Optional[np.ndarray] = None,       # 预融合统一纹理（fallback）
     hires_front_image: Optional[np.ndarray] = None,     # 原始高清正面图（仅正面，旧接口）
@@ -2278,11 +2349,48 @@ def run_texture_pipeline(
         debug_dir=output_texture_dir.parent / "debug" / "side_ear_texture_repair",
     )
 
-    if transparent_unobserved and alpha_mask_out.get("mask") is not None:
-        texture = np.dstack((texture, alpha_mask_out["mask"]))
+    valid_texture_mask = alpha_mask_out.get("mask")
+    observation_confidence = alpha_mask_out.get("observation_confidence")
+    if valid_texture_mask is not None:
+        cv2.imwrite(
+            str(output_texture_dir / f"texture_valid_{lighting_type}.png"),
+            valid_texture_mask,
+        )
+    if observation_confidence is not None:
+        confidence_path = output_texture_dir / f"texture_observation_{lighting_type}.png"
+        cv2.imwrite(str(confidence_path), observation_confidence)
+    if transparent_unobserved and valid_texture_mask is not None:
+        texture = np.dstack((texture, valid_texture_mask))
+    if diagnostics is not None:
+        diagnostics["opaque_uv_pixels"] = int(
+            (valid_texture_mask > 0).sum()
+        ) if valid_texture_mask is not None else int(texture.shape[0] * texture.shape[1])
+        diagnostics["observed_uv_pixels"] = int(
+            (observation_confidence > 0).sum()
+        ) if observation_confidence is not None else 0
+        diagnostics["inpainted_valid_opaque"] = True
+        diagnostics["transparent_unobserved"] = bool(transparent_unobserved)
+        diagnostics["face_material_alpha_mode"] = (
+            "BLEND" if transparent_unobserved else "OPAQUE"
+        )
+
+    transparent_face_mask = None
+    if not transparent_unobserved and transparent_bottom_quantile is not None:
+        quantile = float(np.clip(transparent_bottom_quantile, 0.0, 0.25))
+        transparent_face_mask, y_floor = transparent_bottom_face_mask(
+            vertices,
+            faces,
+            quantile,
+        )
         if diagnostics is not None:
-            diagnostics["opaque_uv_pixels"] = int((alpha_mask_out["mask"] > 0).sum())
-            diagnostics["transparent_unobserved"] = True
+            diagnostics.setdefault("transparent_bottom", {}).update(
+                {
+                    "vertex_y_quantile": quantile,
+                    "y_floor": y_floor,
+                    "hidden_faces": int(transparent_face_mask.sum()),
+                    "material_split": True,
+                }
+            )
 
     # ── 保存纹理图 ────────────────────────────────────────────────────────
     tex_path = output_texture_dir / f"albedo_{lighting_type}.png"
@@ -2299,6 +2407,8 @@ def run_texture_pipeline(
         texture, glb_path,
         lighting_type=lighting_type,
         lighting_display_name=lighting_display_name,
+        smooth_geometry=smooth_geometry_on_export,
+        transparent_face_mask=transparent_face_mask,
     )
 
     return glb_path

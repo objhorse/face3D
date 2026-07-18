@@ -133,6 +133,12 @@ def run_stable_three_view_pipeline(
             "neutral": fit_meta["quality"]["neutral"],
             "geometry": fit_meta["quality"]["geometry"],
             "gate": fit_meta["quality"]["gate"],
+            "identity": fit_meta["quality"].get("identity", {}),
+            "shape_refinement": (
+                fit_meta.get("parameters", {})
+                .get("optimized_shape", {})
+                .get("shape_only_fine_tune", {})
+            ),
         },
         "texture": {
             "final": texture_meta["quality"]["final"],
