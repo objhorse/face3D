@@ -11,6 +11,8 @@ from typing import Tuple
 
 import numpy as np
 
+from .appearance.projective_sampling import project_points_strict
+
 
 def flame_points_to_opencv_world(points: np.ndarray) -> np.ndarray:
     """Convert FLAME/world points (Y up) to the OpenCV-world convention (Y down)."""
@@ -48,13 +50,14 @@ def project_texture_points_to_image(
         pixels: (N, 2) image coordinates
         front: (N,) points in front of the camera
     """
-    v_cam = camera_space_from_texture_extrinsics(points, R, t)
-    z = v_cam[:, 2]
-    front = z > 1e-4
-    pixels = np.zeros((len(points), 2), dtype=np.float32)
-    pixels[front, 0] = K[0, 0] * v_cam[front, 0] / z[front] + K[0, 2]
-    pixels[front, 1] = K[1, 1] * v_cam[front, 1] / z[front] + K[1, 2]
-    return v_cam, z, pixels, front
+    projected = project_points_strict(points, K, R, t)
+    # Preserve the legacy tuple and writable-array contract for pipeline callers.
+    return (
+        projected.camera_points.copy(),
+        projected.depth.copy(),
+        projected.pixel_xy.copy(),
+        projected.front_facing.copy(),
+    )
 
 
 def camera_center_for_texture_visibility(R: np.ndarray, t: np.ndarray) -> np.ndarray:
