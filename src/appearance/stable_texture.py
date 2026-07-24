@@ -126,6 +126,7 @@ def run_stable_texture_pipeline(
     working_image_size: int = 1024,
     baseline_quality: Optional[Dict[str, Any]] = None,
     progress: Optional[ProgressFn] = None,
+    sampling_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     output_texture_dir.mkdir(parents=True, exist_ok=True)
     output_mesh_dir.mkdir(parents=True, exist_ok=True)
@@ -139,7 +140,19 @@ def run_stable_texture_pipeline(
     sampling_warps = None
     feature_masks = None
     bake_diagnostics: Dict[str, Any] = {}
-    if preprocessed_views is not None and hires_images is not None:
+    if sampling_mode is None:
+        sampling_mode = str(
+            getattr(cfg, "STABLE_TEXTURE_MODE", "legacy_registered")
+        )
+    if sampling_mode not in {"legacy_registered", "strict_projective"}:
+        raise ValueError(
+            "sampling_mode must be 'legacy_registered' or 'strict_projective'"
+        )
+    if (
+        sampling_mode == "legacy_registered"
+        and preprocessed_views is not None
+        and hires_images is not None
+    ):
         from src.appearance.stable_texture_registration import prepare_stable_texture_registration
 
         registration = prepare_stable_texture_registration(
@@ -175,6 +188,7 @@ def run_stable_texture_pipeline(
             transparent_unobserved=False,
             transparent_bottom_quantile=0.05,
             smooth_geometry_on_export=False,
+            sampling_mode=sampling_mode,
         )
 
     stable_glb = output_mesh_dir / "face_stable.glb"
@@ -225,6 +239,7 @@ def run_stable_texture_pipeline(
     }
     summary = {
         "mode": "no_delete",
+        "sampling_mode": sampling_mode,
         "delete_invisible_faces": False,
         "glb_path": str(glb_path),
         "stable_glb_path": str(stable_glb),

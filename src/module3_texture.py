@@ -26,6 +26,12 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from src.appearance.projective_sampling import (
+    assert_strict_sampling_coordinates,
+    project_points_strict,
+    render_camera_depth,
+    sample_projected_attributes,
+)
 from src.coordinates import (
     camera_center_for_texture_visibility,
     image_uv_to_obj_uv,
@@ -353,41 +359,7 @@ def _render_camera_depth(
     image_shape: Tuple[int, int],
 ) -> np.ndarray:
     """Render a coarse camera-space z-buffer for visibility filtering."""
-    H, W = image_shape
-    depth = np.full((H, W), np.inf, dtype=np.float32)
-
-    v_cam, z, proj, valid = project_texture_points_to_image(vertices, K, R, t)
-    if not np.any(valid):
-        return depth
-
-    for tri in faces:
-        tri_z = z[tri]
-        if np.any(tri_z <= 1e-4):
-            continue
-        pts = proj[tri]
-        x_min = max(0, int(np.floor(np.min(pts[:, 0]))))
-        x_max = min(W - 1, int(np.ceil(np.max(pts[:, 0]))))
-        y_min = max(0, int(np.floor(np.min(pts[:, 1]))))
-        y_max = min(H - 1, int(np.ceil(np.max(pts[:, 1]))))
-        if x_min > x_max or y_min > y_max:
-            continue
-
-        xs = np.arange(x_min, x_max + 1, dtype=np.float32) + 0.5
-        ys = np.arange(y_min, y_max + 1, dtype=np.float32) + 0.5
-        gx, gy = np.meshgrid(xs, ys)
-        pix = np.stack([gx.ravel(), gy.ravel()], axis=1)
-        bary = _bary_batch(pix, pts[0], pts[1], pts[2])
-        inside = np.all(bary >= -1e-5, axis=1)
-        if not np.any(inside):
-            continue
-
-        pix_in = pix[inside]
-        depth_in = (bary[inside] @ tri_z.astype(np.float32)).astype(np.float32)
-        px = pix_in[:, 0].astype(np.int32)
-        py = pix_in[:, 1].astype(np.int32)
-        np.minimum.at(depth, (py, px), depth_in)
-
-    return depth
+    return render_camera_depth(vertices, faces, K, R, t, image_shape)
 
 
 def _expand_face_selection(faces: np.ndarray, keep_faces: np.ndarray, rings: int) -> np.ndarray:
@@ -1221,6 +1193,8 @@ def bake_texture(
     diagnostics: Optional[dict] = None,
     alpha_mask_out: Optional[dict] = None,
     transparent_bottom_quantile: Optional[float] = None,
+    sampling_mode: str = "legacy_registered",
+    sampling_debug_out: Optional[dict] = None,
 ) -> np.ndarray:
     """
     将3张照片的颜色烘焙到 UV 纹理图。
@@ -1228,6 +1202,19 @@ def bake_texture(
     Returns: (H, W, 3) uint8 RGB 纹理图
     """
     H = W = tex_size
+    if sampling_mode not in {"legacy_registered", "strict_projective"}:
+        raise ValueError(
+            "sampling_mode must be 'legacy_registered' or 'strict_projective'"
+        )
+    strict_projective = sampling_mode == "strict_projective"
+    if strict_projective and sampling_warps:
+        raise ValueError(
+            "strict_projective sampling rejects sampling_warps; geometry and "
+            "camera projection must define the sampled pixel"
+        )
+    if diagnostics is not None:
+        diagnostics["sampling_mode"] = sampling_mode
+        diagnostics.setdefault("sampling_coordinates", {})
     face_normals = compute_face_normals(vertices, faces)  # (F, 3)
 
     # 有效像素的面片索引和重心坐标
@@ -1279,21 +1266,61 @@ def bake_texture(
     view_samples = {}
     blend_layers = []
     blend_weights = []
+    blend_view_names = []
     for view_name in view_names:
         cam    = cameras[view_name]
         K, R, t = cam["K"], cam["R"], cam["t"]
         image  = images[view_name]              # (H_img, W_img, 3) RGB
         H_img, W_img = image.shape[:2]
         depth_map = _render_camera_depth(vertices, faces, K, R, t, (H_img, W_img))
-        v_cam, z, proj, front = project_texture_points_to_image(pts_3d, K, R, t)
-        sample_proj = proj
-        if sampling_warps is not None and view_name in sampling_warps:
-            sample_proj = sampling_warps[view_name].apply(proj, (H_img, W_img))
+        projective_sample = None
+        if strict_projective:
+            projection = project_points_strict(pts_3d, K, R, t)
+            projective_sample = sample_projected_attributes(
+                projection,
+                image,
+                mask=(
+                    face_masks[view_name]
+                    if face_masks is not None and view_name in face_masks
+                    else None
+                ),
+                depth_map=depth_map,
+                semantic_map=(
+                    feature_masks[view_name]
+                    if feature_masks is not None and view_name in feature_masks
+                    else None
+                ),
+            )
+            v_cam = projection.camera_points
+            z = projection.depth
+            proj = projection.pixel_xy
+            front = projection.front_facing
+            pixel_xy = projection.pixel_xy
+            if diagnostics is not None:
+                diagnostics["sampling_coordinates"][view_name] = (
+                    assert_strict_sampling_coordinates(
+                        proj,
+                        pixel_xy,
+                        projective_sample.in_bounds,
+                    )
+                )
+        else:
+            v_cam, z, proj, front = project_texture_points_to_image(
+                pts_3d, K, R, t
+            )
+            pixel_xy = proj
+            if sampling_warps is not None and view_name in sampling_warps:
+                pixel_xy = sampling_warps[view_name].apply(
+                    proj, (H_img, W_img)
+                )
 
         # 在图像范围内的点
-        in_img = (front &
-                  (sample_proj[:, 0] >= 0) & (sample_proj[:, 0] < W_img - 1) &
-                  (sample_proj[:, 1] >= 0) & (sample_proj[:, 1] < H_img - 1))
+        if strict_projective:
+            in_img = projective_sample.in_bounds
+        else:
+            in_img = (front &
+                      (pixel_xy[:, 0] >= 0) & (pixel_xy[:, 0] < W_img - 1) &
+                      (pixel_xy[:, 1] >= 0) & (pixel_xy[:, 1] < H_img - 1))
 
         # 计算权重：面法线 · 相机方向（使用 Y 翻转后的坐标系）
         # 还原回 FLAME 坐标系（翻转 Y）
@@ -1306,23 +1333,29 @@ def bake_texture(
 
         # 如有 face mask，检查投影点是否落在 mask 内
         if face_masks is not None and view_name in face_masks:
-            mask_img = face_masks[view_name]   # (H_img, W_img) uint8
-            mask_H, mask_W = mask_img.shape[:2]
+            if strict_projective:
+                in_mask = projective_sample.mask
+            else:
+                mask_img = face_masks[view_name]   # (H_img, W_img) uint8
+                mask_H, mask_W = mask_img.shape[:2]
             # 采样 mask 值（最近邻）
-            px_u_int = sample_proj[:, 0].astype(int)
-            px_v_int = sample_proj[:, 1].astype(int)
-            px_u_int = np.clip(px_u_int, 0, mask_W - 1)
-            px_v_int = np.clip(px_v_int, 0, mask_H - 1)
-            in_mask = mask_img[px_v_int, px_u_int] > 127
+                px_u_int = pixel_xy[:, 0].astype(int)
+                px_v_int = pixel_xy[:, 1].astype(int)
+                px_u_int = np.clip(px_u_int, 0, mask_W - 1)
+                px_v_int = np.clip(px_v_int, 0, mask_H - 1)
+                in_mask = mask_img[px_v_int, px_u_int] > 127
             valid_pts = in_img & (weights > 0.05) & in_mask
         else:
             valid_pts = in_img & (weights > 0.05)
 
         effective_weights = weights.copy()
         if valid_pts.any():
-            px_u_int = np.clip(proj[:, 0].astype(int), 0, W_img - 1)
-            px_v_int = np.clip(proj[:, 1].astype(int), 0, H_img - 1)
-            z_ref = depth_map[px_v_int, px_u_int]
+            if strict_projective:
+                z_ref = projective_sample.depth
+            else:
+                px_u_int = np.clip(proj[:, 0].astype(int), 0, W_img - 1)
+                px_v_int = np.clip(proj[:, 1].astype(int), 0, H_img - 1)
+                z_ref = depth_map[px_v_int, px_u_int]
             visible = z <= (z_ref + 3e-3)
             if view_name == "front":
                 # FLAME's UV atlas contains small internal holes/seams. Faces around
@@ -1345,11 +1378,14 @@ def bake_texture(
         if valid_pts.sum() == 0:
             continue
 
-        colors = _bilinear_sample(
-            image,
-            sample_proj[valid_pts, 0],
-            sample_proj[valid_pts, 1],
-        )  # (K, 3)
+        if strict_projective:
+            colors = projective_sample.rgb[valid_pts]
+        else:
+            colors = _bilinear_sample(
+                image,
+                pixel_xy[valid_pts, 0],
+                pixel_xy[valid_pts, 1],
+            )  # (K, 3)
 
         # 额外过滤极暗像素（残余背景）
         vp_idx = np.where(valid_pts)[0]
@@ -1360,8 +1396,12 @@ def bake_texture(
             "idx": vp_idx,
             "colors": colors.astype(np.float32),
             "weights": sample_weights.astype(np.float32),
-            "sample_proj": sample_proj[valid_pts].astype(np.float32),
+            "pixel_xy": pixel_xy[valid_pts].astype(np.float32),
         }
+        if strict_projective and projective_sample.semantic is not None:
+            view_samples[view_name]["feature"] = (
+                projective_sample.semantic[valid_pts] > 0
+            )
         fg_mask = np.ones(len(vp_idx), dtype=bool)
 
         logger.info(f"    [{view_name}] 采样 {fg_mask.sum()} 个前景像素（共{valid_pts.sum()}有效）")
@@ -1382,11 +1422,14 @@ def bake_texture(
     protected_feature_full = np.zeros(len(valid_y), dtype=bool)
     if "front" in view_samples and feature_masks is not None and "front" in feature_masks:
         front_sample = view_samples["front"]
-        feature_mask = feature_masks["front"]
-        sample_proj = front_sample["sample_proj"]
-        px = np.clip(sample_proj[:, 0].astype(np.int32), 0, feature_mask.shape[1] - 1)
-        py = np.clip(sample_proj[:, 1].astype(np.int32), 0, feature_mask.shape[0] - 1)
-        protected = feature_mask[py, px] > 0
+        if strict_projective and "feature" in front_sample:
+            protected = front_sample["feature"]
+        else:
+            feature_mask = feature_masks["front"]
+            pixel_xy = front_sample["pixel_xy"]
+            px = np.clip(pixel_xy[:, 0].astype(np.int32), 0, feature_mask.shape[1] - 1)
+            py = np.clip(pixel_xy[:, 1].astype(np.int32), 0, feature_mask.shape[0] - 1)
+            protected = feature_mask[py, px] > 0
         protected_feature_full[front_sample["idx"][protected]] = True
         front_sample["weights"][protected] *= 4.0
         if diagnostics is not None:
@@ -1482,6 +1525,7 @@ def bake_texture(
         weight_layer = _feather_view_weight(weight_layer, radius_px=72.0)
         blend_layers.append(layer)
         blend_weights.append(weight_layer)
+        blend_view_names.append(view_name)
 
     has_color = weight_acc > 0
     texture = np.zeros((H, W, 3), dtype=np.float32)
@@ -1491,6 +1535,25 @@ def bake_texture(
     else:
         texture[valid_y[has_color], valid_x[has_color]] = (
             color_acc[has_color] / weight_acc[has_color, None]
+        )
+
+    if sampling_debug_out is not None:
+        source_view = np.full((H, W), -1, dtype=np.int16)
+        source_weight = np.zeros((H, W), dtype=np.float32)
+        if blend_weights:
+            stacked_weights = np.stack(blend_weights, axis=0)
+            source_view = np.argmax(stacked_weights, axis=0).astype(np.int16)
+            source_weight = np.max(stacked_weights, axis=0).astype(np.float32)
+            source_view[source_weight <= 0.0] = -1
+            source_view[~valid_mask] = -1
+            source_weight[~valid_mask] = 0.0
+        sampling_debug_out.update(
+            {
+                "view_names": tuple(blend_view_names),
+                "source_view": source_view,
+                "source_weight": source_weight,
+                "observed": source_weight > 0.0,
+            }
         )
 
     # 对无颜色的有效区域做 inpainting 填充（遮挡区域）
@@ -2018,6 +2081,7 @@ def run_texture_pipeline(
     diagnostics: Optional[dict] = None,
     transparent_unobserved: bool = False,
     transparent_bottom_quantile: Optional[float] = None,
+    sampling_mode: str = "legacy_registered",
 ) -> Path:
     """
     完整纹理融合流程。
@@ -2145,6 +2209,7 @@ def run_texture_pipeline(
         iterations=4,
     ).astype(bool) & valid_mask
     alpha_mask_out = {}
+    sampling_debug_out = {}
 
     # ── 纹理烘焙（高清直采 > 统一纹理 > 多视角） ─────────────────────────
     if hires_images is not None:
@@ -2207,6 +2272,8 @@ def run_texture_pipeline(
             diagnostics=diagnostics,
             alpha_mask_out=alpha_mask_out,
             transparent_bottom_quantile=transparent_bottom_quantile,
+            sampling_mode=sampling_mode,
+            sampling_debug_out=sampling_debug_out,
         )
         logger.info("接缝修复...")
         if added_uv_faces:
@@ -2295,6 +2362,8 @@ def run_texture_pipeline(
             diagnostics=diagnostics,
             alpha_mask_out=alpha_mask_out,
             transparent_bottom_quantile=transparent_bottom_quantile,
+            sampling_mode=sampling_mode,
+            sampling_debug_out=sampling_debug_out,
         )
         # ── 泊松接缝修复 ─────────────────────────────────────────────────
         logger.info("接缝修复...")
@@ -2359,6 +2428,44 @@ def run_texture_pipeline(
     if observation_confidence is not None:
         confidence_path = output_texture_dir / f"texture_observation_{lighting_type}.png"
         cv2.imwrite(str(confidence_path), observation_confidence)
+    if sampling_debug_out:
+        view_names = tuple(sampling_debug_out.get("view_names", ()))
+        source_view = sampling_debug_out.get("source_view")
+        source_weight = sampling_debug_out.get("source_weight")
+        if source_view is not None:
+            palette = np.array(
+                [
+                    [67, 151, 232],
+                    [59, 190, 118],
+                    [222, 108, 142],
+                ],
+                dtype=np.uint8,
+            )
+            source_rgb = np.zeros((*source_view.shape, 3), dtype=np.uint8)
+            for view_index, _view_name in enumerate(view_names):
+                source_rgb[source_view == view_index] = palette[
+                    view_index % len(palette)
+                ]
+            source_path = output_texture_dir / f"texture_source_{lighting_type}.png"
+            cv2.imwrite(str(source_path), cv2.cvtColor(source_rgb, cv2.COLOR_RGB2BGR))
+        if source_weight is not None:
+            observed_path = (
+                output_texture_dir / f"texture_sampling_valid_{lighting_type}.png"
+            )
+            cv2.imwrite(
+                str(observed_path),
+                (np.asarray(source_weight) > 0.0).astype(np.uint8) * 255,
+            )
+        if diagnostics is not None:
+            diagnostics["sampling_debug"] = {
+                "view_names": list(view_names),
+                "source_map": str(
+                    output_texture_dir / f"texture_source_{lighting_type}.png"
+                ),
+                "valid_map": str(
+                    output_texture_dir / f"texture_sampling_valid_{lighting_type}.png"
+                ),
+            }
     if transparent_unobserved and valid_texture_mask is not None:
         texture = np.dstack((texture, valid_texture_mask))
     if diagnostics is not None:

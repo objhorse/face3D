@@ -7,9 +7,12 @@ import pytest
 from src.appearance.projective_sampling import (
     DEFAULT_POSITIVE_DEPTH_EPSILON,
     ProjectionCoordinates,
+    ProjectionSample,
     assert_strict_sampling_coordinates,
     compare_sampling_coordinates,
     project_points_strict,
+    render_camera_depth,
+    sample_projected_attributes,
 )
 from src.coordinates import project_texture_points_to_image
 
@@ -66,6 +69,78 @@ def test_projection_coordinates_are_immutable_and_own_read_only_arrays():
         result.depth = np.array([2.0])
     with pytest.raises(ValueError):
         result.pixel_xy[0, 0] = 10.0
+
+
+def test_projected_attributes_share_one_pixel_coordinate_for_all_rasters():
+    coordinates = ProjectionCoordinates(
+        camera_points=np.array([[0.0, 0.0, 2.0], [0.0, 0.0, 2.0]]),
+        depth=np.array([2.0, 2.0]),
+        pixel_xy=np.array([[1.25, 1.5], [8.0, 8.0]]),
+        front_facing=np.array([True, True]),
+    )
+    image = np.zeros((4, 4, 3), dtype=np.float32)
+    image[1, 1] = [10.0, 20.0, 30.0]
+    image[1, 2] = [30.0, 40.0, 50.0]
+    image[2, 1] = [50.0, 60.0, 70.0]
+    image[2, 2] = [70.0, 80.0, 90.0]
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[1, 1] = 255
+    depth = np.full((4, 4), 9.0, dtype=np.float32)
+    depth[1, 1] = 2.25
+    semantic = np.zeros((4, 4), dtype=np.uint8)
+    semantic[1, 1] = 7
+
+    sample = sample_projected_attributes(
+        coordinates,
+        image,
+        mask=mask,
+        depth_map=depth,
+        semantic_map=semantic,
+    )
+
+    assert isinstance(sample, ProjectionSample)
+    np.testing.assert_array_equal(sample.in_bounds, [True, False])
+    np.testing.assert_allclose(sample.rgb[0], [35.0, 45.0, 55.0])
+    assert sample.mask.tolist() == [True, False]
+    assert sample.depth[0] == pytest.approx(2.25)
+    assert sample.semantic[0] == pytest.approx(7.0)
+    with pytest.raises(ValueError):
+        sample.rgb[0, 0] = 0.0
+
+
+def test_projected_attributes_require_aligned_raster_shapes():
+    coordinates = project_points_strict(
+        np.array([[0.0, 0.0, 2.0]]),
+        np.eye(3),
+        np.eye(3),
+        np.zeros(3),
+    )
+
+    with pytest.raises(ValueError, match="mask.*match"):
+        sample_projected_attributes(
+            coordinates,
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            mask=np.zeros((3, 4), dtype=np.uint8),
+        )
+
+
+def test_render_camera_depth_uses_the_strict_projection_pixels():
+    vertices = np.array(
+        [[-0.5, -0.5, 2.0], [0.0, 0.5, 2.0], [0.5, -0.5, 2.0]],
+        dtype=np.float32,
+    )
+    depth = render_camera_depth(
+        vertices,
+        np.array([[0, 1, 2]], dtype=np.int32),
+        np.array([[8.0, 0.0, 8.0], [0.0, 8.0, 8.0], [0.0, 0.0, 1.0]]),
+        np.eye(3),
+        np.zeros(3),
+        (16, 16),
+    )
+
+    assert depth.shape == (16, 16)
+    assert np.isfinite(depth).any()
+    np.testing.assert_allclose(depth[np.isfinite(depth)], 2.0)
 
 
 def test_projection_coordinates_validate_depth_and_binary_front_facing():
