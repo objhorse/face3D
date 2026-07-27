@@ -3,22 +3,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Mapping
 
 import cv2
 import numpy as np
 
-from src.cross_view_geometry import Camera, scale_intrinsics
-from src.geometry.profile_silhouette_extrema import (
-    _contour_curvature,
-    _fundamental_matrix_work,
-    _largest_binary_component,
-    _original_to_work,
-    _point_line_distances,
-    _work_to_original,
-    _undistort_work_points,
+from src.cross_view_geometry import Camera
+from src.geometry.observation_coordinates import (
+    ObservationCoordinates,
     canvas_points_to_original,
+    contour_curvature,
+    external_contour_work,
+    fundamental_matrix_work,
+    mask_variant_work,
+    normalize_image_to_work,
+    normalize_mask_to_work,
     original_points_to_canvas,
+    original_points_to_work,
+    point_line_distances,
+    resample_polyline_by_arclength,
+    work_points_to_original,
 )
 from src.geometry.profile_triangulation import ProfileRig
 
@@ -49,6 +54,8 @@ class NasalObservationConfig:
     distance_clip_px: float = 48.0
     confidence_spread_px: float = 3.0
     min_boundary_points: int = 12
+    color_space: str = "RGB"
+    gradient_noise_floor: float = 8.0
 
     def __post_init__(self) -> None:
         width, height = self.work_size
@@ -73,6 +80,48 @@ class NasalObservationConfig:
             raise ValueError("confidence spread must be positive")
         if self.min_boundary_points < 2:
             raise ValueError("minimum boundary point count must be at least two")
+        if self.color_space not in {"GRAY", "RGB", "RGBA", "BGR", "BGRA"}:
+            raise ValueError("unsupported color space")
+        if self.gradient_noise_floor < 0.0:
+            raise ValueError("gradient noise floor must be non-negative")
+
+
+def _readonly_array(value: Any, *, dtype: Any | None = None) -> np.ndarray:
+    result = np.array(value, dtype=dtype, copy=True)
+    result.setflags(write=False)
+    return result
+
+
+def _freeze_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return _readonly_array(value)
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
+def _freeze_camera(camera: Camera) -> Camera:
+    return Camera(
+        name=str(camera.name),
+        view=str(camera.view),
+        image_size=tuple(int(value) for value in camera.image_size),
+        K=_readonly_array(camera.K, dtype=np.float64),
+        dist=_readonly_array(camera.dist, dtype=np.float64),
+        R_rig_to_camera=_readonly_array(
+            camera.R_rig_to_camera,
+            dtype=np.float64,
+        ),
+        t_rig_to_camera=_readonly_array(
+            camera.t_rig_to_camera,
+            dtype=np.float64,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -132,6 +181,27 @@ class NasalViewObservation:
             raise ValueError("confidence contains non-finite values")
         if np.any((self.confidence < 0.0) | (self.confidence > 1.0)):
             raise ValueError("confidence must stay within [0, 1]")
+        object.__setattr__(self, "camera", _freeze_camera(self.camera))
+        for name in (
+            "boundary",
+            "distance_field",
+            "confidence",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _readonly_array(getattr(self, name)),
+            )
+        for name in (
+            "boundaries_work",
+            "distance_fields",
+            "variant_boundaries_work",
+            "variant_boundaries",
+            "anchors_work",
+            "camera_metadata",
+            "coordinate_metadata",
+        ):
+            object.__setattr__(self, name, _freeze_value(getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -187,115 +257,40 @@ def nasal_view_for_camera(camera: Camera) -> str:
     return nasal_view
 
 
-def original_points_to_work(
-    points: Any,
-    image_size: tuple[int, int],
-    work_size: tuple[int, int],
+def _validate_coordinates(
+    camera: Camera,
+    coordinates: ObservationCoordinates,
+    config: NasalObservationConfig,
+) -> None:
+    if coordinates.original_size != tuple(camera.image_size):
+        raise ValueError(
+            f"coordinate original size {coordinates.original_size} does not "
+            f"match {camera.name} size {camera.image_size}"
+        )
+    if coordinates.work_size != tuple(config.work_size):
+        raise ValueError(
+            f"coordinate work size {coordinates.work_size} does not match "
+            f"configured work size {config.work_size}"
+        )
+
+
+def _validate_image(
+    image: np.ndarray,
+    camera: Camera,
+    coordinates: ObservationCoordinates,
 ) -> np.ndarray:
-    """Delegate original-to-work scaling to the profile observation geometry."""
-    return _original_to_work(points, image_size, work_size)
-
-
-def work_points_to_original(
-    points: Any,
-    image_size: tuple[int, int],
-    work_size: tuple[int, int],
-) -> np.ndarray:
-    """Delegate work-to-original scaling to the profile observation geometry."""
-    return _work_to_original(points, image_size, work_size)
-
-
-def _validate_image(image: np.ndarray, camera: Camera) -> np.ndarray:
     frame = np.asarray(image)
     if frame.ndim not in (2, 3):
         raise ValueError("image must be grayscale or have color channels")
     if frame.ndim == 3 and frame.shape[2] not in (1, 3, 4):
         raise ValueError("image must have one, three, or four channels")
     actual_size = (int(frame.shape[1]), int(frame.shape[0]))
-    if actual_size != tuple(camera.image_size):
+    if actual_size != coordinates.original_size:
         raise ValueError(
             f"image size {actual_size} does not match {camera.name} "
-            f"size {camera.image_size}"
+            f"coordinate original size {coordinates.original_size}"
         )
     return frame
-
-
-def _validate_mask(
-    mask: np.ndarray,
-    camera: Camera,
-    *,
-    name: str,
-) -> np.ndarray:
-    values = np.asarray(mask)
-    if values.ndim == 3:
-        values = values[..., 0]
-    if values.ndim != 2:
-        raise ValueError(f"{name} must be a two-dimensional mask")
-    original_shape = (camera.image_size[1], camera.image_size[0])
-    if values.shape != original_shape and values.shape[0] != values.shape[1]:
-        raise ValueError(
-            f"{name} size {values.shape} must match the original image or "
-            "be a square letterbox canvas"
-        )
-    binary = _largest_binary_component(values)
-    if not np.any(binary):
-        raise ValueError(f"{name} is empty")
-    return binary
-
-
-def _mask_variant(binary: np.ndarray, offset_px: int) -> np.ndarray:
-    amount = abs(int(offset_px))
-    if amount == 0:
-        return binary.copy()
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (2 * amount + 1, 2 * amount + 1),
-    )
-    operation = cv2.MORPH_DILATE if offset_px > 0 else cv2.MORPH_ERODE
-    return cv2.morphologyEx(binary, operation, kernel)
-
-
-def _external_contour_canvas(binary: np.ndarray, *, name: str) -> np.ndarray:
-    contours, _hierarchy = cv2.findContours(
-        np.asarray(binary > 0, dtype=np.uint8),
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE,
-    )
-    if not contours:
-        raise ValueError(f"{name} has no external contour")
-    contour = max(contours, key=cv2.contourArea).reshape(-1, 2)
-    if len(contour) < 4:
-        raise ValueError(f"{name} contour has too little support")
-    return contour.astype(np.float64)
-
-
-def _canvas_contour_to_work(
-    contour_canvas: np.ndarray,
-    camera: Camera,
-    canvas_shape: tuple[int, int],
-    work_size: tuple[int, int],
-) -> np.ndarray:
-    original = canvas_points_to_original(
-        contour_canvas,
-        camera.image_size,
-        canvas_shape,
-    )
-    width, height = camera.image_size
-    valid = (
-        (original[:, 0] >= 0.0)
-        & (original[:, 0] < width)
-        & (original[:, 1] >= 0.0)
-        & (original[:, 1] < height)
-    )
-    original = original[valid]
-    if len(original) < 4:
-        raise ValueError("mask contour has too little support inside image bounds")
-    distorted_work = _original_to_work(
-        original,
-        camera.image_size,
-        work_size,
-    )
-    return _undistort_work_points(distorted_work, camera, work_size)
 
 
 def _rasterize_curves(
@@ -332,41 +327,55 @@ def _unsigned_distance_field(
     if not np.any(boundary):
         raise ValueError("cannot build a distance field from an empty boundary")
     background = np.asarray(~boundary, dtype=np.uint8)
-    distance = cv2.distanceTransform(background, cv2.DIST_L2, 5)
+    distance = cv2.distanceTransform(
+        background,
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE,
+    )
     return np.minimum(distance, float(distance_clip_px)).astype(np.float32)
 
 
 def _work_gradients(
     image: np.ndarray,
-    camera: Camera,
+    coordinates: ObservationCoordinates,
+    roi_work_xyxy: tuple[float, float, float, float],
     config: NasalObservationConfig,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    frame = image
-    if frame.ndim == 3 and frame.shape[2] == 1:
-        frame = frame[..., 0]
-    if frame.ndim == 3 and frame.shape[2] == 4:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-    if frame.ndim == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frame = normalize_image_to_work(image, coordinates)
+    channels = 1 if frame.ndim == 2 else int(frame.shape[2])
+    allowed_channels = {
+        "GRAY": (1,),
+        "RGB": (3, 4),
+        "RGBA": (4,),
+        "BGR": (3, 4),
+        "BGRA": (4,),
+    }[config.color_space]
+    if channels not in allowed_channels:
+        raise ValueError(
+            f"color space {config.color_space} requires "
+            f"{'/'.join(str(value) for value in allowed_channels)} channels, "
+            f"found {channels}"
+        )
+    if config.color_space == "GRAY":
+        gray_work = frame
+    elif config.color_space == "RGB":
+        conversion = (
+            cv2.COLOR_RGB2GRAY
+            if channels == 3
+            else cv2.COLOR_RGBA2GRAY
+        )
+        gray_work = cv2.cvtColor(frame, conversion)
+    elif config.color_space == "RGBA":
+        gray_work = cv2.cvtColor(frame, cv2.COLOR_RGBA2GRAY)
+    elif config.color_space == "BGR":
+        conversion = (
+            cv2.COLOR_BGR2GRAY
+            if channels == 3
+            else cv2.COLOR_BGRA2GRAY
+        )
+        gray_work = cv2.cvtColor(frame, conversion)
     else:
-        gray = frame
-    gray_work = cv2.resize(
-        gray,
-        config.work_size,
-        interpolation=cv2.INTER_AREA,
-    )
-    intrinsics = scale_intrinsics(
-        camera.K,
-        camera.image_size,
-        config.work_size,
-    )
-    gray_work = cv2.undistort(
-        gray_work,
-        intrinsics,
-        camera.dist,
-        None,
-        intrinsics,
-    )
+        gray_work = cv2.cvtColor(frame, cv2.COLOR_BGRA2GRAY)
     float_gray = gray_work.astype(np.float32)
     gx = cv2.Sobel(float_gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(float_gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -376,24 +385,45 @@ def _work_gradients(
     gx = cv2.GaussianBlur(gx, (window, window), 0)
     gy = cv2.GaussianBlur(gy, (window, window), 0)
     magnitude = cv2.magnitude(gx, gy)
-    positive = magnitude[magnitude > 1e-6]
-    if not len(positive):
+    width, height = config.work_size
+    x0, y0, x1, y1 = roi_work_xyxy
+    ix0 = max(0, int(np.floor(x0)))
+    iy0 = max(0, int(np.floor(y0)))
+    ix1 = min(width, int(np.ceil(x1)))
+    iy1 = min(height, int(np.ceil(y1)))
+    if ix1 <= ix0 or iy1 <= iy0:
+        raise ValueError("gradient ROI must intersect the work frame")
+    roi_mask = np.zeros((height, width), dtype=bool)
+    roi_mask[iy0:iy1, ix0:ix1] = True
+    above_floor = roi_mask & (
+        magnitude >= float(config.gradient_noise_floor)
+    )
+    if not np.any(above_floor):
         zeros = np.zeros_like(magnitude, dtype=np.float32)
         return zeros, zeros.copy(), zeros.copy()
-    normalizer = max(float(np.percentile(positive, 90.0)), 1e-6)
+    floor = float(config.gradient_noise_floor)
+    normalizer = max(
+        float(np.percentile(magnitude[above_floor], 90.0)),
+        floor + 1e-6,
+    )
     unit_x = np.divide(
         gx,
         magnitude,
         out=np.zeros_like(gx),
-        where=magnitude > 1e-6,
+        where=above_floor,
     )
     unit_y = np.divide(
         gy,
         magnitude,
         out=np.zeros_like(gy),
-        where=magnitude > 1e-6,
+        where=above_floor,
     )
-    strength = np.clip(magnitude / normalizer, 0.0, 1.0)
+    strength = np.zeros_like(magnitude, dtype=np.float32)
+    strength[above_floor] = np.clip(
+        (magnitude[above_floor] - floor) / (normalizer - floor),
+        0.0,
+        1.0,
+    )
     return (
         unit_x.astype(np.float32),
         unit_y.astype(np.float32),
@@ -473,13 +503,15 @@ def _curve_normal_field(
 
 def _gradient_normal_agreement(
     image: np.ndarray,
-    camera: Camera,
+    coordinates: ObservationCoordinates,
     curves: Mapping[str, np.ndarray],
+    roi_work_xyxy: tuple[float, float, float, float],
     config: NasalObservationConfig,
 ) -> np.ndarray:
     gradient_x, gradient_y, strength = _work_gradients(
         image,
-        camera,
+        coordinates,
+        roi_work_xyxy,
         config,
     )
     normal_x, normal_y = _curve_normal_field(curves, config.work_size)
@@ -503,7 +535,7 @@ def _confidence_field(
                 cv2.distanceTransform(
                     np.asarray(~variant, dtype=np.uint8),
                     cv2.DIST_L2,
-                    5,
+                    cv2.DIST_MASK_PRECISE,
                 )
             )
         else:
@@ -545,23 +577,24 @@ def _confidence_field(
 
 
 def _coordinate_metadata(
-    camera: Camera,
+    coordinates: ObservationCoordinates,
     canvas_shape: tuple[int, int],
-    work_size: tuple[int, int],
+    color_space: str,
 ) -> dict[str, Any]:
-    return {
-        "source_pixel_frame": "distorted_original_px",
-        "mask_pixel_frame": "letterbox_canvas_px",
-        "observation_pixel_frame": "undistorted_work_px",
-        "distance_field": "unsigned_truncated_euclidean_px",
-        "aggregate_distance_field_usage": "display_only",
-        "original_size_wh": list(camera.image_size),
-        "mask_canvas_shape_hw": list(canvas_shape),
-        "work_size_wh": list(work_size),
-        "conversion_source": (
-            "src.geometry.profile_silhouette_extrema"
+    metadata = coordinates.metadata()
+    metadata.update({
+        "mask_pixel_layout": (
+            "original"
+            if tuple(canvas_shape)
+            == (coordinates.original_size[1], coordinates.original_size[0])
+            else "square_letterbox"
         ),
-    }
+        "distance_field": "unsigned_truncated_precise_euclidean_work_px",
+        "aggregate_distance_field_usage": "display_only",
+        "mask_canvas_shape_hw": list(canvas_shape),
+        "color_space": color_space,
+    })
+    return metadata
 
 
 def _camera_metadata(camera: Camera, semantic_view: str) -> dict[str, Any]:
@@ -590,6 +623,7 @@ def _make_observation(
     *,
     semantic_view: str,
     camera: Camera,
+    coordinates: ObservationCoordinates,
     canvas_shape: tuple[int, int],
     roi_work_xyxy: tuple[float, float, float, float],
     curves: Mapping[str, np.ndarray],
@@ -634,13 +668,19 @@ def _make_observation(
             if name != "base"
         ],
         distance_field,
-        _gradient_normal_agreement(image, camera, curves, config),
+        _gradient_normal_agreement(
+            image,
+            coordinates,
+            curves,
+            roi_work_xyxy,
+            config,
+        ),
         config,
     )
     coordinate_metadata = _coordinate_metadata(
-        camera,
+        coordinates,
         canvas_shape,
-        config.work_size,
+        config.color_space,
     )
     if coordinate_extras:
         coordinate_metadata.update(dict(coordinate_extras))
@@ -671,28 +711,15 @@ def _make_observation(
 
 
 def _front_alar_curves(
-    binary: np.ndarray,
-    camera: Camera,
-    centerline_x_original: float,
+    binary_work: np.ndarray,
+    centerline_x_work: float,
     config: NasalObservationConfig,
 ) -> dict[str, np.ndarray]:
-    contour_canvas = _external_contour_canvas(binary, name="nose mask")
-    contour_work = _canvas_contour_to_work(
-        contour_canvas,
-        camera,
-        binary.shape,
-        config.work_size,
+    contour_work = external_contour_work(
+        binary_work,
+        name="nose mask",
+        spacing_work_px=1.0,
     )
-    center_y_original = 0.5 * camera.image_size[1]
-    center_work = _undistort_work_points(
-        _original_to_work(
-            ((centerline_x_original, center_y_original),),
-            camera.image_size,
-            config.work_size,
-        ),
-        camera,
-        config.work_size,
-    )[0, 0]
     y_min = float(np.min(contour_work[:, 1]))
     y_max = float(np.max(contour_work[:, 1]))
     lower_fraction, upper_fraction = config.front_alar_vertical_fraction
@@ -707,8 +734,8 @@ def _front_alar_curves(
     subject_right = []
     for row in np.unique(rows):
         row_points = local[rows == row]
-        left_candidates = row_points[row_points[:, 0] > center_work]
-        right_candidates = row_points[row_points[:, 0] < center_work]
+        left_candidates = row_points[row_points[:, 0] > centerline_x_work]
+        right_candidates = row_points[row_points[:, 0] < centerline_x_work]
         if len(left_candidates):
             subject_left.append(
                 left_candidates[int(np.argmax(left_candidates[:, 0]))]
@@ -718,8 +745,14 @@ def _front_alar_curves(
                 right_candidates[int(np.argmin(right_candidates[:, 0]))]
             )
     curves = {
-        "subject-left-alar": np.asarray(subject_left, dtype=np.float64).reshape(-1, 2),
-        "subject-right-alar": np.asarray(subject_right, dtype=np.float64).reshape(-1, 2),
+        "subject-left-alar": resample_polyline_by_arclength(
+            np.asarray(subject_left, dtype=np.float64).reshape(-1, 2),
+            spacing_px=1.0,
+        ),
+        "subject-right-alar": resample_polyline_by_arclength(
+            np.asarray(subject_right, dtype=np.float64).reshape(-1, 2),
+            spacing_px=1.0,
+        ),
     }
     for name, points in curves.items():
         if len(points) < config.min_boundary_points:
@@ -731,24 +764,30 @@ def build_front_nasal_observation(
     image: np.ndarray,
     semantic_nose_mask: np.ndarray,
     camera: Camera,
+    coordinates: ObservationCoordinates,
     *,
     centerline_x_original: float,
     config: NasalObservationConfig | None = None,
 ) -> NasalViewObservation:
     """Extract subject-left/right alar evidence from a semantic nose mask."""
     limits = config or NasalObservationConfig()
-    frame = _validate_image(image, camera)
+    _validate_coordinates(camera, coordinates, limits)
+    frame = _validate_image(image, camera, coordinates)
     if nasal_view_for_camera(camera) != "front":
         raise ValueError("front nasal observation requires camera2/front")
     centerline = float(centerline_x_original)
     if not np.isfinite(centerline) or not 0.0 <= centerline < camera.image_size[0]:
         raise ValueError("front nasal centerline must lie inside image bounds")
-    binary = _validate_mask(
+    binary_work = normalize_mask_to_work(
         semantic_nose_mask,
-        camera,
+        coordinates,
         name="nose mask",
     )
-    curves = _front_alar_curves(binary, camera, centerline, limits)
+    centerline_work = original_points_to_work(
+        ((centerline, 0.5 * camera.image_size[1]),),
+        coordinates,
+    )[0, 0]
+    curves = _front_alar_curves(binary_work, centerline_work, limits)
     variant_curves: dict[str, Mapping[str, np.ndarray]] = {
         "base": curves,
     }
@@ -756,12 +795,11 @@ def build_front_nasal_observation(
         ("eroded", -limits.mask_perturbation_px),
         ("dilated", limits.mask_perturbation_px),
     ):
-        variant = _mask_variant(binary, offset)
+        variant = mask_variant_work(binary_work, offset)
         try:
             variant_curves[name] = _front_alar_curves(
                 variant,
-                camera,
-                centerline,
+                centerline_work,
                 limits,
             )
         except ValueError:
@@ -776,7 +814,8 @@ def build_front_nasal_observation(
     return _make_observation(
         semantic_view="front",
         camera=camera,
-        canvas_shape=binary.shape,
+        coordinates=coordinates,
+        canvas_shape=np.asarray(semantic_nose_mask).shape[:2],
         roi_work_xyxy=roi,
         curves=curves,
         variant_curves=variant_curves,
@@ -804,8 +843,7 @@ def _validate_profile_roi(
 
 def _named_points_work(
     points_original: Mapping[str, Any],
-    camera: Camera,
-    config: NasalObservationConfig,
+    coordinates: ObservationCoordinates,
     *,
     label: str,
 ) -> dict[str, np.ndarray]:
@@ -823,7 +861,7 @@ def _named_points_work(
     ).reshape(-1, 2)
     if not np.isfinite(original).all():
         raise ValueError(f"{label} points must be finite")
-    width, height = camera.image_size
+    width, height = coordinates.original_size
     if np.any(
         (original[:, 0] < 0.0)
         | (original[:, 0] >= width)
@@ -831,11 +869,7 @@ def _named_points_work(
         | (original[:, 1] >= height)
     ):
         raise ValueError(f"{label} points must lie inside image bounds")
-    work = _undistort_work_points(
-        _original_to_work(original, camera.image_size, config.work_size),
-        camera,
-        config.work_size,
-    )
+    work = original_points_to_work(original, coordinates)
     return {
         name: work[index]
         for index, name in enumerate(PROFILE_PRIOR_NAMES)
@@ -844,19 +878,14 @@ def _named_points_work(
 
 def _roi_original_to_work(
     roi_original_xyxy: tuple[float, float, float, float],
-    camera: Camera,
-    work_size: tuple[int, int],
+    coordinates: ObservationCoordinates,
 ) -> tuple[float, float, float, float]:
     x0, y0, x1, y1 = roi_original_xyxy
     corners = np.asarray(
         ((x0, y0), (x1, y0), (x1, y1), (x0, y1)),
         dtype=np.float64,
     )
-    work = _undistort_work_points(
-        _original_to_work(corners, camera.image_size, work_size),
-        camera,
-        work_size,
-    )
+    work = original_points_to_work(corners, coordinates)
     return (
         float(np.min(work[:, 0])),
         float(np.min(work[:, 1])),
@@ -912,12 +941,15 @@ def _epipolar_lines_work(
     front_anchors_work: Mapping[str, np.ndarray],
     front_camera: Camera,
     side_camera: Camera,
+    front_coordinates: ObservationCoordinates,
+    side_coordinates: ObservationCoordinates,
     config: NasalObservationConfig,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    fundamental = _fundamental_matrix_work(
+    fundamental = fundamental_matrix_work(
         front_camera,
         side_camera,
-        config.work_size,
+        front_coordinates,
+        side_coordinates,
     )
     anchor_values, samples = _sample_named_curve(
         front_anchors_work,
@@ -964,81 +996,131 @@ def _ordered_epipolar_candidate(
     np.ndarray,
     np.ndarray,
 ] | None:
-    curve = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    anchor_indices = np.asarray(
-        [
-            int(np.argmin(_point_line_distances(curve, named_lines[name])))
-            for name in PROFILE_PRIOR_NAMES
-        ],
-        dtype=np.int32,
-    )
-    anchor_errors = np.asarray(
-        [
-            float(
-                _point_line_distances(
-                    curve[anchor_indices[index]].reshape(1, 2),
-                    named_lines[name],
-                )[0]
+    source_curve = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(source_curve) < len(PROFILE_PRIOR_NAMES):
+        return None
+
+    def solve(
+        curve: np.ndarray,
+    ) -> tuple[float, np.ndarray, np.ndarray, np.ndarray] | None:
+        epipolar_errors = np.asarray(
+            [
+                point_line_distances(curve, named_lines[name])
+                for name in PROFILE_PRIOR_NAMES
+            ],
+            dtype=np.float64,
+        )
+        prior_errors = np.asarray(
+            [
+                np.linalg.norm(curve - side_prior_work[name], axis=1)
+                for name in PROFILE_PRIOR_NAMES
+            ],
+            dtype=np.float64,
+        )
+        eligible = (
+            epipolar_errors <= float(config.max_epipolar_distance_px)
+        ) & (
+            prior_errors <= float(config.max_side_prior_distance_px)
+        )
+        costs = (
+            epipolar_errors / float(config.max_epipolar_distance_px)
+            + prior_errors / float(config.max_side_prior_distance_px)
+        )
+        costs[~eligible] = np.inf
+        anchor_count, point_count = costs.shape
+        dynamic = np.full((anchor_count, point_count), np.inf)
+        previous = np.full((anchor_count, point_count), -1, dtype=np.int32)
+        dynamic[0] = costs[0]
+        for anchor_index in range(1, anchor_count):
+            best_cost = np.inf
+            best_point = -1
+            for point_index in range(point_count):
+                predecessor = point_index - 1
+                if (
+                    predecessor >= 0
+                    and dynamic[anchor_index - 1, predecessor] < best_cost
+                ):
+                    best_cost = dynamic[anchor_index - 1, predecessor]
+                    best_point = predecessor
+                if np.isfinite(costs[anchor_index, point_index]) and np.isfinite(
+                    best_cost
+                ):
+                    dynamic[anchor_index, point_index] = (
+                        best_cost + costs[anchor_index, point_index]
+                    )
+                    previous[anchor_index, point_index] = best_point
+
+        for end_index in np.argsort(dynamic[-1]):
+            total_cost = float(dynamic[-1, end_index])
+            if not np.isfinite(total_cost):
+                break
+            indices = np.empty(anchor_count, dtype=np.int32)
+            indices[-1] = int(end_index)
+            for anchor_index in range(anchor_count - 1, 0, -1):
+                indices[anchor_index - 1] = previous[
+                    anchor_index,
+                    indices[anchor_index],
+                ]
+            if indices[0] < 0:
+                continue
+            if int(indices[-1] - indices[0] + 1) < config.min_boundary_points:
+                continue
+            rows = np.arange(anchor_count)
+            return (
+                total_cost,
+                indices,
+                epipolar_errors[rows, indices],
+                prior_errors[rows, indices],
             )
-            for index, name in enumerate(PROFILE_PRIOR_NAMES)
-        ],
-        dtype=np.float64,
+        return None
+
+    solutions = []
+    for reversed_order, curve in (
+        (False, source_curve),
+        (True, source_curve[::-1].copy()),
+    ):
+        solution = solve(curve)
+        if solution is not None:
+            solutions.append((solution[0], reversed_order, curve, *solution[1:]))
+    if not solutions:
+        return None
+    _score, _reversed, curve, indices, anchor_errors, prior_errors = min(
+        solutions,
+        key=lambda item: float(item[0]),
     )
-    if np.any(anchor_errors > float(config.max_epipolar_distance_px)):
-        return None
-    if np.all(np.diff(anchor_indices) <= 0):
-        curve = curve[::-1].copy()
-        anchor_indices = len(curve) - 1 - anchor_indices
-    if np.any(np.diff(anchor_indices) < 0):
-        return None
-    start = int(anchor_indices[0])
-    stop = int(anchor_indices[-1]) + 1
-    curve = curve[start:stop]
-    anchor_indices = anchor_indices - start
-    if len(curve) < config.min_boundary_points:
-        return None
+    start = int(indices[0])
+    stop = int(indices[-1]) + 1
+    trimmed = curve[start:stop].copy()
+    trimmed_indices = indices - start
     anchors = {
-        name: curve[int(anchor_indices[index])]
+        name: trimmed[int(trimmed_indices[index])]
         for index, name in enumerate(PROFILE_PRIOR_NAMES)
     }
-    prior_errors = np.asarray(
-        [
-            float(
-                np.linalg.norm(
-                    anchors[name] - side_prior_work[name]
-                )
-            )
-            for name in PROFILE_PRIOR_NAMES
-        ],
-        dtype=np.float64,
-    )
-    if np.any(
-        prior_errors > float(config.max_side_prior_distance_px)
-    ):
-        return None
-    return curve, anchors, anchor_errors, prior_errors
+    return trimmed, anchors, anchor_errors, prior_errors
 
 
 def _profile_curve_from_epipolar(
-    binary: np.ndarray,
+    binary_work: np.ndarray,
     camera: Camera,
     front_camera: Camera,
+    side_coordinates: ObservationCoordinates,
+    front_coordinates: ObservationCoordinates,
     front_anchors_work: Mapping[str, np.ndarray],
     side_prior_work: Mapping[str, np.ndarray],
     roi_work_xyxy: tuple[float, float, float, float] | None,
     config: NasalObservationConfig,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, Any]]:
-    contour_canvas = _external_contour_canvas(binary, name="face mask")
-    contour_work = _canvas_contour_to_work(
-        contour_canvas,
-        camera,
-        binary.shape,
-        config.work_size,
+    contour_work = external_contour_work(
+        binary_work,
+        name="face mask",
+        spacing_work_px=1.0,
     )
     named_lines, sampled_lines = _epipolar_lines_work(
         front_anchors_work,
         front_camera,
         camera,
+        front_coordinates,
+        side_coordinates,
         config,
     )
     distances = _line_distance_matrix(contour_work, sampled_lines)
@@ -1092,7 +1174,7 @@ def _profile_curve_from_epipolar(
         )
 
     contour_center = np.mean(contour_work, axis=0)
-    curvature = _contour_curvature(contour_work)
+    curvature = contour_curvature(contour_work)
     candidates = []
     for run in runs:
         ordered = _ordered_epipolar_candidate(
@@ -1184,6 +1266,7 @@ def build_profile_nasal_observation(
     side_view: str,
     side_prior_original: Mapping[str, Any],
     *,
+    coordinates_by_view: Mapping[str, ObservationCoordinates],
     roi_original_xyxy: tuple[float, float, float, float] | None = None,
     config: NasalObservationConfig | None = None,
 ) -> NasalViewObservation:
@@ -1197,23 +1280,38 @@ def build_profile_nasal_observation(
         raise ValueError(f"fixed rig is missing front or {side_view} camera")
     camera = rig.cameras_by_view[side_view]
     front_camera = rig.cameras_by_view["front"]
-    frame = _validate_image(image, camera)
+    missing_coordinates = [
+        view for view in ("front", side_view)
+        if view not in coordinates_by_view
+    ]
+    if missing_coordinates:
+        raise ValueError(
+            "nasal coordinate contracts are missing views: "
+            + ", ".join(missing_coordinates)
+        )
+    side_coordinates = coordinates_by_view[side_view]
+    front_coordinates = coordinates_by_view["front"]
+    _validate_coordinates(camera, side_coordinates, limits)
+    _validate_coordinates(front_camera, front_coordinates, limits)
+    frame = _validate_image(image, camera, side_coordinates)
     semantic_view = nasal_view_for_camera(camera)
     if semantic_view not in {"subject-left", "subject-right"}:
         raise ValueError("profile nasal observation requires camera1 or camera3")
-    binary = _validate_mask(face_mask, camera, name="face mask")
+    binary_work = normalize_mask_to_work(
+        face_mask,
+        side_coordinates,
+        name="face mask",
+    )
     if nasal_view_for_camera(front_camera) != "front":
         raise ValueError("fixed rig front camera must be camera2/front")
     front_anchors_work = _named_points_work(
         front_anchors_original,
-        front_camera,
-        limits,
+        front_coordinates,
         label="front nasal anchors",
     )
     side_prior_work = _named_points_work(
         side_prior_original,
-        camera,
-        limits,
+        side_coordinates,
         label="side nasal prior",
     )
     roi_work = (
@@ -1221,14 +1319,15 @@ def build_profile_nasal_observation(
         if roi_original_xyxy is None
         else _roi_original_to_work(
             _validate_profile_roi(roi_original_xyxy, camera),
-            camera,
-            limits.work_size,
+            side_coordinates,
         )
     )
     curve, anchors, selection_metadata = _profile_curve_from_epipolar(
-        binary,
+        binary_work,
         camera,
         front_camera,
+        side_coordinates,
+        front_coordinates,
         front_anchors_work,
         side_prior_work,
         roi_work,
@@ -1241,13 +1340,15 @@ def build_profile_nasal_observation(
         ("eroded", -limits.mask_perturbation_px),
         ("dilated", limits.mask_perturbation_px),
     ):
-        variant = _mask_variant(binary, offset)
+        variant = mask_variant_work(binary_work, offset)
         try:
             candidate, _candidate_anchors, _candidate_metadata = (
                 _profile_curve_from_epipolar(
                     variant,
                     camera,
                     front_camera,
+                    side_coordinates,
+                    front_coordinates,
                     front_anchors_work,
                     side_prior_work,
                     roi_work,
@@ -1264,7 +1365,8 @@ def build_profile_nasal_observation(
     return _make_observation(
         semantic_view=semantic_view,
         camera=camera,
-        canvas_shape=binary.shape,
+        coordinates=side_coordinates,
+        canvas_shape=np.asarray(face_mask).shape[:2],
         roi_work_xyxy=observation_roi,
         curves={"nasal-profile": curve},
         variant_curves=variant_curves,
@@ -1283,6 +1385,7 @@ def build_multiview_nasal_observations(
     front_anchors_original: Mapping[str, Any],
     side_priors_original: Mapping[str, Mapping[str, Any]],
     *,
+    coordinates_by_view: Mapping[str, ObservationCoordinates],
     centerline_x_original: float,
     side_rois_original: (
         Mapping[str, tuple[float, float, float, float]] | None
@@ -1298,6 +1401,15 @@ def build_multiview_nasal_observations(
     if missing_images:
         raise ValueError(
             "nasal images are missing views: " + ", ".join(missing_images)
+        )
+    missing_coordinates = [
+        view for view in ("left", "front", "right")
+        if view not in coordinates_by_view
+    ]
+    if missing_coordinates:
+        raise ValueError(
+            "nasal coordinate contracts are missing views: "
+            + ", ".join(missing_coordinates)
         )
     missing_masks = [
         view for view in ("left", "right")
@@ -1323,6 +1435,7 @@ def build_multiview_nasal_observations(
         images_by_view["front"],
         front_semantic_nose_mask,
         front_camera,
+        coordinates_by_view["front"],
         centerline_x_original=centerline_x_original,
         config=limits,
     )
@@ -1335,6 +1448,7 @@ def build_multiview_nasal_observations(
             front_anchors_original,
             side_view,
             side_priors_original[side_view],
+            coordinates_by_view=coordinates_by_view,
             roi_original_xyxy=(
                 None
                 if side_rois_original is None

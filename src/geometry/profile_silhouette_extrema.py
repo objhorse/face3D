@@ -8,10 +8,19 @@ from typing import Any, Mapping
 import cv2
 import numpy as np
 
-from src.cross_view_geometry import (
-    Camera,
-    relative_camera_transform,
-    scale_intrinsics,
+from src.cross_view_geometry import Camera
+from src.geometry.observation_coordinates import (
+    ObservationCoordinates,
+    canvas_points_to_original,
+    contour_curvature,
+    external_contour_work,
+    fundamental_matrix_work,
+    mask_variant_work,
+    normalize_mask_to_work,
+    original_points_to_canvas,
+    original_points_to_work,
+    point_line_distances,
+    work_points_to_original,
 )
 from src.geometry.profile_triangulation import (
     ProfileRig,
@@ -30,215 +39,13 @@ class SilhouetteExtremumThresholds:
     max_epipolar_distance_work_px: float = 5.0
     nose_prior_radius_work_px: float = 48.0
     chin_prior_radius_work_px: float = 58.0
-    mask_variant_offsets_px: tuple[int, ...] = (-2, 0, 2)
+    mask_variant_offsets_work_px: tuple[int, ...] = (-2, 0, 2)
     max_variant_spread_work_px: float = 5.0
     max_variant_depth_spread_m: float = 0.006
     max_cross_side_depth_delta_m: float = 0.010
     min_valid_mask_variants: int = 2
     min_depth_m: float = 0.12
     max_depth_m: float = 1.50
-
-
-def _largest_binary_component(mask: np.ndarray) -> np.ndarray:
-    binary = np.asarray(mask > 0, dtype=np.uint8)
-    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary)
-    if count <= 1:
-        return binary
-    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    return np.asarray(labels == largest, dtype=np.uint8)
-
-
-def _letterbox_parameters(
-    image_size: tuple[int, int],
-    canvas_shape: tuple[int, int],
-) -> tuple[float, int, int]:
-    image_width, image_height = (int(value) for value in image_size)
-    canvas_height, canvas_width = (int(value) for value in canvas_shape)
-    if min(image_width, image_height, canvas_width, canvas_height) <= 0:
-        raise ValueError("image and canvas dimensions must be positive")
-    scale = min(
-        canvas_width / float(image_width),
-        canvas_height / float(image_height),
-    )
-    resized_width = int(image_width * scale)
-    resized_height = int(image_height * scale)
-    x_offset = (canvas_width - resized_width) // 2
-    y_offset = (canvas_height - resized_height) // 2
-    return float(scale), int(x_offset), int(y_offset)
-
-
-def canvas_points_to_original(
-    points: Any,
-    image_size: tuple[int, int],
-    canvas_shape: tuple[int, int],
-) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    scale, x_offset, y_offset = _letterbox_parameters(image_size, canvas_shape)
-    result = values.copy()
-    result[:, 0] = (result[:, 0] - x_offset) / scale
-    result[:, 1] = (result[:, 1] - y_offset) / scale
-    return result
-
-
-def original_points_to_canvas(
-    points: Any,
-    image_size: tuple[int, int],
-    canvas_shape: tuple[int, int],
-) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    scale, x_offset, y_offset = _letterbox_parameters(image_size, canvas_shape)
-    result = values * scale
-    result[:, 0] += x_offset
-    result[:, 1] += y_offset
-    return result
-
-
-def _original_to_work(
-    points: Any,
-    image_size: tuple[int, int],
-    work_size: tuple[int, int],
-) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    return values * np.asarray(
-        (
-            work_size[0] / float(image_size[0]),
-            work_size[1] / float(image_size[1]),
-        ),
-        dtype=np.float64,
-    )
-
-
-def _work_to_original(
-    points: Any,
-    image_size: tuple[int, int],
-    work_size: tuple[int, int],
-) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    return values * np.asarray(
-        (
-            image_size[0] / float(work_size[0]),
-            image_size[1] / float(work_size[1]),
-        ),
-        dtype=np.float64,
-    )
-
-
-def _undistort_work_points(
-    points: Any,
-    camera: Camera,
-    work_size: tuple[int, int],
-) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    intrinsics = scale_intrinsics(camera.K, camera.image_size, work_size)
-    return cv2.undistortPoints(
-        values.reshape(-1, 1, 2),
-        intrinsics,
-        camera.dist,
-        P=intrinsics,
-    ).reshape(-1, 2)
-
-
-def _fundamental_matrix_work(
-    front_camera: Camera,
-    side_camera: Camera,
-    work_size: tuple[int, int],
-) -> np.ndarray:
-    front_intrinsics = scale_intrinsics(
-        front_camera.K, front_camera.image_size, work_size
-    )
-    side_intrinsics = scale_intrinsics(
-        side_camera.K, side_camera.image_size, work_size
-    )
-    rotation, translation = relative_camera_transform(front_camera, side_camera)
-    tx, ty, tz = np.asarray(translation, dtype=np.float64).reshape(3)
-    skew = np.array(
-        ((0.0, -tz, ty), (tz, 0.0, -tx), (-ty, tx, 0.0)),
-        dtype=np.float64,
-    )
-    return np.linalg.inv(side_intrinsics).T @ skew @ rotation @ np.linalg.inv(
-        front_intrinsics
-    )
-
-
-def _point_line_distances(points: np.ndarray, line: np.ndarray) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    a, b, c = np.asarray(line, dtype=np.float64).reshape(3)
-    denominator = float(np.hypot(a, b))
-    if denominator <= 1e-12:
-        return np.full(len(values), np.inf, dtype=np.float64)
-    return np.abs(values[:, 0] * a + values[:, 1] * b + c) / denominator
-
-
-def _contour_curvature(points: np.ndarray) -> np.ndarray:
-    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
-    count = len(values)
-    if count < 7:
-        return np.zeros(count, dtype=np.float64)
-    stride = max(2, min(12, count // 150))
-    previous = values[np.arange(count) - stride]
-    following = values[(np.arange(count) + stride) % count]
-    first = values - previous
-    second = following - values
-    first /= np.maximum(np.linalg.norm(first, axis=1, keepdims=True), 1e-9)
-    second /= np.maximum(np.linalg.norm(second, axis=1, keepdims=True), 1e-9)
-    return np.clip(1.0 - np.sum(first * second, axis=1), 0.0, 2.0)
-
-
-def _mask_variant(mask: np.ndarray, offset_px: int) -> np.ndarray:
-    binary = _largest_binary_component(mask)
-    amount = abs(int(offset_px))
-    if amount == 0:
-        return binary
-    kernel_size = 2 * amount + 1
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (kernel_size, kernel_size),
-    )
-    operation = cv2.MORPH_DILATE if offset_px > 0 else cv2.MORPH_ERODE
-    return cv2.morphologyEx(binary, operation, kernel)
-
-
-def _profile_contour_work(
-    mask: np.ndarray,
-    camera: Camera,
-    work_size: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    binary = _largest_binary_component(mask)
-    contours, _hierarchy = cv2.findContours(
-        binary,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE,
-    )
-    if not contours:
-        raise ValueError("face mask has no external contour")
-    contour_canvas = max(contours, key=cv2.contourArea).reshape(-1, 2)
-    contour_original = canvas_points_to_original(
-        contour_canvas,
-        camera.image_size,
-        binary.shape,
-    )
-    width, height = camera.image_size
-    valid = (
-        (contour_original[:, 0] >= 0.0)
-        & (contour_original[:, 0] < width)
-        & (contour_original[:, 1] >= 0.0)
-        & (contour_original[:, 1] < height)
-    )
-    contour_original = contour_original[valid]
-    contour_canvas = contour_canvas[valid]
-    if len(contour_original) < 16:
-        raise ValueError("face contour has too little valid support")
-    contour_work_distorted = _original_to_work(
-        contour_original,
-        camera.image_size,
-        work_size,
-    )
-    contour_work = _undistort_work_points(
-        contour_work_distorted,
-        camera,
-        work_size,
-    )
-    return contour_canvas.astype(np.float64), contour_work
 
 
 def _select_contour_candidate(
@@ -253,27 +60,51 @@ def _select_contour_candidate(
 ) -> dict[str, Any]:
     if semantic_name not in SUPPORTED_EXTREMA:
         raise ValueError(f"unsupported silhouette extremum: {semantic_name}")
-    fundamental = _fundamental_matrix_work(
+    front_coordinates = ObservationCoordinates.from_camera(
+        front_camera,
+        work_size=thresholds.work_size,
+        pixel_frame="undistorted",
+    )
+    side_coordinates = ObservationCoordinates.from_camera(
+        side_camera,
+        work_size=thresholds.work_size,
+        pixel_frame="distorted",
+    )
+    fundamental = fundamental_matrix_work(
         front_camera,
         side_camera,
-        thresholds.work_size,
+        front_coordinates,
+        side_coordinates,
     )
     line = fundamental @ np.append(front_anchor_work, 1.0)
-    epipolar_distance = _point_line_distances(contour_work, line)
+    epipolar_distance = point_line_distances(contour_work, line)
     prior_distance = np.linalg.norm(contour_work - side_prior_work, axis=1)
     prior_radius = (
         thresholds.nose_prior_radius_work_px
         if semantic_name == "nose_tip"
         else thresholds.chin_prior_radius_work_px
     )
-    eligible = prior_distance <= float(prior_radius)
-    if not np.any(eligible):
+    prior_eligible = prior_distance <= float(prior_radius)
+    if not np.any(prior_eligible):
         return {
             "passed": False,
             "issues": ["no_contour_support_in_semantic_roi"],
             "epipolar_line_work": line.astype(float).tolist(),
         }
-    curvature = _contour_curvature(contour_work)
+    eligible = prior_eligible & (
+        epipolar_distance
+        <= float(thresholds.max_epipolar_distance_work_px)
+    )
+    if not np.any(eligible):
+        return {
+            "passed": False,
+            "issues": ["no_legal_contour_support_on_epipolar_line"],
+            "epipolar_line_work": line.astype(float).tolist(),
+            "prior_eligible_contour_points": int(
+                np.count_nonzero(prior_eligible)
+            ),
+        }
+    curvature = contour_curvature(contour_work)
     curvature_scale = max(
         float(np.percentile(curvature[eligible], 90.0)),
         1e-6,
@@ -298,14 +129,9 @@ def _select_contour_candidate(
         score = 0.50 * epipolar_normalized + 0.50 * prior_normalized
     score[~eligible] = np.inf
     index = int(np.argmin(score))
-    issues: list[str] = []
-    if epipolar_distance[index] > float(
-        thresholds.max_epipolar_distance_work_px
-    ):
-        issues.append("silhouette_epipolar_distance_exceeded")
     return {
-        "passed": not issues,
-        "issues": issues,
+        "passed": True,
+        "issues": [],
         "selected_index": index,
         "selected_work_px": contour_work[index].astype(float).tolist(),
         "epipolar_distance_work_px": float(epipolar_distance[index]),
@@ -326,10 +152,15 @@ def _triangulate_front_side(
     thresholds: SilhouetteExtremumThresholds,
 ) -> dict[str, Any]:
     side_camera = rig.cameras_by_view[side_view]
-    side_point_original = _work_to_original(
+    side_coordinates = ObservationCoordinates.from_camera(
+        side_camera,
+        work_size=thresholds.work_size,
+        pixel_frame="distorted",
+    )
+    side_point_original = work_points_to_original(
         side_point_work,
-        side_camera.image_size,
-        thresholds.work_size,
+        side_coordinates,
+        target_pixel_frame="undistorted",
     ).reshape(2)
     triangle = triangulate_profile_point(
         {
@@ -366,34 +197,56 @@ def refine_profile_extremum(
         raise ValueError("side_view must be left or right")
     front_camera = rig.cameras_by_view["front"]
     side_camera = rig.cameras_by_view[side_view]
+    front_coordinates = ObservationCoordinates.from_camera(
+        front_camera,
+        work_size=limits.work_size,
+        pixel_frame="undistorted",
+    )
+    side_coordinates = ObservationCoordinates.from_camera(
+        side_camera,
+        work_size=limits.work_size,
+        pixel_frame="distorted",
+    )
     front_anchor_original = np.asarray(
         front_anchor_undistorted_px,
         dtype=np.float64,
     ).reshape(2)
-    front_anchor_work = _original_to_work(
+    front_anchor_work = original_points_to_work(
         front_anchor_original,
-        front_camera.image_size,
-        limits.work_size,
+        front_coordinates,
     ).reshape(2)
-    side_prior_work_distorted = _original_to_work(
+    side_prior_work = original_points_to_work(
         side_prior_distorted_px,
-        side_camera.image_size,
-        limits.work_size,
-    )
-    side_prior_work = _undistort_work_points(
-        side_prior_work_distorted,
-        side_camera,
-        limits.work_size,
+        side_coordinates,
     ).reshape(2)
 
+    try:
+        base_mask_work = normalize_mask_to_work(
+            face_mask,
+            side_coordinates,
+            name="face mask",
+        )
+        mask_error = None
+    except ValueError as exc:
+        base_mask_work = None
+        mask_error = str(exc)
     variants: list[dict[str, Any]] = []
-    for offset in limits.mask_variant_offsets_px:
-        variant_mask = _mask_variant(face_mask, int(offset))
+    for offset in limits.mask_variant_offsets_work_px:
+        if base_mask_work is None:
+            variants.append(
+                {
+                    "offset_work_px": int(offset),
+                    "passed": False,
+                    "issues": [f"contour_extraction_failed:{mask_error}"],
+                }
+            )
+            continue
         try:
-            contour_canvas, contour_work = _profile_contour_work(
+            variant_mask = mask_variant_work(base_mask_work, int(offset))
+            contour_work = external_contour_work(
                 variant_mask,
-                side_camera,
-                limits.work_size,
+                name="face mask",
+                spacing_work_px=1.0,
             )
             selection = _select_contour_candidate(
                 contour_work,
@@ -408,7 +261,19 @@ def refine_profile_extremum(
             triangle = None
             selected_canvas = None
             if selected_index is not None:
-                selected_canvas = contour_canvas[int(selected_index)]
+                selected_original = work_points_to_original(
+                    np.asarray(
+                        selection["selected_work_px"],
+                        dtype=np.float64,
+                    ),
+                    side_coordinates,
+                    target_pixel_frame="distorted",
+                )
+                selected_canvas = original_points_to_canvas(
+                    selected_original,
+                    side_camera.image_size,
+                    np.asarray(face_mask).shape[:2],
+                ).reshape(2)
                 triangle = _triangulate_front_side(
                     front_anchor_original,
                     np.asarray(selection["selected_work_px"], dtype=np.float64),
@@ -423,7 +288,7 @@ def refine_profile_extremum(
             )
             variants.append(
                 {
-                    "offset_px": int(offset),
+                    "offset_work_px": int(offset),
                     "passed": variant_passed,
                     "selection": selection,
                     "triangulation": triangle,
@@ -437,7 +302,7 @@ def refine_profile_extremum(
         except (ValueError, cv2.error) as exc:
             variants.append(
                 {
-                    "offset_px": int(offset),
+                    "offset_work_px": int(offset),
                     "passed": False,
                     "issues": [f"contour_extraction_failed:{exc}"],
                 }
@@ -487,7 +352,7 @@ def refine_profile_extremum(
         (
             item
             for item in valid_variants
-            if int(item["offset_px"]) == 0
+            if int(item["offset_work_px"]) == 0
         ),
         valid_variants[0] if valid_variants else None,
     )
@@ -662,6 +527,9 @@ def build_profile_silhouette_extrema(
         },
         "thresholds": {
             "work_size": list(limits.work_size),
+            "mask_variant_offsets_work_px": list(
+                limits.mask_variant_offsets_work_px
+            ),
             "max_epipolar_distance_work_px": float(
                 limits.max_epipolar_distance_work_px
             ),

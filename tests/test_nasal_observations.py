@@ -9,15 +9,17 @@ from src.cross_view_geometry import Camera
 from src.geometry.nasal_observations import (
     NasalObservationBundle,
     NasalObservationConfig,
-    build_front_nasal_observation,
-    build_multiview_nasal_observations,
-    build_profile_nasal_observation,
+    _ordered_epipolar_candidate,
+    build_front_nasal_observation as _build_front_nasal_observation,
+    build_multiview_nasal_observations as _build_multiview_nasal_observations,
+    build_profile_nasal_observation as _build_profile_nasal_observation,
     canvas_points_to_original,
     nasal_view_for_camera,
     original_points_to_canvas,
     original_points_to_work,
     work_points_to_original,
 )
+from src.geometry.observation_coordinates import ObservationCoordinates
 from src.geometry.profile_triangulation import ProfileRig
 
 
@@ -78,6 +80,87 @@ def _config() -> NasalObservationConfig:
         min_boundary_points=8,
         max_side_prior_distance_px=12.0,
         max_epipolar_distance_px=4.0,
+    )
+
+
+def _coordinates(
+    camera: Camera,
+    config: NasalObservationConfig,
+    *,
+    pixel_frame: str = "undistorted",
+) -> ObservationCoordinates:
+    return ObservationCoordinates.from_camera(
+        camera,
+        work_size=config.work_size,
+        pixel_frame=pixel_frame,
+    )
+
+
+def _rig_coordinates(
+    rig: ProfileRig,
+    config: NasalObservationConfig,
+) -> dict[str, ObservationCoordinates]:
+    return {
+        view: _coordinates(camera, config)
+        for view, camera in rig.cameras_by_view.items()
+    }
+
+
+def build_front_nasal_observation(
+    image,
+    mask,
+    camera,
+    *,
+    coordinates=None,
+    config=None,
+    **kwargs,
+):
+    limits = config or NasalObservationConfig()
+    contract = coordinates or _coordinates(camera, limits)
+    return _build_front_nasal_observation(
+        image,
+        mask,
+        camera,
+        contract,
+        config=limits,
+        **kwargs,
+    )
+
+
+def build_profile_nasal_observation(
+    image,
+    mask,
+    rig,
+    front_anchors,
+    side_view,
+    side_prior_original,
+    *,
+    coordinates_by_view=None,
+    config=None,
+    **kwargs,
+):
+    limits = config or NasalObservationConfig()
+    contracts = coordinates_by_view or _rig_coordinates(rig, limits)
+    return _build_profile_nasal_observation(
+        image,
+        mask,
+        rig,
+        front_anchors,
+        side_view,
+        side_prior_original,
+        coordinates_by_view=contracts,
+        config=limits,
+        **kwargs,
+    )
+
+
+def build_multiview_nasal_observations(*, coordinates_by_view=None, **kwargs):
+    limits = kwargs.get("config") or NasalObservationConfig()
+    rig = kwargs["rig"]
+    contracts = coordinates_by_view or _rig_coordinates(rig, limits)
+    return _build_multiview_nasal_observations(
+        coordinates_by_view=contracts,
+        **kwargs,
     )
 
 
@@ -149,6 +232,20 @@ def _profile_mask(side: str, *, jagged: bool = False) -> np.ndarray:
     return mask
 
 
+def _letterbox_mask(mask: np.ndarray, size: int) -> np.ndarray:
+    image_height, image_width = mask.shape[:2]
+    resized_height = int(image_height * size / image_width)
+    resized = cv2.resize(
+        mask,
+        (size, resized_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    canvas = np.zeros((size, size), dtype=np.uint8)
+    y0 = (size - resized_height) // 2
+    canvas[y0 : y0 + resized_height] = resized
+    return canvas
+
+
 def _profile_priors(side: str) -> dict[str, tuple[float, float]]:
     left = {
         "upper_tip": (59.0, 40.0),
@@ -180,8 +277,12 @@ def test_coordinate_spaces_round_trip_without_reimplementing_letterbox_logic():
     points = np.array([[0.0, 0.0], [80.0, 60.0], [159.0, 119.0]])
     canvas = original_points_to_canvas(points, (160, 120), (128, 128))
     restored = canvas_points_to_original(canvas, (160, 120), (128, 128))
-    work = original_points_to_work(points, (160, 120), (80, 60))
-    restored_from_work = work_points_to_original(work, (160, 120), (80, 60))
+    coordinates = _coordinates(
+        _camera("camera2", "front"),
+        NasalObservationConfig(work_size=(80, 60)),
+    )
+    work = original_points_to_work(points, coordinates)
+    restored_from_work = work_points_to_original(work, coordinates)
 
     assert restored == pytest.approx(points, abs=1e-8)
     assert restored_from_work == pytest.approx(points, abs=1e-8)
@@ -343,6 +444,229 @@ def test_strong_tangential_gradient_does_not_boost_confidence():
 
     assert normal_confidence > flat_confidence + 0.05
     assert tangential_confidence == pytest.approx(flat_confidence, abs=0.01)
+
+
+def test_rgb_is_default_and_bgr_requires_explicit_configuration():
+    camera = _camera("camera2", "front")
+    mask = _vertical_front_mask()
+    flat = np.zeros((120, 160, 3), dtype=np.uint8)
+    red_edge = flat.copy()
+    red_edge[..., 0] = mask
+    rgba_edge = np.dstack(
+        (red_edge, np.full(mask.shape, 255, dtype=np.uint8))
+    )
+    rgb_config = NasalObservationConfig(
+        **{
+            **_config().__dict__,
+            "gradient_noise_floor": 150.0,
+        }
+    )
+    bgr_config = NasalObservationConfig(
+        **{
+            **rgb_config.__dict__,
+            "color_space": "BGR",
+        }
+    )
+
+    flat_observation = build_front_nasal_observation(
+        flat,
+        mask,
+        camera,
+        centerline_x_original=80.0,
+        config=rgb_config,
+    )
+    rgb_observation = build_front_nasal_observation(
+        red_edge,
+        mask,
+        camera,
+        centerline_x_original=80.0,
+        config=rgb_config,
+    )
+    bgr_observation = build_front_nasal_observation(
+        red_edge,
+        mask,
+        camera,
+        centerline_x_original=80.0,
+        config=bgr_config,
+    )
+    rgba_observation = build_front_nasal_observation(
+        rgba_edge,
+        mask,
+        camera,
+        centerline_x_original=80.0,
+        config=rgb_config,
+    )
+
+    assert rgb_observation.coordinate_metadata["color_space"] == "RGB"
+    assert _boundary_confidence(rgba_observation) == pytest.approx(
+        _boundary_confidence(rgb_observation),
+        abs=0.01,
+    )
+    assert _boundary_confidence(rgb_observation) > _boundary_confidence(
+        flat_observation
+    ) + 0.03
+    assert _boundary_confidence(bgr_observation) == pytest.approx(
+        _boundary_confidence(flat_observation),
+        abs=0.01,
+    )
+
+
+def test_low_contrast_noise_does_not_raise_gradient_confidence():
+    camera = _camera("camera2", "front")
+    mask = _front_mask()
+    flat = np.full((120, 160, 3), 127, dtype=np.uint8)
+    rng = np.random.default_rng(7)
+    noise = rng.integers(-1, 2, size=flat.shape, dtype=np.int16)
+    noisy = np.clip(flat.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    observations = [
+        build_front_nasal_observation(
+            image,
+            mask,
+            camera,
+            centerline_x_original=76.0,
+            config=_config(),
+        )
+        for image in (flat, noisy)
+    ]
+
+    assert _boundary_confidence(observations[1]) == pytest.approx(
+        _boundary_confidence(observations[0]),
+        abs=0.01,
+    )
+
+
+def test_strong_edge_outside_nasal_roi_does_not_change_normalization():
+    camera = _camera("camera2", "front")
+    mask = _front_mask()
+    weak = np.zeros((120, 160, 3), dtype=np.uint8)
+    contour, _hierarchy = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    cv2.drawContours(weak, contour, -1, (24, 24, 24), 2)
+    outside = weak.copy()
+    outside[:, :8] = 255
+
+    observations = [
+        build_front_nasal_observation(
+            image,
+            mask,
+            camera,
+            centerline_x_original=76.0,
+            config=_config(),
+        )
+        for image in (weak, outside)
+    ]
+
+    assert _boundary_confidence(observations[1]) == pytest.approx(
+        _boundary_confidence(observations[0]),
+        abs=0.005,
+    )
+
+
+def test_ordered_anchor_dp_finds_legal_solution_rejected_by_greedy_choice():
+    curve = np.column_stack(
+        (np.arange(8, dtype=np.float64), np.zeros(8, dtype=np.float64))
+    )
+    target_x = {
+        "upper_tip": 2.0,
+        "tip_apex": 1.0,
+        "lower_tip": 4.0,
+        "alar_transition": 5.0,
+    }
+    lines = {
+        name: np.array([1.0, 0.0, -x], dtype=np.float64)
+        for name, x in target_x.items()
+    }
+    priors = {
+        name: np.array([x, 0.0], dtype=np.float64)
+        for name, x in target_x.items()
+    }
+    config = NasalObservationConfig(
+        work_size=(8, 2),
+        min_boundary_points=4,
+        max_epipolar_distance_px=2.1,
+        max_side_prior_distance_px=2.1,
+    )
+    greedy_indices = [
+        int(np.argmin(np.abs(curve[:, 0] - target_x[name])))
+        for name in ("upper_tip", "tip_apex", "lower_tip", "alar_transition")
+    ]
+
+    result = _ordered_epipolar_candidate(curve, lines, priors, config)
+
+    assert greedy_indices == [2, 1, 4, 5]
+    assert result is not None
+    matched_curve, anchors, _epipolar_errors, _prior_errors = result
+    indices = [
+        int(np.argmin(np.linalg.norm(matched_curve - anchors[name], axis=1)))
+        for name in ("upper_tip", "tip_apex", "lower_tip", "alar_transition")
+    ]
+    assert np.all(np.diff(indices) > 0)
+
+
+def test_front_confidence_is_stable_across_letterbox_mask_resolutions():
+    camera = _camera("camera2", "front")
+    config = _config()
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    observations = [
+        build_front_nasal_observation(
+            image,
+            _letterbox_mask(_front_mask(), size),
+            camera,
+            centerline_x_original=76.0,
+            config=config,
+        )
+        for size in (160, 640, 1024)
+    ]
+
+    confidence = np.asarray(
+        [_boundary_confidence(observation) for observation in observations]
+    )
+    reference_curve = observations[0].boundaries_work["subject-left-alar"]
+    for observation in observations[1:]:
+        curve = observation.boundaries_work["subject-left-alar"]
+        distances = np.linalg.norm(
+            reference_curve[:, None, :] - curve[None, :, :],
+            axis=2,
+        )
+        assert float(np.percentile(np.min(distances, axis=1), 95.0)) <= 1.5
+    assert float(np.ptp(confidence)) <= 0.02
+
+
+def test_observation_arrays_and_mappings_are_deeply_immutable():
+    observation = build_front_nasal_observation(
+        np.zeros((120, 160, 3), dtype=np.uint8),
+        _front_mask(),
+        _camera("camera2", "front"),
+        centerline_x_original=76.0,
+        config=_config(),
+    )
+    curve = observation.boundaries_work["subject-left-alar"]
+    base_variant = observation.variant_boundaries_work["base"][
+        "subject-left-alar"
+    ]
+
+    assert not np.shares_memory(curve, base_variant)
+    assert not np.shares_memory(
+        observation.boundary,
+        observation.variant_boundaries["base"],
+    )
+    with pytest.raises(TypeError):
+        observation.boundaries_work["new"] = np.zeros((2, 2))
+    with pytest.raises(ValueError):
+        curve[0, 0] = 0.0
+    with pytest.raises(ValueError):
+        observation.distance_fields["subject-left-alar"][0, 0] = 0.0
+    with pytest.raises(ValueError):
+        observation.camera.K[0, 0] = 0.0
+    with pytest.raises(TypeError):
+        observation.coordinate_metadata["new"] = "value"
+    assert "precise_euclidean" in observation.coordinate_metadata[
+        "distance_field"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -524,14 +848,26 @@ def test_profile_rejects_front_anchors_with_no_epipolar_intersection():
 
 def test_production_apis_require_projected_side_priors():
     profile_parameter = inspect.signature(
-        build_profile_nasal_observation
+        _build_profile_nasal_observation
     ).parameters["side_prior_original"]
     multiview_parameter = inspect.signature(
-        build_multiview_nasal_observations
+        _build_multiview_nasal_observations
     ).parameters["side_priors_original"]
+    front_coordinates = inspect.signature(
+        _build_front_nasal_observation
+    ).parameters["coordinates"]
+    profile_coordinates = inspect.signature(
+        _build_profile_nasal_observation
+    ).parameters["coordinates_by_view"]
+    multiview_coordinates = inspect.signature(
+        _build_multiview_nasal_observations
+    ).parameters["coordinates_by_view"]
 
     assert profile_parameter.default is inspect.Parameter.empty
     assert multiview_parameter.default is inspect.Parameter.empty
+    assert front_coordinates.default is inspect.Parameter.empty
+    assert profile_coordinates.default is inspect.Parameter.empty
+    assert multiview_coordinates.default is inspect.Parameter.empty
 
 
 def test_multiview_api_rejects_missing_projected_side_prior():

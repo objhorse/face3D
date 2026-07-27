@@ -5,11 +5,17 @@ import numpy as np
 import pytest
 
 from src.cross_view_geometry import Camera
+from src.geometry.observation_coordinates import (
+    ObservationCoordinates,
+    fundamental_matrix_work,
+)
 from src.geometry.profile_silhouette_extrema import (
     SilhouetteExtremumThresholds,
+    _select_contour_candidate,
     build_profile_silhouette_extrema,
     canvas_points_to_original,
     original_points_to_canvas,
+    refine_profile_extremum,
 )
 from src.geometry.profile_triangulation import ProfileRig, project_reference_point
 
@@ -67,6 +73,19 @@ def _profile_mask(side: str) -> np.ndarray:
     )
     cv2.fillPoly(mask, [points], 255)
     return mask
+
+
+def _letterbox_mask(mask: np.ndarray, size: int) -> np.ndarray:
+    resized_height = int(size * 3 / 4)
+    resized = cv2.resize(
+        mask,
+        (size, resized_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    canvas = np.zeros((size, size), dtype=np.uint8)
+    y0 = (size - resized_height) // 2
+    canvas[y0 : y0 + resized_height] = resized
+    return canvas
 
 
 def test_letterbox_point_conversion_round_trips():
@@ -165,3 +184,92 @@ def test_silhouette_extrema_reject_empty_masks():
 
     assert result["quality_gate"]["passed"] is False
     assert set(result["quality_gate"]["missing_points"]) == {"nose_tip", "chin"}
+
+
+def test_epipolar_threshold_filters_candidates_before_scoring():
+    rig = _rig()
+    front_camera = rig.cameras_by_view["front"]
+    side_camera = rig.cameras_by_view["left"]
+    front_anchor = np.array([320.0, 240.0], dtype=np.float64)
+    front_coordinates = ObservationCoordinates.from_camera(
+        front_camera,
+        work_size=(640, 480),
+        pixel_frame="undistorted",
+    )
+    side_coordinates = ObservationCoordinates.from_camera(
+        side_camera,
+        work_size=(640, 480),
+        pixel_frame="distorted",
+    )
+    line = fundamental_matrix_work(
+        front_camera,
+        side_camera,
+        front_coordinates,
+        side_coordinates,
+    ) @ np.append(front_anchor, 1.0)
+    normal = line[:2] / np.linalg.norm(line[:2])
+    tangent = np.array([-normal[1], normal[0]])
+    point_on_line = -line[2] * line[:2] / np.dot(line[:2], line[:2])
+    legal = point_on_line + 4.9 * normal + 19.0 * tangent
+    illegal = point_on_line + 5.1 * normal
+    contour = np.asarray(
+        [
+            legal,
+            illegal,
+            illegal + tangent,
+            illegal + 2.0 * tangent,
+            illegal + 3.0 * tangent,
+            illegal + 4.0 * tangent,
+            illegal + 5.0 * tangent,
+        ]
+    )
+    thresholds = SilhouetteExtremumThresholds(
+        max_epipolar_distance_work_px=5.0,
+        nose_prior_radius_work_px=20.0,
+    )
+
+    result = _select_contour_candidate(
+        contour,
+        front_anchor,
+        illegal,
+        front_camera,
+        side_camera,
+        semantic_name="nose_tip",
+        thresholds=thresholds,
+    )
+
+    assert result["passed"] is True
+    assert result["selected_work_px"] == pytest.approx(legal, abs=1e-8)
+    assert result["epipolar_distance_work_px"] == pytest.approx(4.9, abs=1e-8)
+
+
+def test_profile_mask_variants_are_independent_of_letterbox_resolution():
+    rig = _rig()
+    thresholds = SilhouetteExtremumThresholds(
+        max_epipolar_distance_work_px=6.0,
+        nose_prior_radius_work_px=100.0,
+        mask_variant_offsets_work_px=(-2, 0, 2),
+        max_variant_spread_work_px=8.0,
+        max_variant_depth_spread_m=0.050,
+    )
+    mask = _profile_mask("left")
+    selected = []
+
+    for size in (160, 640, 1024):
+        result = refine_profile_extremum(
+            np.array([320.0, 270.0]),
+            np.array([400.0, 270.0]),
+            _letterbox_mask(mask, size),
+            rig,
+            "left",
+            "nose_tip",
+            thresholds=thresholds,
+        )
+        selected.append(
+            np.asarray(
+                result["selected_center"]["selection"]["selected_work_px"],
+                dtype=np.float64,
+            )
+        )
+
+    assert np.max(np.ptp(np.asarray(selected), axis=0)) <= 4.1
