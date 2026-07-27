@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import numpy as np
 import pytest
@@ -97,10 +97,23 @@ def _synthetic_face():
     return vertices, faces, triangles, barycentric
 
 
+def _build_basis(vertices, faces, triangles, barycentric, **kwargs):
+    return build_nasal_semantic_basis(
+        vertices,
+        faces,
+        triangles,
+        barycentric,
+        model_to_front_camera=kwargs.pop(
+            "model_to_front_camera", np.eye(3, dtype=np.float64)
+        ),
+        **kwargs,
+    )
+
+
 @pytest.fixture
 def synthetic_basis():
     vertices, faces, triangles, barycentric = _synthetic_face()
-    basis = build_nasal_semantic_basis(vertices, faces, triangles, barycentric)
+    basis = _build_basis(vertices, faces, triangles, barycentric)
     return vertices, faces, triangles, barycentric, basis
 
 
@@ -118,8 +131,8 @@ def _weighted_projection(basis, mode: str, direction: np.ndarray, mask: np.ndarr
 
 def test_basis_names_dimensions_finite_deterministic_and_immutable():
     vertices, faces, triangles, barycentric = _synthetic_face()
-    first = build_nasal_semantic_basis(vertices, faces, triangles, barycentric)
-    second = build_nasal_semantic_basis(vertices, faces, triangles, barycentric)
+    first = _build_basis(vertices, faces, triangles, barycentric)
+    second = _build_basis(vertices, faces, triangles, barycentric)
 
     assert first.names == NASAL_SEMANTIC_MODE_NAMES == (
         "alar_width_shared",
@@ -135,6 +148,7 @@ def test_basis_names_dimensions_finite_deterministic_and_immutable():
     assert first.weights.shape == (8, len(vertices))
     assert first.directions.shape == (8, len(vertices), 3)
     assert first.mode_support_masks.shape == (8, len(vertices))
+    assert first.orthogonalization_weights.shape == (len(vertices),)
     assert first.scales.shape == (8,)
     assert np.isfinite(first.vectors).all()
     assert np.isfinite(first.weights).all()
@@ -152,6 +166,7 @@ def test_basis_names_dimensions_finite_deterministic_and_immutable():
         first.protected_mask,
         first.support_mask,
         first.scales,
+        first.orthogonalization_weights,
     ))
     with pytest.raises(FrozenInstanceError):
         first.face_width = 1.0
@@ -322,6 +337,76 @@ def test_front_camera_rotation_controls_positive_depth_direction():
     assert np.any(np.abs(tip_depth @ np.array([1.0, 0.0, 0.0])) > 0.0)
 
 
+def test_front_camera_rotation_is_required_and_near_rotation_is_projected():
+    vertices, faces, triangles, barycentric = _synthetic_face()
+    with pytest.raises(TypeError, match="model_to_front_camera"):
+        build_nasal_semantic_basis(vertices, faces, triangles, barycentric)
+
+    angle = np.deg2rad(12.0)
+    exact = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ]
+    )
+    target_determinant = 0.99999968
+    first_scale = np.sqrt(1.0 - 4.41e-7)
+    real_like = (
+        np.diag([first_scale, target_determinant / first_scale, 1.0])
+        @ exact
+    )
+    error = float(np.max(np.abs(real_like @ real_like.T - np.eye(3))))
+    assert np.linalg.det(real_like) == pytest.approx(
+        target_determinant, abs=1e-12
+    )
+    assert error == pytest.approx(4.41e-7, abs=1e-12)
+
+    basis = _build_basis(
+        vertices,
+        faces,
+        triangles,
+        barycentric,
+        model_to_front_camera=real_like,
+    )
+    projected = basis.semantic_frame.model_to_front_camera
+    np.testing.assert_allclose(projected @ projected.T, np.eye(3), atol=1e-12)
+    assert np.linalg.det(projected) == pytest.approx(1.0, abs=1e-12)
+    assert np.linalg.norm(projected - real_like) < 1e-5
+
+    reflection = np.diag([-1.0, 1.0, 1.0])
+    with pytest.raises(ValueError, match="determinant|reflection"):
+        _build_basis(
+            vertices,
+            faces,
+            triangles,
+            barycentric,
+            model_to_front_camera=reflection,
+        )
+
+
+def test_all_modes_have_low_pairwise_support_weighted_cosine(synthetic_basis):
+    _vertices, _faces, _triangles, _barycentric, basis = synthetic_basis
+    metric = basis.orthogonalization_weights
+    gram = np.einsum(
+        "v,ivc,jvc->ij",
+        metric,
+        basis.vectors,
+        basis.vectors,
+    )
+    norms = np.sqrt(np.diag(gram))
+    cosine = gram / np.outer(norms, norms)
+    off_diagonal = np.abs(cosine - np.eye(len(basis.names)))
+    threshold = basis.config.max_pairwise_weighted_cosine
+
+    assert float(np.max(off_diagonal)) <= threshold
+    fullness = _mode_index(basis, "tip_alar_fullness")
+    tip_depth = _mode_index(basis, "tip_depth")
+    alar_depth = _mode_index(basis, "alar_depth_shared")
+    assert abs(float(cosine[fullness, tip_depth])) <= threshold
+    assert abs(float(cosine[fullness, alar_depth])) <= threshold
+
+
 def test_roundness_is_not_collinear_with_tip_depth(synthetic_basis):
     _vertices, _faces, _triangles, _barycentric, basis = synthetic_basis
     depth = basis.vectors[_mode_index(basis, "tip_depth")].reshape(-1)
@@ -383,14 +468,70 @@ def test_small_combinations_are_linear_continuous_and_edge_smooth(synthetic_basi
     assert float(np.percentile(np.linalg.norm(laplacian, axis=1), 99.0)) < basis.unit_scale * 0.25
 
 
-def test_build_and_apply_never_mutate_inputs(synthetic_basis):
-    vertices, faces, triangles, barycentric, basis = synthetic_basis
-    snapshots = tuple(value.copy() for value in (vertices, faces, triangles, barycentric))
-    coefficients = np.linspace(-0.2, 0.2, 8)
-    _candidate, _displacement = apply_nasal_semantic_basis(vertices, basis, coefficients)
-
-    for value, snapshot in zip((vertices, faces, triangles, barycentric), snapshots):
+def test_build_and_apply_never_mutate_inputs():
+    vertices, faces, triangles, barycentric = _synthetic_face()
+    rotation = np.eye(3, dtype=np.float64)
+    build_inputs = (vertices, faces, triangles, barycentric, rotation)
+    build_snapshots = tuple(value.copy() for value in build_inputs)
+    basis = build_nasal_semantic_basis(
+        vertices,
+        faces,
+        triangles,
+        barycentric,
+        model_to_front_camera=rotation,
+    )
+    for value, snapshot in zip(build_inputs, build_snapshots):
         np.testing.assert_array_equal(value, snapshot)
+
+    baseline = vertices.copy()
+    coefficients = np.linspace(-0.2, 0.2, 8)
+    baseline_snapshot = baseline.copy()
+    coefficient_snapshot = coefficients.copy()
+    _candidate, _displacement = apply_nasal_semantic_basis(
+        baseline, basis, coefficients
+    )
+
+    np.testing.assert_array_equal(baseline, baseline_snapshot)
+    np.testing.assert_array_equal(coefficients, coefficient_snapshot)
+
+
+def test_basis_validation_rejects_invalid_region_and_seed_metadata(synthetic_basis):
+    _vertices, _faces, _triangles, _barycentric, basis = synthetic_basis
+    missing_region = dict(basis.region_masks)
+    missing_region.pop("nose_bridge")
+    with pytest.raises(ValueError, match="region mask keys"):
+        replace(basis, region_masks=missing_region)
+
+    bad_region_shape = dict(basis.region_masks)
+    bad_region_shape["nose_bridge"] = np.zeros(2, dtype=bool)
+    with pytest.raises(ValueError, match="region mask.*shape"):
+        replace(basis, region_masks=bad_region_shape)
+
+    protected_region = dict(basis.region_masks)
+    protected_region["nose_bridge"] = protected_region["nose_bridge"].copy()
+    protected_region["nose_bridge"][np.flatnonzero(basis.protected_mask)[0]] = True
+    with pytest.raises(ValueError, match="protected"):
+        replace(basis, region_masks=protected_region)
+
+    missing_seed = dict(basis.seed_indices)
+    missing_seed.pop("nose_tip")
+    with pytest.raises(ValueError, match="seed index keys"):
+        replace(basis, seed_indices=missing_seed)
+
+    empty_seed = dict(basis.seed_indices)
+    empty_seed["nose_tip"] = np.array([], dtype=np.int64)
+    with pytest.raises(ValueError, match="non-empty integer 1-D"):
+        replace(basis, seed_indices=empty_seed)
+
+    floating_seed = dict(basis.seed_indices)
+    floating_seed["nose_tip"] = np.array([1.0])
+    with pytest.raises(ValueError, match="non-empty integer 1-D"):
+        replace(basis, seed_indices=floating_seed)
+
+    out_of_bounds_seed = dict(basis.seed_indices)
+    out_of_bounds_seed["nose_tip"] = np.array([len(basis.support_mask)])
+    with pytest.raises(ValueError, match="bounds"):
+        replace(basis, seed_indices=out_of_bounds_seed)
 
 
 @pytest.mark.parametrize(
@@ -428,22 +569,22 @@ def test_invalid_indices_nonfinite_values_config_and_coefficients_fail(synthetic
     bad_vertices = vertices.copy()
     bad_vertices[0, 0] = np.nan
     with pytest.raises(ValueError, match="finite"):
-        build_nasal_semantic_basis(bad_vertices, faces, triangles, barycentric)
+        _build_basis(bad_vertices, faces, triangles, barycentric)
 
     bad_faces = faces.copy()
     bad_faces[0, 0] = len(vertices)
     with pytest.raises(ValueError, match="indices"):
-        build_nasal_semantic_basis(vertices, bad_faces, triangles, barycentric)
+        _build_basis(vertices, bad_faces, triangles, barycentric)
 
     bad_barycentric = barycentric.copy()
     bad_barycentric[0] = [0.2, 0.2, 0.2]
     with pytest.raises(ValueError, match="sum"):
-        build_nasal_semantic_basis(vertices, faces, triangles, bad_barycentric)
+        _build_basis(vertices, faces, triangles, bad_barycentric)
 
     non_face_mapping = triangles.copy()
     non_face_mapping[30] = [0, len(vertices) // 2, len(vertices) - 1]
     with pytest.raises(ValueError, match="mesh faces"):
-        build_nasal_semantic_basis(
+        _build_basis(
             vertices, faces, non_face_mapping, barycentric
         )
 
