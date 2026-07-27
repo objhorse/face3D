@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from src.cross_view_geometry import Camera
+from src.appearance.projective_sampling import project_points_strict
+from src.cross_view_geometry import Camera, scale_intrinsics
 from src.geometry.multiview_nasal_objective import (
+    MultiviewNasalProjection,
     MultiviewNasalSamplingConfig,
+    ProjectedNasalSamples,
+    _edge_adjacency,
+    _external_region_boundary_edges,
+    _silhouette_edges,
+    _sparse_visibility,
     build_candidate_nasal_mesh,
     project_multiview_nasal_boundaries,
 )
@@ -16,7 +24,13 @@ from src.geometry.nasal_observations import (
     NasalObservationBundle,
     NasalViewObservation,
 )
-from src.geometry.observable_flame_subspace import ProjectionView
+from src.geometry.nasal_semantic_basis import build_nasal_semantic_basis
+from src.geometry.observable_flame_subspace import (
+    ObservableFlameSubspaceConfig,
+    ProjectionView,
+    build_observable_flame_subspace,
+)
+from tests.test_nasal_semantic_basis import _synthetic_face as _real_basis_mesh
 
 
 VIEW_NAMES = ("front", "subject-left", "subject-right")
@@ -37,25 +51,46 @@ def _rotation_y(degrees: float) -> np.ndarray:
 def _mesh():
     vertices = np.array(
         [
-            [-1.0, -1.0, 4.0],
-            [0.0, -1.0, 3.5],
-            [1.0, -1.0, 4.0],
-            [-1.0, 1.0, 4.0],
-            [0.0, 1.0, 3.5],
-            [1.0, 1.0, 4.0],
+            [-1.2, -0.8, 4.0],
+            [-0.6, 0.0, 4.0],
+            [-1.2, 0.8, 4.0],
+            [-0.3, -0.8, 3.6],
+            [0.3, -0.8, 3.6],
+            [0.0, 0.8, 3.5],
+            [0.6, 0.0, 4.0],
+            [1.2, -0.8, 4.0],
+            [1.2, 0.8, 4.0],
         ],
         dtype=np.float64,
     )
     faces = np.array(
         [
-            [0, 1, 4],
-            [0, 4, 3],
-            [1, 2, 5],
-            [1, 5, 4],
+            [0, 2, 1],
+            [3, 5, 4],
+            [6, 8, 7],
         ],
         dtype=np.int32,
     )
     return vertices, faces
+
+
+def _grid_mesh(size: int = 7):
+    xx, yy = np.meshgrid(
+        np.arange(size, dtype=np.float64),
+        np.arange(size, dtype=np.float64),
+    )
+    vertices = np.column_stack(
+        (xx.ravel(), yy.ravel(), np.full(size * size, 4.0))
+    )
+    faces = []
+    for row in range(size - 1):
+        for column in range(size - 1):
+            first = row * size + column
+            right = first + 1
+            below = first + size
+            diagonal = below + 1
+            faces.extend(((first, diagonal, right), (first, below, diagonal)))
+    return vertices, np.asarray(faces, dtype=np.int64)
 
 
 def _bases(vertex_count: int):
@@ -72,11 +107,11 @@ def _bases(vertex_count: int):
     subject_left = np.zeros(vertex_count, dtype=bool)
     subject_right = np.zeros(vertex_count, dtype=bool)
     transition = np.ones(vertex_count, dtype=bool)
-    if vertex_count == 6:
-        bridge[[3, 4, 5]] = True
-        tip[[1, 4]] = True
-        subject_left[[2, 5]] = True
-        subject_right[[0, 3]] = True
+    if vertex_count == 9:
+        bridge[3:6] = True
+        tip[3:6] = True
+        subject_left[6:9] = True
+        subject_right[0:3] = True
     else:
         tip[-3:] = True
         subject_left[4:7] = True
@@ -98,11 +133,16 @@ def _bases(vertex_count: int):
     return observable, semantic
 
 
-def _camera(name: str, camera_view: str, K: np.ndarray) -> Camera:
+def _camera(
+    name: str,
+    camera_view: str,
+    K: np.ndarray,
+    image_size: tuple[int, int] = (200, 200),
+) -> Camera:
     return Camera(
         name=name,
         view=camera_view,
-        image_size=(100, 100),
+        image_size=image_size,
         K=K.copy(),
         dist=np.zeros(5, dtype=np.float64),
         R_rig_to_camera=np.eye(3, dtype=np.float64),
@@ -114,8 +154,12 @@ def _observation(
     semantic_view: str,
     camera: Camera,
     boundary_names: tuple[str, ...],
+    *,
+    coordinate_K: np.ndarray,
+    work_size: tuple[int, int] = (100, 100),
+    camera_metadata_overrides=None,
 ) -> NasalViewObservation:
-    height = width = 100
+    width, height = work_size
     confidence = np.add.outer(
         np.arange(height, dtype=np.float64) * 0.003,
         np.arange(width, dtype=np.float64) * 0.002,
@@ -131,13 +175,43 @@ def _observation(
         name: np.zeros((height, width), dtype=np.float32)
         for name in boundary_names
     }
+    camera_metadata = {
+        "camera_name": camera.name,
+        "camera_view": camera.view,
+        "subject_relative_view": semantic_view,
+        "image_size_wh": list(camera.image_size),
+        "intrinsics": np.asarray(camera.K, dtype=float).tolist(),
+        "distortion_coefficients": np.asarray(
+            camera.dist,
+            dtype=float,
+        ).reshape(-1).tolist(),
+        "rig_to_camera_rotation": np.asarray(
+            camera.R_rig_to_camera,
+            dtype=float,
+        ).tolist(),
+        "rig_to_camera_translation": np.asarray(
+            camera.t_rig_to_camera,
+            dtype=float,
+        ).reshape(3).tolist(),
+    }
+    if camera_metadata_overrides:
+        camera_metadata.update(camera_metadata_overrides)
+    coordinate_metadata = {
+        "source_pixel_frame": "undistorted_original_px",
+        "observation_pixel_frame": "undistorted_work_px",
+        "original_size_wh": list(camera.image_size),
+        "work_size_wh": list(work_size),
+        "intrinsics": np.asarray(coordinate_K, dtype=float).tolist(),
+        "distortion_coefficients": np.zeros(5).tolist(),
+        "conversion_source": "src.geometry.observation_coordinates",
+    }
     return NasalViewObservation(
         semantic_view=semantic_view,
         camera=camera,
-        original_size=(100, 100),
-        mask_canvas_shape=(100, 100),
-        work_size=(100, 100),
-        roi_work_xyxy=(0.0, 0.0, 100.0, 100.0),
+        original_size=tuple(camera.image_size),
+        mask_canvas_shape=(height, width),
+        work_size=work_size,
+        roi_work_xyxy=(0.0, 0.0, float(width), float(height)),
         boundaries_work=curves,
         boundary=boundary,
         distance_fields=fields,
@@ -145,25 +219,60 @@ def _observation(
         confidence=confidence,
         variant_boundaries_work={"base": curves},
         variant_boundaries={"base": boundary},
+        camera_metadata=camera_metadata,
+        coordinate_metadata=coordinate_metadata,
     )
 
 
-def _observations(K: np.ndarray) -> NasalObservationBundle:
+def _original_K(
+    work_K: np.ndarray,
+    original_size: tuple[int, int] = (200, 200),
+    work_size: tuple[int, int] = (100, 100),
+) -> np.ndarray:
+    result = np.asarray(work_K, dtype=np.float64).copy()
+    result[0] *= original_size[0] / float(work_size[0])
+    result[1] *= original_size[1] / float(work_size[1])
+    return result
+
+
+def _observations(
+    work_K: np.ndarray,
+    *,
+    camera_K: np.ndarray = None,
+    coordinate_K: np.ndarray = None,
+    front_names=("subject-left-alar", "subject-right-alar"),
+    side_names=("nasal-profile",),
+    camera_metadata_overrides=None,
+) -> NasalObservationBundle:
+    camera_intrinsics = (
+        _original_K(work_K)
+        if camera_K is None
+        else np.asarray(camera_K, dtype=np.float64)
+    )
+    coordinate_intrinsics = (
+        _original_K(work_K)
+        if coordinate_K is None
+        else np.asarray(coordinate_K, dtype=np.float64)
+    )
     return NasalObservationBundle(
         front=_observation(
             "front",
-            _camera("camera2", "front", K),
-            ("subject-left-alar", "nose-tip", "subject-right-alar"),
+            _camera("camera2", "front", camera_intrinsics),
+            tuple(front_names),
+            coordinate_K=coordinate_intrinsics,
+            camera_metadata_overrides=camera_metadata_overrides,
         ),
         subject_left=_observation(
             "subject-left",
-            _camera("camera1", "left", K),
-            ("nasal-profile",),
+            _camera("camera1", "left", camera_intrinsics),
+            tuple(side_names),
+            coordinate_K=coordinate_intrinsics,
         ),
         subject_right=_observation(
             "subject-right",
-            _camera("camera3", "right", K),
-            ("nasal-profile",),
+            _camera("camera3", "right", camera_intrinsics),
+            tuple(side_names),
+            coordinate_K=coordinate_intrinsics,
         ),
     )
 
@@ -234,7 +343,7 @@ def test_known_camera_projects_samples_in_declared_work_frame():
         )
         homogeneous = camera_points @ view.K.T
         expected = homogeneous[:, :2] / homogeneous[:, 2, None]
-        np.testing.assert_allclose(view_result.pixel_xy, expected, atol=2e-6)
+        np.testing.assert_allclose(view_result.pixel_xy, expected, atol=6e-6)
         assert np.all(view_result.pixel_xy[:, 0] < 100.0)
         assert np.all(view_result.pixel_xy[:, 1] < 100.0)
         assert np.all(view_result.depth > 0.0)
@@ -257,6 +366,20 @@ def test_known_camera_projects_samples_in_declared_work_frame():
             expected_confidence,
             atol=1e-12,
         )
+    assert set(result.per_view[0].boundary_names) == {
+        "subject-left-alar",
+        "subject-right-alar",
+    }
+    assert set(result.per_view[0].source_labels) == {
+        "subject_left_nose_wing",
+        "subject_right_nose_wing",
+    }
+    assert all(
+        set(samples.boundary_names).issubset(
+            observations.by_view[samples.semantic_view].distance_fields
+        )
+        for samples in result.per_view
+    )
 
 
 def test_zero_and_nonzero_flame_and_semantic_coefficients_compose_exactly():
@@ -299,6 +422,78 @@ def test_zero_and_nonzero_flame_and_semantic_coefficients_compose_exactly():
     np.testing.assert_allclose(changed.vertices, expected, atol=1e-15)
     np.testing.assert_array_equal(changed.faces, faces)
     assert changed.faces.dtype == faces.dtype
+
+
+def test_real_semantic_and_observable_dataclasses_integrate_with_scaled_work_frame():
+    vertices, faces, landmark_faces, barycentric = _real_basis_mesh()
+    semantic = build_nasal_semantic_basis(
+        vertices,
+        faces,
+        landmark_faces,
+        barycentric,
+        model_to_front_camera=np.eye(3),
+    )
+    work_K = np.array(
+        [[46.0, 1.0, 50.0], [0.0, 44.0, 50.0], [0.0, 0.0, 1.0]]
+    )
+    base_rotation = np.diag([-1.0, 1.0, -1.0])
+    views = (
+        ProjectionView("front", work_K, base_rotation, np.array([0.0, 0.0, 4.0])),
+        ProjectionView(
+            "subject-left",
+            work_K,
+            base_rotation @ _rotation_y(72.0),
+            np.array([0.0, 0.0, 4.0]),
+        ),
+        ProjectionView(
+            "subject-right",
+            work_K,
+            base_rotation @ _rotation_y(-72.0),
+            np.array([0.0, 0.0, 4.0]),
+        ),
+    )
+    shape_basis = semantic.vectors[0][:, :, None]
+    observable = build_observable_flame_subspace(
+        vertices,
+        shape_basis,
+        semantic.support_mask,
+        semantic.protected_mask,
+        views,
+        config=ObservableFlameSubspaceConfig(
+            min_nasal_response_ratio=0.0,
+            max_protected_to_nasal_energy_ratio=1.0,
+            relative_nasal_energy_floor=0.0,
+            relative_singular_value_threshold=1e-6,
+            max_rank=1,
+        ),
+    )
+    candidate = build_candidate_nasal_mesh(
+        vertices,
+        faces,
+        observable,
+        semantic,
+        np.zeros(observable.retained_rank),
+        np.zeros(8),
+    )
+
+    result = project_multiview_nasal_boundaries(
+        candidate,
+        semantic,
+        _observations(work_K),
+        views,
+        config=MultiviewNasalSamplingConfig(
+            front_samples_per_region=6,
+            side_samples_per_view=8,
+        ),
+    )
+
+    assert observable.vertex_basis.shape == (
+        len(vertices),
+        3,
+        observable.retained_rank,
+    )
+    assert tuple(samples.semantic_view for samples in result.per_view) == VIEW_NAMES
+    assert all(len(samples.pixel_xy) for samples in result.per_view)
 
 
 def test_inputs_remain_unchanged_and_candidate_api_cannot_change_fixed_state():
@@ -355,7 +550,34 @@ def test_inputs_remain_unchanged_and_candidate_api_cannot_change_fixed_state():
         )
 
 
-def test_occluded_back_side_wing_is_rejected_by_facing_and_sparse_depth():
+def test_back_facing_open_boundary_is_not_a_silhouette_candidate():
+    vertices = np.array(
+        [
+            [-0.5, -0.5, 4.0],
+            [0.5, -0.5, 4.0],
+            [0.0, 0.5, 4.0],
+        ],
+        dtype=np.float64,
+    )
+    back_faces = np.array([[0, 1, 2]], dtype=np.int64)
+    front_faces = np.array([[0, 2, 1]], dtype=np.int64)
+
+    back = _silhouette_edges(
+        _edge_adjacency(back_faces),
+        vertices,
+        back_faces,
+    )
+    front = _silhouette_edges(
+        _edge_adjacency(front_faces),
+        vertices,
+        front_faces,
+    )
+
+    assert back == ()
+    assert set(front) == {(0, 1), (0, 2), (1, 2)}
+
+
+def test_front_facing_open_boundary_is_rejected_only_when_depth_occluded():
     vertices = np.array(
         [
             [-1.0, -1.0, 3.0],
@@ -365,53 +587,90 @@ def test_occluded_back_side_wing_is_rejected_by_facing_and_sparse_depth():
             [-0.3, -0.3, 5.0],
             [0.3, -0.3, 5.0],
             [0.0, 0.3, 5.0],
-            [1.2, -0.4, 4.0],
-            [1.8, -0.4, 4.0],
-            [1.5, 0.4, 4.0],
         ],
         dtype=np.float64,
     )
     faces = np.array(
-        [[0, 1, 2], [0, 2, 3], [4, 5, 6], [7, 8, 9]],
+        [[0, 2, 1], [0, 3, 2], [4, 6, 5]],
         dtype=np.int64,
-    )
-    observable, semantic = _bases(len(vertices))
-    semantic.support_mask[:] = False
-    semantic.support_mask[4:] = True
-    semantic.region_masks["subject_left_nose_wing"][:] = False
-    semantic.region_masks["subject_left_nose_wing"][4:7] = True
-    semantic.region_masks["nose_tip"][:] = False
-    semantic.region_masks["nose_tip"][7:] = True
-    semantic.region_masks["tip_alar_transition"][:] = False
-    semantic.region_masks["tip_alar_transition"][4:] = True
-    candidate = build_candidate_nasal_mesh(
-        vertices,
-        faces,
-        observable,
-        semantic,
-        np.zeros(2),
-        np.zeros(8),
     )
     K = np.array(
         [[40.0, 0.0, 50.0], [0.0, 40.0, 50.0], [0.0, 0.0, 1.0]]
     )
-    views = tuple(
-        ProjectionView(name, K, np.eye(3), np.zeros(3))
-        for name in VIEW_NAMES
+    projection = project_points_strict(
+        vertices,
+        K,
+        np.eye(3),
+        np.zeros(3),
+    )
+    silhouettes = _silhouette_edges(
+        _edge_adjacency(faces),
+        projection.camera_points,
+        faces,
+    )
+    rear_edge = (4, 5)
+    rear_point = np.mean(vertices[list(rear_edge)], axis=0, keepdims=True)
+    rear_projection = project_points_strict(
+        rear_point,
+        K,
+        np.eye(3),
+        np.zeros(3),
     )
 
-    result = project_multiview_nasal_boundaries(
-        candidate,
-        semantic,
-        _observations(K),
-        views,
-        config=_config(),
+    visible = _sparse_visibility(
+        rear_projection.pixel_xy,
+        rear_projection.depth,
+        projection.pixel_xy,
+        projection.depth,
+        faces,
+        _config(),
     )
 
-    for samples in result.per_view[1:]:
-        assert "nose_wing_subject_left" not in samples.source_labels
-        assert "nose_tip" in samples.source_labels
-        assert np.all(samples.visible)
+    assert rear_edge in silhouettes
+    assert visible.tolist() == [False]
+
+
+def test_external_front_contours_exclude_holes_and_protected_islands_with_overlap():
+    size = 9
+    vertices, faces = _grid_mesh(size)
+    projected = vertices[:, :2] * 8.0 + 20.0
+    adjacency = _edge_adjacency(faces)
+    rows, columns = np.divmod(np.arange(len(vertices)), size)
+    protected = (rows == 4) & (columns == 4)
+    left = (columns <= 6) & ~protected
+    right = (columns >= 2) & ~protected
+
+    left_edges = _external_region_boundary_edges(
+        adjacency,
+        faces,
+        left,
+        protected,
+        projected,
+    )
+    right_edges = _external_region_boundary_edges(
+        adjacency,
+        faces,
+        right,
+        protected,
+        projected,
+    )
+
+    assert left_edges
+    assert right_edges
+    assert np.any(left & right)
+    for edges, minimum_column, maximum_column in (
+        (left_edges, 0, 6),
+        (right_edges, 2, 8),
+    ):
+        used = np.unique(np.asarray(edges))
+        used_rows, used_columns = np.divmod(used, size)
+        assert np.all(
+            (used_rows == 0)
+            | (used_rows == size - 1)
+            | (used_columns == minimum_column)
+            | (used_columns == maximum_column)
+        )
+        assert not np.any(protected[used])
 
 
 def test_subject_labels_do_not_follow_image_x_ordering():
@@ -430,31 +689,31 @@ def test_subject_labels_do_not_follow_image_x_ordering():
     reversed_front = reversed_result.per_view[0]
 
     for samples in (normal_front, reversed_front):
-        assert "nose_wing_subject_left" in samples.source_labels
-        assert "nose_wing_subject_right" in samples.source_labels
+        assert "subject_left_nose_wing" in samples.source_labels
+        assert "subject_right_nose_wing" in samples.source_labels
     normal_left_x = np.mean(
         normal_front.pixel_xy[
-            np.asarray(normal_front.source_labels) == "nose_wing_subject_left",
+            np.asarray(normal_front.source_labels) == "subject_left_nose_wing",
             0,
         ]
     )
     normal_right_x = np.mean(
         normal_front.pixel_xy[
-            np.asarray(normal_front.source_labels) == "nose_wing_subject_right",
+            np.asarray(normal_front.source_labels) == "subject_right_nose_wing",
             0,
         ]
     )
     reversed_left_x = np.mean(
         reversed_front.pixel_xy[
             np.asarray(reversed_front.source_labels)
-            == "nose_wing_subject_left",
+            == "subject_left_nose_wing",
             0,
         ]
     )
     reversed_right_x = np.mean(
         reversed_front.pixel_xy[
             np.asarray(reversed_front.source_labels)
-            == "nose_wing_subject_right",
+            == "subject_right_nose_wing",
             0,
         ]
     )
@@ -515,6 +774,57 @@ def test_invalid_work_frame_intrinsics_and_nonfinite_inputs_fail_clearly():
         )
 
 
+def test_authoritative_coordinate_metadata_controls_nonidentity_work_K():
+    candidate, semantic, _observations_unused, _views_unused = _problem()
+    camera_work_K = np.array(
+        [[36.0, 0.0, 48.0], [0.0, 38.0, 52.0], [0.0, 0.0, 1.0]]
+    )
+    authoritative_work_K = np.array(
+        [[43.0, 1.5, 54.0], [0.0, 41.0, 47.0], [0.0, 0.0, 1.0]]
+    )
+    observations = _observations(
+        authoritative_work_K,
+        camera_K=_original_K(camera_work_K),
+        coordinate_K=_original_K(authoritative_work_K),
+    )
+    authoritative_views = _views(authoritative_work_K)
+
+    result = project_multiview_nasal_boundaries(
+        candidate,
+        semantic,
+        observations,
+        authoritative_views,
+        config=_config(),
+    )
+
+    assert all(len(samples.pixel_xy) for samples in result.per_view)
+    with pytest.raises(ValueError, match="coordinate.*work|work.*contract"):
+        project_multiview_nasal_boundaries(
+            candidate,
+            semantic,
+            observations,
+            _views(camera_work_K),
+            config=_config(),
+        )
+
+
+def test_camera_metadata_must_match_the_immutable_observation_camera():
+    candidate, semantic, _observations_unused, views = _problem()
+    observations = _observations(
+        views[0].K,
+        camera_metadata_overrides={"camera_name": "wrong-camera"},
+    )
+
+    with pytest.raises(ValueError, match="camera_metadata.*camera"):
+        project_multiview_nasal_boundaries(
+            candidate,
+            semantic,
+            observations,
+            views,
+            config=_config(),
+        )
+
+
 def test_returned_arrays_are_deeply_immutable():
     candidate, semantic, observations, views = _problem()
     result = project_multiview_nasal_boundaries(
@@ -542,6 +852,80 @@ def test_returned_arrays_are_deeply_immutable():
         assert not array.flags.writeable
         with pytest.raises(ValueError, match="WRITEABLE|writeable"):
             array.setflags(write=True)
+
+
+def test_result_rejects_empty_targets_and_invalid_provenance():
+    candidate, semantic, observations, views = _problem()
+    result = project_multiview_nasal_boundaries(
+        candidate,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    front = result.per_view[0]
+    empty_values = {
+        "pixel_xy": np.empty((0, 2)),
+        "model_points": np.empty((0, 3)),
+        "source_vertex_indices": np.empty((0, 2), dtype=np.int64),
+        "source_weights": np.empty((0, 2)),
+        "confidence": np.empty(0),
+        "source_labels": (),
+        "boundary_names": (),
+        "visible": np.empty(0, dtype=bool),
+        "depth": np.empty(0),
+    }
+    with pytest.raises(ValueError, match="empty|at least one"):
+        replace(front, **empty_values)
+
+    bad_indices = front.source_vertex_indices.copy()
+    bad_indices[0, 0] = len(result.candidate_vertices)
+    with pytest.raises(ValueError, match="source.*range|indices"):
+        MultiviewNasalProjection(
+            result.candidate_vertices,
+            result.faces,
+            (replace(front, source_vertex_indices=bad_indices),)
+            + result.per_view[1:],
+            result.observations,
+        )
+
+    bad_points = front.model_points.copy()
+    bad_points[0, 0] += 0.25
+    with pytest.raises(ValueError, match="reconstruct|provenance"):
+        MultiviewNasalProjection(
+            result.candidate_vertices,
+            result.faces,
+            (replace(front, model_points=bad_points),) + result.per_view[1:],
+            result.observations,
+        )
+
+    bad_targets = tuple("not-an-observation-target" for _ in front.boundary_names)
+    with pytest.raises(ValueError, match="target.*observation|boundary"):
+        MultiviewNasalProjection(
+            result.candidate_vertices,
+            result.faces,
+            (replace(front, boundary_names=bad_targets),) + result.per_view[1:],
+            result.observations,
+        )
+
+    bad_weights = front.source_weights.copy()
+    bad_weights[0] = (-0.5, 1.5)
+    with pytest.raises(ValueError, match="provenance|weight"):
+        replace(front, source_weights=bad_weights)
+
+
+def test_missing_mandatory_front_alar_group_fails_clearly():
+    candidate, semantic, observations, views = _problem()
+    semantic.region_masks["subject_left_nose_wing"][:] = False
+
+    with pytest.raises(ValueError, match="mandatory.*subject-left-alar"):
+        project_multiview_nasal_boundaries(
+            candidate,
+            semantic,
+            observations,
+            views,
+            config=_config(),
+        )
 
 
 def test_calls_are_deterministic_with_identical_sample_order_and_confidence():

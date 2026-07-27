@@ -28,28 +28,21 @@ __all__ = [
     "project_multiview_nasal_boundaries",
 ]
 
-_REGION_ALIASES = {
-    "nose_bridge": ("nose_bridge",),
-    "nose_tip": ("nose_tip",),
-    "nose_wing_subject_left": (
-        "subject_left_nose_wing",
-        "nose_wing_subject_left",
-    ),
-    "nose_wing_subject_right": (
-        "subject_right_nose_wing",
-        "nose_wing_subject_right",
-    ),
-    "tip_alar_transition": ("tip_alar_transition",),
-}
+_REGION_NAMES = (
+    "nose_bridge",
+    "nose_tip",
+    "subject_left_nose_wing",
+    "subject_right_nose_wing",
+    "tip_alar_transition",
+)
 _FRONT_REGIONS = (
-    ("nose_wing_subject_left", "subject-left-alar"),
-    ("nose_tip", "nose-tip"),
-    ("nose_wing_subject_right", "subject-right-alar"),
+    ("subject_left_nose_wing", "subject-left-alar"),
+    ("subject_right_nose_wing", "subject-right-alar"),
 )
 _SOURCE_PRIORITY = (
     "nose_tip",
-    "nose_wing_subject_left",
-    "nose_wing_subject_right",
+    "subject_left_nose_wing",
+    "subject_right_nose_wing",
     "tip_alar_transition",
     "nose_bridge",
 )
@@ -327,6 +320,8 @@ class ProjectedNasalSamples:
         visible = np.asarray(self.visible)
         depth = np.asarray(self.depth, dtype=np.float64)
         count = len(pixel_xy)
+        if count < 1:
+            raise ValueError("projected view samples must contain at least one sample")
         expected = {
             "pixel_xy": (count, 2),
             "model_points": (count, 3),
@@ -408,10 +403,13 @@ class MultiviewNasalProjection:
     candidate_vertices: np.ndarray
     faces: np.ndarray
     per_view: Tuple[ProjectedNasalSamples, ...]
+    observations: NasalObservationBundle
 
     def __post_init__(self) -> None:
         vertices = _validate_vertices(self.candidate_vertices)
         faces = _validate_faces(self.faces, len(vertices))
+        if not isinstance(self.observations, NasalObservationBundle):
+            raise ValueError("observations must be a NasalObservationBundle")
         views = tuple(self.per_view)
         if (
             len(views) != len(NASAL_VIEWS)
@@ -419,6 +417,65 @@ class MultiviewNasalProjection:
             or tuple(value.semantic_view for value in views) != tuple(NASAL_VIEWS)
         ):
             raise ValueError("per_view samples must use canonical three-view order")
+        target_names = tuple(
+            tuple(sorted(self.observations.by_view[view].distance_fields))
+            for view in NASAL_VIEWS
+        )
+        if len(target_names) != len(NASAL_VIEWS) or any(
+            not names or len(set(names)) != len(names)
+            for names in target_names
+        ):
+            raise ValueError(
+                "observation_target_names must contain non-empty unique "
+                "targets for all three views"
+            )
+        for samples, allowed_targets in zip(views, target_names):
+            if not len(samples.pixel_xy):
+                raise ValueError(
+                    f"{samples.semantic_view} sample collection must not be empty"
+                )
+            if (
+                np.any(samples.source_vertex_indices < 0)
+                or np.any(samples.source_vertex_indices >= len(vertices))
+            ):
+                raise ValueError(
+                    f"{samples.semantic_view} source indices are out of range"
+                )
+            reconstructed = np.sum(
+                vertices[samples.source_vertex_indices]
+                * samples.source_weights[:, :, None],
+                axis=1,
+            )
+            if not np.allclose(
+                reconstructed,
+                samples.model_points,
+                atol=1e-10,
+                rtol=1e-10,
+            ):
+                raise ValueError(
+                    f"{samples.semantic_view} provenance does not reconstruct "
+                    "model_points"
+                )
+            unknown_targets = set(samples.boundary_names) - set(allowed_targets)
+            if unknown_targets:
+                raise ValueError(
+                    f"{samples.semantic_view} boundary target is absent from "
+                    "the corresponding observation: "
+                    + ", ".join(sorted(unknown_targets))
+                )
+        front_samples = views[0]
+        for source_label, boundary_name in _FRONT_REGIONS:
+            contributed = any(
+                label == source_label and target == boundary_name
+                for label, target in zip(
+                    front_samples.source_labels,
+                    front_samples.boundary_names,
+                )
+            )
+            if not contributed:
+                raise ValueError(
+                    f"mandatory front target {boundary_name} has no visible samples"
+                )
         object.__setattr__(
             self,
             "candidate_vertices",
@@ -434,6 +491,13 @@ class MultiviewNasalProjection:
                 samples.semantic_view: samples
                 for samples in self.per_view
             }
+        )
+
+    @property
+    def observation_target_names(self) -> Tuple[Tuple[str, ...], ...]:
+        return tuple(
+            tuple(sorted(self.observations.by_view[view].distance_fields))
+            for view in NASAL_VIEWS
         )
 
 
@@ -465,27 +529,23 @@ def _region_masks(semantic_basis, vertex_count: int) -> Mapping[str, np.ndarray]
     protected = np.asarray(semantic_basis.protected_mask, dtype=bool)
     if np.any(support & protected):
         raise ValueError("semantic support and protected masks must be disjoint")
-    for public_name, aliases in _REGION_ALIASES.items():
-        present = [name for name in aliases if name in raw]
-        if not present:
-            raise ValueError(f"semantic region mask is missing {public_name}")
-        mask = np.asarray(raw[present[0]])
+    if set(raw) != set(_REGION_NAMES):
+        raise ValueError(
+            "semantic region masks must use the NasalSemanticBasis names"
+        )
+    for name in _REGION_NAMES:
+        mask = np.asarray(raw[name])
         if mask.shape != (vertex_count,) or not np.issubdtype(
             mask.dtype, np.bool_
         ):
             raise ValueError(
-                f"semantic region {public_name} must be boolean shape (V,)"
+                f"semantic region {name} must be boolean shape (V,)"
             )
-        if any(
-            not np.array_equal(mask, np.asarray(raw[name]))
-            for name in present[1:]
-        ):
-            raise ValueError(f"semantic region aliases disagree for {public_name}")
         if np.any(mask & ~support) or np.any(mask & protected):
             raise ValueError(
-                f"semantic region {public_name} extends outside editable support"
+                f"semantic region {name} extends outside editable support"
             )
-        result[public_name] = np.asarray(mask, dtype=bool)
+        result[name] = np.asarray(mask, dtype=bool)
     return result
 
 
@@ -505,21 +565,89 @@ def _edge_adjacency(faces: np.ndarray):
     )
 
 
-def _front_region_edges(
+def _closed_boundary_loops(
+    edges: Sequence[Tuple[int, int]],
+) -> Tuple[Tuple[int, ...], ...]:
+    unvisited = {tuple(sorted(edge)) for edge in edges}
+    neighbors = {}
+    for first, second in unvisited:
+        neighbors.setdefault(first, []).append(second)
+        neighbors.setdefault(second, []).append(first)
+    for values in neighbors.values():
+        values.sort()
+    loops = []
+    while unvisited:
+        first, second = min(unvisited)
+        unvisited.remove((first, second))
+        path = [first, second]
+        previous = first
+        current = second
+        while current != path[0]:
+            candidates = [
+                neighbor
+                for neighbor in neighbors.get(current, ())
+                if tuple(sorted((current, neighbor))) in unvisited
+            ]
+            if not candidates:
+                break
+            nonbacktracking = [
+                neighbor for neighbor in candidates if neighbor != previous
+            ]
+            next_vertex = min(nonbacktracking or candidates)
+            unvisited.remove(tuple(sorted((current, next_vertex))))
+            path.append(next_vertex)
+            previous, current = current, next_vertex
+        if path[-1] == path[0] and len(path) >= 4:
+            loops.append(tuple(path[:-1]))
+    return tuple(loops)
+
+
+def _projected_loop_area(
+    loop: Sequence[int],
+    projected_vertices: np.ndarray,
+) -> float:
+    points = projected_vertices[np.asarray(loop, dtype=np.int64)]
+    next_points = np.roll(points, -1, axis=0)
+    return 0.5 * float(
+        np.sum(points[:, 0] * next_points[:, 1])
+        - np.sum(points[:, 1] * next_points[:, 0])
+    )
+
+
+def _external_region_boundary_edges(
     adjacency,
     faces: np.ndarray,
     region_mask: np.ndarray,
+    protected_mask: np.ndarray,
+    projected_vertices: np.ndarray,
 ) -> Tuple[Tuple[int, int], ...]:
-    edges = []
+    editable_region = np.asarray(region_mask, dtype=bool) & ~np.asarray(
+        protected_mask,
+        dtype=bool,
+    )
+    active_faces = np.all(editable_region[faces], axis=1)
+    boundary_edges = []
     for first, second, incident in adjacency:
-        if not (region_mask[first] and region_mask[second]):
-            continue
-        if len(incident) == 1 or any(
-            not np.all(region_mask[faces[face_index]])
-            for face_index in incident
-        ):
-            edges.append((first, second))
-    return tuple(edges)
+        incident_active = sum(bool(active_faces[index]) for index in incident)
+        if incident_active == 1:
+            boundary_edges.append((first, second))
+    loops = _closed_boundary_loops(boundary_edges)
+    if not loops:
+        return ()
+    ranked = sorted(
+        loops,
+        key=lambda loop: (
+            -abs(_projected_loop_area(loop, projected_vertices)),
+            tuple(loop),
+        ),
+    )
+    external = ranked[0]
+    return tuple(
+        sorted(
+            tuple(sorted((external[index], external[(index + 1) % len(external)])))
+            for index in range(len(external))
+        )
+    )
 
 
 def _silhouette_edges(
@@ -539,7 +667,7 @@ def _silhouette_edges(
     result = []
     for first, second, incident in adjacency:
         if len(incident) == 1:
-            if nondegenerate[incident[0]]:
+            if nondegenerate[incident[0]] and front_facing[incident[0]]:
                 result.append((first, second))
         elif (
             nondegenerate[incident[0]]
@@ -810,17 +938,101 @@ def _validate_work_intrinsics(
     observations: NasalObservationBundle,
     views: Tuple[ProjectionView, ...],
 ) -> None:
+    def metadata_array(metadata, key, shape, label):
+        if key not in metadata:
+            raise ValueError(f"{label} is missing {key}")
+        try:
+            value = np.asarray(metadata[key], dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} {key} must be numeric") from exc
+        if value.shape != shape or not np.isfinite(value).all():
+            raise ValueError(f"{label} {key} must have finite shape {shape}")
+        return value
+
     for view, semantic_view in zip(views, NASAL_VIEWS):
         observation = observations.by_view[semantic_view]
+        camera = observation.camera
+        camera_metadata = observation.camera_metadata
+        coordinate_metadata = observation.coordinate_metadata
+        if tuple(observation.original_size) != tuple(camera.image_size):
+            raise ValueError(
+                f"{semantic_view} observation original size disagrees with camera"
+            )
+        expected_camera_scalars = {
+            "camera_name": camera.name,
+            "camera_view": camera.view,
+            "subject_relative_view": semantic_view,
+            "image_size_wh": tuple(camera.image_size),
+        }
+        for key, expected_value in expected_camera_scalars.items():
+            if key not in camera_metadata:
+                raise ValueError(f"{semantic_view} camera_metadata is missing {key}")
+            actual_value = camera_metadata[key]
+            if key == "image_size_wh":
+                actual_value = tuple(int(value) for value in actual_value)
+            if actual_value != expected_value:
+                raise ValueError(
+                    f"{semantic_view} camera_metadata does not match camera {key}"
+                )
+        camera_arrays = (
+            ("intrinsics", camera.K, (3, 3)),
+            (
+                "distortion_coefficients",
+                np.asarray(camera.dist).reshape(-1),
+                np.asarray(camera.dist).reshape(-1).shape,
+            ),
+            ("rig_to_camera_rotation", camera.R_rig_to_camera, (3, 3)),
+            ("rig_to_camera_translation", camera.t_rig_to_camera, (3,)),
+        )
+        for key, expected_value, shape in camera_arrays:
+            actual = metadata_array(
+                camera_metadata,
+                key,
+                shape,
+                f"{semantic_view} camera_metadata",
+            )
+            if not np.allclose(
+                actual,
+                np.asarray(expected_value, dtype=np.float64).reshape(shape),
+                atol=1e-12,
+                rtol=0.0,
+            ):
+                raise ValueError(
+                    f"{semantic_view} camera_metadata does not match camera {key}"
+                )
+        required_coordinate_scalars = {
+            "original_size_wh": tuple(observation.original_size),
+            "work_size_wh": tuple(observation.work_size),
+            "observation_pixel_frame": "undistorted_work_px",
+        }
+        for key, expected_value in required_coordinate_scalars.items():
+            if key not in coordinate_metadata:
+                raise ValueError(
+                    f"{semantic_view} coordinate_metadata is missing {key}"
+                )
+            actual_value = coordinate_metadata[key]
+            if key.endswith("_size_wh"):
+                actual_value = tuple(int(value) for value in actual_value)
+            if actual_value != expected_value:
+                raise ValueError(
+                    f"{semantic_view} coordinate metadata {key} is "
+                    "inconsistent with the observation"
+                )
+        coordinate_K = metadata_array(
+            coordinate_metadata,
+            "intrinsics",
+            (3, 3),
+            f"{semantic_view} coordinate_metadata",
+        )
         expected = scale_intrinsics(
-            observation.camera.K,
-            observation.camera.image_size,
-            observation.work_size,
+            coordinate_K,
+            tuple(observation.original_size),
+            tuple(observation.work_size),
         )
         if not np.allclose(view.K, expected, atol=1e-9, rtol=1e-9):
             raise ValueError(
-                f"{semantic_view} ProjectionView K is incompatible with "
-                "the observation work-pixel frame"
+                f"{semantic_view} ProjectionView K does not match the "
+                "authoritative coordinate work-frame contract"
             )
 
 
@@ -848,12 +1060,21 @@ def project_multiview_nasal_boundaries(
     for semantic_view, view in zip(NASAL_VIEWS, canonical_views):
         observation = observations.by_view[semantic_view]
         if semantic_view == "front":
+            vertex_projection = project_points_strict(
+                candidate.vertices,
+                view.K,
+                view.R_model_to_camera,
+                view.t_model_to_camera,
+                epsilon=float(limits.min_depth),
+            )
             edge_groups = []
             for source_label, boundary_name in _FRONT_REGIONS:
-                edges = _front_region_edges(
+                edges = _external_region_boundary_edges(
                     adjacency,
                     candidate.faces,
                     regions[source_label],
+                    np.asarray(semantic_basis.protected_mask, dtype=bool),
+                    vertex_projection.pixel_xy,
                 )
                 edge_groups.append(
                     (
@@ -881,8 +1102,8 @@ def project_multiview_nasal_boundaries(
                 & (
                     regions["nose_tip"]
                     | regions["tip_alar_transition"]
-                    | regions["nose_wing_subject_left"]
-                    | regions["nose_wing_subject_right"]
+                    | regions["subject_left_nose_wing"]
+                    | regions["subject_right_nose_wing"]
                 )
             )
             restricted = tuple(
@@ -941,4 +1162,5 @@ def project_multiview_nasal_boundaries(
         candidate_vertices=candidate.vertices,
         faces=candidate.faces,
         per_view=tuple(per_view),
+        observations=observations,
     )
