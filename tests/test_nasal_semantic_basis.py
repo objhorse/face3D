@@ -7,6 +7,10 @@ import pytest
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
+from src.geometry.observable_flame_subspace import (
+    ProjectionView,
+    build_observable_flame_subspace,
+)
 from src.geometry.nasal_semantic_basis import (
     NASAL_SEMANTIC_MODE_NAMES,
     NasalSemanticBasisConfig,
@@ -489,6 +493,102 @@ def test_front_camera_rotation_is_required_and_near_rotation_is_projected():
         )
 
 
+def test_semantic_masks_build_a_valid_observable_flame_subspace():
+    vertices, faces, triangles, barycentric = _synthetic_face()
+    angle = np.deg2rad(12.0)
+    exact_front = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ]
+    )
+    target_determinant = 0.99999968
+    first_scale = np.sqrt(1.0 - 4.41e-7)
+    real_like_front = (
+        np.diag([first_scale, target_determinant / first_scale, 1.0])
+        @ exact_front
+    )
+    semantic_basis = _build_basis(
+        vertices,
+        faces,
+        triangles,
+        barycentric,
+        model_to_front_camera=real_like_front,
+    )
+    intrinsic = np.array(
+        [
+            [820.0, 24.0, 320.0],
+            [0.0, 910.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    front_view = ProjectionView(
+        "front",
+        intrinsic,
+        real_like_front,
+        np.array([0.0, 0.0, 4.0]),
+    )
+    side_angle = np.deg2rad(27.0)
+    side_left = np.array(
+        [
+            [np.cos(side_angle), 0.0, np.sin(side_angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(side_angle), 0.0, np.cos(side_angle)],
+        ]
+    )
+    views = (
+        ProjectionView(
+            "subject-right",
+            intrinsic,
+            side_left.T @ front_view.R_model_to_camera,
+            np.array([0.0, 0.0, 4.0]),
+        ),
+        front_view,
+        ProjectionView(
+            "subject-left",
+            intrinsic,
+            side_left @ front_view.R_model_to_camera,
+            np.array([0.0, 0.0, 4.0]),
+        ),
+    )
+    flame_shape_basis = np.transpose(semantic_basis.vectors, (1, 2, 0))
+
+    result = build_observable_flame_subspace(
+        vertices,
+        flame_shape_basis,
+        semantic_basis.support_mask,
+        semantic_basis.protected_mask,
+        views,
+    )
+
+    np.testing.assert_allclose(
+        front_view.R_model_to_camera,
+        semantic_basis.semantic_frame.model_to_front_camera,
+        atol=1e-14,
+        rtol=0.0,
+    )
+    np.testing.assert_allclose(
+        front_view.R_model_to_camera @ front_view.R_model_to_camera.T,
+        np.eye(3),
+        atol=1e-12,
+    )
+    assert np.linalg.det(front_view.R_model_to_camera) == pytest.approx(1.0)
+    assert result.candidate_mode_indices.size > 0
+    assert result.retained_rank > 0
+    np.testing.assert_allclose(
+        result.coefficient_basis.T @ result.coefficient_basis,
+        np.eye(result.retained_rank),
+        atol=1e-12,
+    )
+    assert result.vertex_basis.shape == (
+        len(vertices),
+        3,
+        result.retained_rank,
+    )
+    assert result.report_data["status"] == "ok"
+
+
 def test_all_modes_have_low_pairwise_support_weighted_cosine(synthetic_basis):
     _vertices, _faces, _triangles, _barycentric, basis = synthetic_basis
     metric = basis.orthogonalization_weights
@@ -707,3 +807,24 @@ def test_invalid_indices_nonfinite_values_config_and_coefficients_fail(synthetic
         apply_nasal_semantic_basis(vertices, basis, invalid_coefficients)
     with pytest.raises(ValueError, match="vertices"):
         apply_nasal_semantic_basis(vertices[:-1], basis, np.zeros(8))
+
+
+@pytest.mark.parametrize(
+    "invalid_config",
+    [False, 0, {}],
+    ids=["false", "zero", "empty-mapping"],
+)
+def test_falsey_invalid_config_values_reach_type_validation(invalid_config):
+    vertices, faces, triangles, barycentric = _synthetic_face()
+
+    with pytest.raises(
+        ValueError,
+        match="config must be a NasalSemanticBasisConfig",
+    ):
+        _build_basis(
+            vertices,
+            faces,
+            triangles,
+            barycentric,
+            config=invalid_config,
+        )

@@ -677,7 +677,7 @@ def build_nasal_semantic_basis(
     subject-right wing. Camera depth is transformed back to model space, so
     positive depth always points opposite front-camera +Z.
     """
-    cfg = config or NasalSemanticBasisConfig()
+    cfg = NasalSemanticBasisConfig() if config is None else config
     if not isinstance(cfg, NasalSemanticBasisConfig):
         raise ValueError("config must be a NasalSemanticBasisConfig")
     verts, faces_np, landmark_triangles, barycentric = _validate_build_inputs(
