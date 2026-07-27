@@ -111,6 +111,7 @@ class ObservationCoordinates:
             "intrinsics": self.K.astype(float).tolist(),
             "distortion_coefficients": self.dist.astype(float).tolist(),
             "undistortion_applied": self.pixel_frame == "distorted",
+            "distorted_reverse_available": self.pixel_frame == "distorted",
             "conversion_source": "src.geometry.observation_coordinates",
         }
 
@@ -214,10 +215,18 @@ def work_points_to_original(
     *,
     target_pixel_frame: PixelFrame | None = None,
 ) -> np.ndarray:
-    """Map undistorted work pixels into the requested original pixel frame."""
+    """Map work pixels back, rejecting unavailable distorted calibration."""
     target = target_pixel_frame or coordinates.pixel_frame
     if target not in {"distorted", "undistorted"}:
         raise ValueError("target pixel frame must be distorted or undistorted")
+    if (
+        target == "distorted"
+        and coordinates.pixel_frame == "undistorted"
+    ):
+        raise ValueError(
+            "distorted target pixels are unavailable from an undistorted "
+            "contract because original distortion was not retained"
+        )
     values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     if target == "undistorted":
         return _scale_points(

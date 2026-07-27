@@ -129,6 +129,25 @@ def test_undistorted_contract_never_applies_a_second_undistortion(monkeypatch):
     assert frame_work.shape == (480, 640, 3)
 
 
+def test_undistorted_contract_rejects_distorted_reverse_conversion():
+    camera = _camera(dist=np.zeros(5, dtype=np.float64))
+    coordinates = ObservationCoordinates(
+        original_size=camera.image_size,
+        work_size=(640, 480),
+        K=camera.K,
+        dist=np.zeros(5, dtype=np.float64),
+        pixel_frame="undistorted",
+    )
+
+    assert coordinates.metadata()["distorted_reverse_available"] is False
+    with pytest.raises(ValueError, match="distorted.*unavailable"):
+        work_points_to_original(
+            np.array([[320.0, 240.0]], dtype=np.float64),
+            coordinates,
+            target_pixel_frame="distorted",
+        )
+
+
 def test_coordinate_contract_owns_read_only_calibration_copies():
     camera = _camera()
     coordinates = ObservationCoordinates.from_camera(

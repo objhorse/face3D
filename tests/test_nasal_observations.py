@@ -607,6 +607,42 @@ def test_ordered_anchor_dp_finds_legal_solution_rejected_by_greedy_choice():
     assert np.all(np.diff(indices) > 0)
 
 
+def test_ordered_anchor_dp_preserves_long_span_path_to_same_endpoint():
+    curve = np.column_stack(
+        (np.arange(12, dtype=np.float64), np.zeros(12, dtype=np.float64))
+    )
+    target_x = {
+        "upper_tip": 8.0,
+        "tip_apex": 9.0,
+        "lower_tip": 10.0,
+        "alar_transition": 11.0,
+    }
+    lines = {
+        name: np.array([1.0, 0.0, -x], dtype=np.float64)
+        for name, x in target_x.items()
+    }
+    priors = {
+        name: np.array([x, 0.0], dtype=np.float64)
+        for name, x in target_x.items()
+    }
+    config = NasalObservationConfig(
+        work_size=(12, 2),
+        min_boundary_points=12,
+        max_epipolar_distance_px=8.1,
+        max_side_prior_distance_px=8.1,
+    )
+
+    result = _ordered_epipolar_candidate(curve, lines, priors, config)
+
+    assert result is not None
+    matched_curve, anchors, _epipolar_errors, _prior_errors = result
+    assert len(matched_curve) == 12
+    assert anchors["upper_tip"] == pytest.approx([0.0, 0.0])
+    assert anchors["tip_apex"] == pytest.approx([9.0, 0.0])
+    assert anchors["lower_tip"] == pytest.approx([10.0, 0.0])
+    assert anchors["alar_transition"] == pytest.approx([11.0, 0.0])
+
+
 def test_front_confidence_is_stable_across_letterbox_mask_resolutions():
     camera = _camera("camera2", "front")
     config = _config()

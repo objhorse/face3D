@@ -1028,32 +1028,49 @@ def _ordered_epipolar_candidate(
         )
         costs[~eligible] = np.inf
         anchor_count, point_count = costs.shape
-        dynamic = np.full((anchor_count, point_count), np.inf)
-        previous = np.full((anchor_count, point_count), -1, dtype=np.int32)
-        dynamic[0] = costs[0]
-        for anchor_index in range(1, anchor_count):
-            best_cost = np.inf
-            best_point = -1
-            for point_index in range(point_count):
-                predecessor = point_index - 1
-                if (
-                    predecessor >= 0
-                    and dynamic[anchor_index - 1, predecessor] < best_cost
-                ):
-                    best_cost = dynamic[anchor_index - 1, predecessor]
-                    best_point = predecessor
-                if np.isfinite(costs[anchor_index, point_index]) and np.isfinite(
-                    best_cost
-                ):
-                    dynamic[anchor_index, point_index] = (
-                        best_cost + costs[anchor_index, point_index]
-                    )
-                    previous[anchor_index, point_index] = best_point
+        best_solution = None
+        for start_index in np.flatnonzero(np.isfinite(costs[0])):
+            minimum_end = int(start_index) + config.min_boundary_points - 1
+            if minimum_end >= point_count:
+                continue
+            dynamic = np.full((anchor_count, point_count), np.inf)
+            previous = np.full(
+                (anchor_count, point_count),
+                -1,
+                dtype=np.int32,
+            )
+            dynamic[0, start_index] = costs[0, start_index]
+            for anchor_index in range(1, anchor_count):
+                best_cost = np.inf
+                best_point = -1
+                for point_index in range(point_count):
+                    predecessor = point_index - 1
+                    if (
+                        predecessor >= 0
+                        and dynamic[
+                            anchor_index - 1,
+                            predecessor,
+                        ] < best_cost
+                    ):
+                        best_cost = dynamic[
+                            anchor_index - 1,
+                            predecessor,
+                        ]
+                        best_point = predecessor
+                    if (
+                        np.isfinite(costs[anchor_index, point_index])
+                        and np.isfinite(best_cost)
+                    ):
+                        dynamic[anchor_index, point_index] = (
+                            best_cost + costs[anchor_index, point_index]
+                        )
+                        previous[anchor_index, point_index] = best_point
 
-        for end_index in np.argsort(dynamic[-1]):
+            valid_end_costs = dynamic[-1, minimum_end:]
+            if not np.any(np.isfinite(valid_end_costs)):
+                continue
+            end_index = minimum_end + int(np.argmin(valid_end_costs))
             total_cost = float(dynamic[-1, end_index])
-            if not np.isfinite(total_cost):
-                break
             indices = np.empty(anchor_count, dtype=np.int32)
             indices[-1] = int(end_index)
             for anchor_index in range(anchor_count - 1, 0, -1):
@@ -1061,18 +1078,18 @@ def _ordered_epipolar_candidate(
                     anchor_index,
                     indices[anchor_index],
                 ]
-            if indices[0] < 0:
-                continue
-            if int(indices[-1] - indices[0] + 1) < config.min_boundary_points:
+            if indices[0] != start_index:
                 continue
             rows = np.arange(anchor_count)
-            return (
+            solution = (
                 total_cost,
                 indices,
                 epipolar_errors[rows, indices],
                 prior_errors[rows, indices],
             )
-        return None
+            if best_solution is None or total_cost < best_solution[0]:
+                best_solution = solution
+        return best_solution
 
     solutions = []
     for reversed_order, curve in (
