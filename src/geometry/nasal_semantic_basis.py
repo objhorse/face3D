@@ -46,9 +46,14 @@ _ROTATION_TOLERANCE = 1e-5
 
 
 def _readonly_array(value: np.ndarray, dtype=None) -> np.ndarray:
-    result = np.array(value, dtype=dtype, copy=True)
-    result.setflags(write=False)
-    return result
+    """Snapshot an array into an immutable bytes-backed NumPy view."""
+    contiguous = np.ascontiguousarray(value, dtype=dtype)
+    backing = contiguous.tobytes(order="C")
+    return np.frombuffer(
+        backing,
+        dtype=contiguous.dtype,
+        count=contiguous.size,
+    ).reshape(contiguous.shape)
 
 
 def _readonly_region_masks(

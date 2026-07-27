@@ -10,6 +10,7 @@ from scipy.sparse.csgraph import dijkstra
 from src.geometry.nasal_semantic_basis import (
     NASAL_SEMANTIC_MODE_NAMES,
     NasalSemanticBasisConfig,
+    NasalSemanticFrame,
     apply_nasal_semantic_basis,
     build_nasal_semantic_basis,
 )
@@ -174,6 +175,109 @@ def test_basis_names_dimensions_finite_deterministic_and_immutable():
         first.vectors[0, 0, 0] = 1.0
     with pytest.raises(TypeError):
         first.seed_indices["new"] = np.array([0])
+
+
+def test_all_public_arrays_have_non_writeable_backing_storage(synthetic_basis):
+    _vertices, _faces, _triangles, _barycentric, basis = synthetic_basis
+    public_arrays = {
+        "vectors": basis.vectors,
+        "weights": basis.weights,
+        "directions": basis.directions,
+        "scales": basis.scales,
+        "mode_support_masks": basis.mode_support_masks,
+        "protected_mask": basis.protected_mask,
+        "support_mask": basis.support_mask,
+        "orthogonalization_weights": basis.orthogonalization_weights,
+        "frame_origin": basis.semantic_frame.origin,
+        "frame_matrix": basis.semantic_frame.matrix,
+        "frame_rotation": basis.semantic_frame.model_to_front_camera,
+        "frame_subject_left": basis.semantic_frame.subject_left,
+        "frame_up": basis.semantic_frame.up,
+        "frame_depth": basis.semantic_frame.depth,
+    }
+    public_arrays.update(
+        {f"region:{name}": value for name, value in basis.region_masks.items()}
+    )
+    public_arrays.update(
+        {f"seed:{name}": value for name, value in basis.seed_indices.items()}
+    )
+
+    for name, value in public_arrays.items():
+        assert not value.flags.writeable, name
+        with pytest.raises(ValueError, match="WRITEABLE|writeable"):
+            value.setflags(write=True)
+
+
+def test_caller_owned_array_mutation_cannot_affect_stored_basis(synthetic_basis):
+    _vertices, _faces, _triangles, _barycentric, basis = synthetic_basis
+    array_sources = {
+        "vectors": basis.vectors.copy(),
+        "weights": basis.weights.copy(),
+        "directions": basis.directions.copy(),
+        "scales": basis.scales.copy(),
+        "mode_support_masks": basis.mode_support_masks.copy(),
+        "protected_mask": basis.protected_mask.copy(),
+        "support_mask": basis.support_mask.copy(),
+        "orthogonalization_weights": basis.orthogonalization_weights.copy(),
+    }
+    region_sources = {
+        name: value.copy() for name, value in basis.region_masks.items()
+    }
+    seed_sources = {
+        name: value.copy() for name, value in basis.seed_indices.items()
+    }
+    origin_source = basis.semantic_frame.origin.copy()
+    matrix_source = basis.semantic_frame.matrix.copy()
+    rotation_source = basis.semantic_frame.model_to_front_camera.copy()
+    frame = NasalSemanticFrame(
+        origin_source,
+        matrix_source,
+        rotation_source,
+    )
+    expected_arrays = {name: value.copy() for name, value in array_sources.items()}
+    expected_regions = {
+        name: value.copy() for name, value in region_sources.items()
+    }
+    expected_seeds = {
+        name: value.copy() for name, value in seed_sources.items()
+    }
+    expected_frame = (
+        origin_source.copy(),
+        matrix_source.copy(),
+        rotation_source.copy(),
+    )
+    frozen = replace(
+        basis,
+        semantic_frame=frame,
+        region_masks=region_sources,
+        seed_indices=seed_sources,
+        **array_sources,
+    )
+
+    for value in array_sources.values():
+        value.flat[0] = not value.flat[0] if value.dtype == bool else value.flat[0] + 1
+    for value in region_sources.values():
+        value.flat[0] = not value.flat[0]
+    for value in seed_sources.values():
+        value.flat[0] = 0
+    region_sources.clear()
+    seed_sources.clear()
+    origin_source[:] = 100.0
+    matrix_source[:] = 100.0
+    rotation_source[:] = 100.0
+
+    for name, expected in expected_arrays.items():
+        np.testing.assert_array_equal(getattr(frozen, name), expected)
+    for name, expected in expected_regions.items():
+        np.testing.assert_array_equal(frozen.region_masks[name], expected)
+    for name, expected in expected_seeds.items():
+        np.testing.assert_array_equal(frozen.seed_indices[name], expected)
+    np.testing.assert_array_equal(frozen.semantic_frame.origin, expected_frame[0])
+    np.testing.assert_array_equal(frozen.semantic_frame.matrix, expected_frame[1])
+    np.testing.assert_array_equal(
+        frozen.semantic_frame.model_to_front_camera,
+        expected_frame[2],
+    )
 
 
 def test_support_is_a_compact_physical_geodesic_neighborhood(synthetic_basis):
