@@ -140,17 +140,27 @@ def _validate_faces(value: np.ndarray, vertex_count: int) -> np.ndarray:
     canonical_faces = np.sort(faces.astype(np.int64, copy=False), axis=1)
     if len(np.unique(canonical_faces, axis=0)) != len(faces):
         raise ValueError("faces contain duplicate topology triangles")
-    edge_counts = {}
+    edge_directions = {}
     for triangle in faces:
         for first, second in (
             (triangle[0], triangle[1]),
             (triangle[1], triangle[2]),
             (triangle[2], triangle[0]),
         ):
-            edge = tuple(sorted((int(first), int(second))))
-            edge_counts[edge] = edge_counts.get(edge, 0) + 1
-    if any(count > 2 for count in edge_counts.values()):
+            directed = (int(first), int(second))
+            edge = tuple(sorted(directed))
+            edge_directions.setdefault(edge, []).append(directed)
+    if any(len(directions) > 2 for directions in edge_directions.values()):
         raise ValueError("faces contain non-manifold topology edges")
+    for directions in edge_directions.values():
+        if len(directions) == 2 and directions[0] != (
+            directions[1][1],
+            directions[1][0],
+        ):
+            raise ValueError(
+                "adjacent faces must traverse shared edges in opposite "
+                "directions with consistent winding"
+            )
     return faces
 
 
@@ -364,6 +374,12 @@ class ProjectedNasalSamples:
         boundaries = tuple(str(value) for value in self.boundary_names)
         if len(labels) != count or len(boundaries) != count:
             raise ValueError("sample labels must match the sample count")
+        unknown_labels = set(labels) - set(_REGION_NAMES)
+        if unknown_labels:
+            raise ValueError(
+                "source_labels must use canonical semantic region names: "
+                + ", ".join(sorted(unknown_labels))
+            )
         object.__setattr__(self, "semantic_view", str(self.semantic_view))
         object.__setattr__(self, "pixel_xy", _readonly_array(pixel_xy, np.float64))
         object.__setattr__(
@@ -396,6 +412,28 @@ class ProjectedNasalSamples:
         object.__setattr__(self, "depth", _readonly_array(depth, np.float64))
 
 
+def _snapshot_region_masks(
+    values: Mapping[str, np.ndarray],
+    vertex_count: int,
+) -> Mapping[str, np.ndarray]:
+    if not isinstance(values, Mapping) or set(values) != set(_REGION_NAMES):
+        raise ValueError(
+            "semantic_region_masks must contain the canonical semantic regions"
+        )
+    snapshots = {}
+    for name in _REGION_NAMES:
+        mask = np.asarray(values[name])
+        if mask.shape != (vertex_count,) or not np.issubdtype(
+            mask.dtype,
+            np.bool_,
+        ):
+            raise ValueError(
+                f"semantic_region_masks[{name}] must be boolean shape (V,)"
+            )
+        snapshots[name] = _readonly_array(mask, bool)
+    return MappingProxyType(snapshots)
+
+
 @dataclass(frozen=True)
 class MultiviewNasalProjection:
     """Candidate geometry and ordered immutable samples for all fixed views."""
@@ -403,13 +441,16 @@ class MultiviewNasalProjection:
     candidate_vertices: np.ndarray
     faces: np.ndarray
     per_view: Tuple[ProjectedNasalSamples, ...]
-    observations: NasalObservationBundle
+    observation_target_names: Tuple[Tuple[str, ...], ...]
+    semantic_region_masks: Mapping[str, np.ndarray]
 
     def __post_init__(self) -> None:
         vertices = _validate_vertices(self.candidate_vertices)
         faces = _validate_faces(self.faces, len(vertices))
-        if not isinstance(self.observations, NasalObservationBundle):
-            raise ValueError("observations must be a NasalObservationBundle")
+        region_masks = _snapshot_region_masks(
+            self.semantic_region_masks,
+            len(vertices),
+        )
         views = tuple(self.per_view)
         if (
             len(views) != len(NASAL_VIEWS)
@@ -418,8 +459,8 @@ class MultiviewNasalProjection:
         ):
             raise ValueError("per_view samples must use canonical three-view order")
         target_names = tuple(
-            tuple(sorted(self.observations.by_view[view].distance_fields))
-            for view in NASAL_VIEWS
+            tuple(str(name) for name in names)
+            for names in self.observation_target_names
         )
         if len(target_names) != len(NASAL_VIEWS) or any(
             not names or len(set(names)) != len(names)
@@ -463,6 +504,15 @@ class MultiviewNasalProjection:
                     "the corresponding observation: "
                     + ", ".join(sorted(unknown_targets))
                 )
+            for label, edge in zip(
+                samples.source_labels,
+                samples.source_vertex_indices,
+            ):
+                if not np.all(region_masks[label][edge]):
+                    raise ValueError(
+                        f"{samples.semantic_view} source edge is not represented "
+                        f"by semantic region {label}"
+                    )
         front_samples = views[0]
         for source_label, boundary_name in _FRONT_REGIONS:
             contributed = any(
@@ -483,6 +533,16 @@ class MultiviewNasalProjection:
         )
         object.__setattr__(self, "faces", _readonly_array(faces, faces.dtype))
         object.__setattr__(self, "per_view", views)
+        object.__setattr__(
+            self,
+            "observation_target_names",
+            target_names,
+        )
+        object.__setattr__(
+            self,
+            "semantic_region_masks",
+            region_masks,
+        )
 
     @property
     def by_view(self) -> Mapping[str, ProjectedNasalSamples]:
@@ -492,14 +552,6 @@ class MultiviewNasalProjection:
                 for samples in self.per_view
             }
         )
-
-    @property
-    def observation_target_names(self) -> Tuple[Tuple[str, ...], ...]:
-        return tuple(
-            tuple(sorted(self.observations.by_view[view].distance_fields))
-            for view in NASAL_VIEWS
-        )
-
 
 def _canonical_views(views: Sequence[ProjectionView]) -> Tuple[ProjectionView, ...]:
     try:
@@ -650,6 +702,45 @@ def _external_region_boundary_edges(
     )
 
 
+def _front_external_edge_groups(
+    adjacency,
+    faces: np.ndarray,
+    regions: Mapping[str, np.ndarray],
+    protected_mask: np.ndarray,
+    projected_vertices: np.ndarray,
+):
+    composite = (
+        regions["subject_left_nose_wing"]
+        | regions["subject_right_nose_wing"]
+        | regions["nose_tip"]
+        | regions["tip_alar_transition"]
+    ) & ~np.asarray(protected_mask, dtype=bool)
+    external_edges = _external_region_boundary_edges(
+        adjacency,
+        faces,
+        composite,
+        protected_mask,
+        projected_vertices,
+    )
+    classified = {name: [] for name, _target in _FRONT_REGIONS}
+    for edge in external_edges:
+        represented = [
+            name
+            for name, _target in _FRONT_REGIONS
+            if np.all(regions[name][np.asarray(edge, dtype=np.int64)])
+        ]
+        if len(represented) == 1:
+            classified[represented[0]].append(edge)
+    return tuple(
+        (
+            source_label,
+            boundary_name,
+            tuple(sorted(classified[source_label])),
+        )
+        for source_label, boundary_name in _FRONT_REGIONS
+    )
+
+
 def _silhouette_edges(
     adjacency,
     camera_points: np.ndarray,
@@ -726,15 +817,11 @@ def _source_label(
     first: int,
     second: int,
     regions: Mapping[str, np.ndarray],
-) -> str:
-    best_name = _SOURCE_PRIORITY[-1]
-    best_score = -1
+) -> Optional[str]:
     for name in _SOURCE_PRIORITY:
-        score = int(regions[name][first]) + int(regions[name][second])
-        if score > best_score:
-            best_name = name
-            best_score = score
-    return best_name
+        if regions[name][first] and regions[name][second]:
+            return name
+    return None
 
 
 def _sparse_visibility(
@@ -842,6 +929,7 @@ def _project_edge_groups(
     observation,
     view: ProjectionView,
     config: MultiviewNasalSamplingConfig,
+    regions: Optional[Mapping[str, np.ndarray]] = None,
 ) -> ProjectedNasalSamples:
     vertex_projection = project_points_strict(
         candidate.vertices,
@@ -865,7 +953,20 @@ def _project_edge_groups(
         all_points.append(points)
         all_indices.append(indices)
         all_weights.append(weights)
-        all_labels.extend([source_label] * len(points))
+        if source_label is None:
+            if regions is None:
+                raise ValueError("semantic regions are required for edge labeling")
+            labels = [
+                _source_label(int(edge[0]), int(edge[1]), regions)
+                for edge in indices
+            ]
+            if any(label is None for label in labels):
+                raise ValueError(
+                    "profile edge has no common canonical semantic source"
+                )
+            all_labels.extend(labels)
+        else:
+            all_labels.extend([source_label] * len(points))
         all_boundaries.extend([boundary_name] * len(points))
     if not all_points or not sum(len(value) for value in all_points):
         raise ValueError(f"no valid nasal samples exist for {semantic_view}")
@@ -1067,23 +1168,22 @@ def project_multiview_nasal_boundaries(
                 view.t_model_to_camera,
                 epsilon=float(limits.min_depth),
             )
-            edge_groups = []
-            for source_label, boundary_name in _FRONT_REGIONS:
-                edges = _external_region_boundary_edges(
-                    adjacency,
-                    candidate.faces,
-                    regions[source_label],
-                    np.asarray(semantic_basis.protected_mask, dtype=bool),
-                    vertex_projection.pixel_xy,
+            front_groups = _front_external_edge_groups(
+                adjacency,
+                candidate.faces,
+                regions,
+                np.asarray(semantic_basis.protected_mask, dtype=bool),
+                vertex_projection.pixel_xy,
+            )
+            edge_groups = [
+                (
+                    edges,
+                    int(limits.front_samples_per_region),
+                    source_label,
+                    boundary_name,
                 )
-                edge_groups.append(
-                    (
-                        edges,
-                        int(limits.front_samples_per_region),
-                        source_label,
-                        boundary_name,
-                    )
-                )
+                for source_label, boundary_name, edges in front_groups
+            ]
         else:
             vertex_projection = project_points_strict(
                 candidate.vertices,
@@ -1114,6 +1214,8 @@ def project_multiview_nasal_boundaries(
             by_label = {}
             for edge in restricted:
                 label = _source_label(edge[0], edge[1], regions)
+                if label is None:
+                    continue
                 by_label.setdefault(label, []).append(edge)
             ordered_edges = tuple(
                 edge
@@ -1124,7 +1226,7 @@ def project_multiview_nasal_boundaries(
                 (
                     ordered_edges,
                     int(limits.side_samples_per_view),
-                    "nasal-profile",
+                    None,
                     "nasal-profile",
                 )
             ]
@@ -1135,32 +1237,16 @@ def project_multiview_nasal_boundaries(
             observation,
             view,
             limits,
+            regions,
         )
-        if semantic_view != "front":
-            side_labels = tuple(
-                _source_label(
-                    int(indices[0]),
-                    int(indices[1]),
-                    regions,
-                )
-                for indices in samples.source_vertex_indices
-            )
-            samples = ProjectedNasalSamples(
-                semantic_view=samples.semantic_view,
-                pixel_xy=samples.pixel_xy,
-                model_points=samples.model_points,
-                source_vertex_indices=samples.source_vertex_indices,
-                source_weights=samples.source_weights,
-                confidence=samples.confidence,
-                source_labels=side_labels,
-                boundary_names=samples.boundary_names,
-                visible=samples.visible,
-                depth=samples.depth,
-            )
         per_view.append(samples)
     return MultiviewNasalProjection(
         candidate_vertices=candidate.vertices,
         faces=candidate.faces,
         per_view=tuple(per_view),
-        observations=observations,
+        observation_target_names=tuple(
+            tuple(sorted(observations.by_view[name].distance_fields))
+            for name in NASAL_VIEWS
+        ),
+        semantic_region_masks=regions,
     )

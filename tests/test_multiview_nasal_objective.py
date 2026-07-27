@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import replace
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass, replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,6 +16,7 @@ from src.geometry.multiview_nasal_objective import (
     ProjectedNasalSamples,
     _edge_adjacency,
     _external_region_boundary_edges,
+    _front_external_edge_groups,
     _silhouette_edges,
     _sparse_visibility,
     build_candidate_nasal_mesh,
@@ -49,29 +51,13 @@ def _rotation_y(degrees: float) -> np.ndarray:
 
 
 def _mesh():
-    vertices = np.array(
-        [
-            [-1.2, -0.8, 4.0],
-            [-0.6, 0.0, 4.0],
-            [-1.2, 0.8, 4.0],
-            [-0.3, -0.8, 3.6],
-            [0.3, -0.8, 3.6],
-            [0.0, 0.8, 3.5],
-            [0.6, 0.0, 4.0],
-            [1.2, -0.8, 4.0],
-            [1.2, 0.8, 4.0],
-        ],
-        dtype=np.float64,
+    vertices, faces = _grid_mesh(3)
+    vertices[:, 0] -= 1.0
+    vertices[:, 1] -= 1.0
+    vertices[:, 2] = np.array(
+        [4.0, 3.8, 4.0, 4.0, 3.5, 4.0, 4.0, 3.8, 4.0]
     )
-    faces = np.array(
-        [
-            [0, 2, 1],
-            [3, 5, 4],
-            [6, 8, 7],
-        ],
-        dtype=np.int32,
-    )
-    return vertices, faces
+    return vertices, faces.astype(np.int32)
 
 
 def _grid_mesh(size: int = 7):
@@ -108,10 +94,10 @@ def _bases(vertex_count: int):
     subject_right = np.zeros(vertex_count, dtype=bool)
     transition = np.ones(vertex_count, dtype=bool)
     if vertex_count == 9:
-        bridge[3:6] = True
-        tip[3:6] = True
-        subject_left[6:9] = True
-        subject_right[0:3] = True
+        bridge[[1, 4, 7]] = True
+        tip[[1, 4, 7]] = True
+        subject_left[[2, 5, 8]] = True
+        subject_right[[0, 3, 6]] = True
     else:
         tip[-3:] = True
         subject_left[4:7] = True
@@ -380,6 +366,13 @@ def test_known_camera_projects_samples_in_declared_work_frame():
         )
         for samples in result.per_view
     )
+    for samples in result.per_view:
+        for label, edge in zip(
+            samples.source_labels,
+            samples.source_vertex_indices,
+        ):
+            assert label in result.semantic_region_masks
+            assert np.all(result.semantic_region_masks[label][edge])
 
 
 def test_zero_and_nonzero_flame_and_semantic_coefficients_compose_exactly():
@@ -422,6 +415,40 @@ def test_zero_and_nonzero_flame_and_semantic_coefficients_compose_exactly():
     np.testing.assert_allclose(changed.vertices, expected, atol=1e-15)
     np.testing.assert_array_equal(changed.faces, faces)
     assert changed.faces.dtype == faces.dtype
+
+
+def test_adjacent_coplanar_faces_must_have_opposite_shared_edge_winding():
+    vertices = np.array(
+        [
+            [-1.0, -1.0, 4.0],
+            [1.0, -1.0, 4.0],
+            [1.0, 1.0, 4.0],
+            [-1.0, 1.0, 4.0],
+        ]
+    )
+    consistent = np.array([[0, 2, 1], [0, 3, 2]], dtype=np.int64)
+    inconsistent = np.array([[0, 2, 1], [0, 2, 3]], dtype=np.int64)
+    observable, semantic = _bases(len(vertices))
+
+    candidate = build_candidate_nasal_mesh(
+        vertices,
+        consistent,
+        observable,
+        semantic,
+        np.zeros(2),
+        np.zeros(8),
+    )
+
+    np.testing.assert_array_equal(candidate.faces, consistent)
+    with pytest.raises(ValueError, match="winding|opposite directions"):
+        build_candidate_nasal_mesh(
+            vertices,
+            inconsistent,
+            observable,
+            semantic,
+            np.zeros(2),
+            np.zeros(8),
+        )
 
 
 def test_real_semantic_and_observable_dataclasses_integrate_with_scaled_work_frame():
@@ -673,6 +700,67 @@ def test_external_front_contours_exclude_holes_and_protected_islands_with_overla
         assert not np.any(protected[used])
 
 
+def test_front_classification_uses_one_composite_exterior_and_excludes_medial_edges():
+    size = 9
+    vertices, faces = _grid_mesh(size)
+    projected = vertices[:, :2] * 8.0 + 20.0
+    adjacency = _edge_adjacency(faces)
+    rows, columns = np.divmod(np.arange(len(vertices)), size)
+    protected = (rows == 4) & (columns == 4)
+    regions = {
+        "nose_bridge": (columns == 4) & ~protected,
+        "nose_tip": (columns >= 3) & (columns <= 5) & ~protected,
+        "subject_left_nose_wing": (columns >= 4) & ~protected,
+        "subject_right_nose_wing": (columns <= 4) & ~protected,
+        "tip_alar_transition": (columns >= 2) & (columns <= 6) & ~protected,
+    }
+    composite = (
+        regions["subject_left_nose_wing"]
+        | regions["subject_right_nose_wing"]
+        | regions["nose_tip"]
+        | regions["tip_alar_transition"]
+    )
+    external = set(
+        _external_region_boundary_edges(
+            adjacency,
+            faces,
+            composite,
+            protected,
+            projected,
+        )
+    )
+
+    groups = _front_external_edge_groups(
+        adjacency,
+        faces,
+        regions,
+        protected,
+        projected,
+    )
+    classified = {
+        edge
+        for _source, _target, edges in groups
+        for edge in edges
+    }
+    medial_edge = tuple(
+        sorted(
+            (
+                2 * size + 4,
+                3 * size + 4,
+            )
+        )
+    )
+
+    assert {source for source, _target, _edges in groups} == {
+        "subject_left_nose_wing",
+        "subject_right_nose_wing",
+    }
+    assert classified
+    assert classified.issubset(external)
+    assert medial_edge not in external
+    assert medial_edge not in classified
+
+
 def test_subject_labels_do_not_follow_image_x_ordering():
     normal = _problem(reverse_image_x=False)
     reversed_x = _problem(reverse_image_x=True)
@@ -825,7 +913,35 @@ def test_camera_metadata_must_match_the_immutable_observation_camera():
         )
 
 
-def test_returned_arrays_are_deeply_immutable():
+def _reachable_arrays(value, seen=None):
+    visited = set() if seen is None else seen
+    if id(value) in visited:
+        return []
+    visited.add(id(value))
+    if isinstance(value, np.ndarray):
+        return [value]
+    if is_dataclass(value):
+        return [
+            array
+            for field in fields(value)
+            for array in _reachable_arrays(getattr(value, field.name), visited)
+        ]
+    if isinstance(value, Mapping):
+        return [
+            array
+            for item in value.values()
+            for array in _reachable_arrays(item, visited)
+        ]
+    if isinstance(value, (tuple, list)):
+        return [
+            array
+            for item in value
+            for array in _reachable_arrays(item, visited)
+        ]
+    return []
+
+
+def test_every_reachable_result_array_is_deeply_immutable_and_isolated():
     candidate, semantic, observations, views = _problem()
     result = project_multiview_nasal_boundaries(
         candidate,
@@ -834,24 +950,34 @@ def test_returned_arrays_are_deeply_immutable():
         views,
         config=_config(),
     )
-    arrays = [result.candidate_vertices, result.faces]
-    for samples in result.per_view:
-        arrays.extend(
-            [
-                samples.pixel_xy,
-                samples.model_points,
-                samples.source_vertex_indices,
-                samples.source_weights,
-                samples.confidence,
-                samples.visible,
-                samples.depth,
-            ]
-        )
+    observation_arrays = _reachable_arrays(observations)
+    result_arrays = _reachable_arrays(result)
+    region_snapshot = {
+        name: mask.copy()
+        for name, mask in result.semantic_region_masks.items()
+    }
 
-    for array in arrays:
+    assert not hasattr(result, "observations")
+    assert result_arrays
+    assert not any(
+        result_array is observation_array
+        for result_array in result_arrays
+        for observation_array in observation_arrays
+    )
+    for array in result_arrays:
         assert not array.flags.writeable
         with pytest.raises(ValueError, match="WRITEABLE|writeable"):
             array.setflags(write=True)
+    with pytest.raises(TypeError):
+        result.semantic_region_masks["new"] = np.zeros(
+            len(result.candidate_vertices),
+            dtype=bool,
+        )
+
+    for mask in semantic.region_masks.values():
+        mask[:] = False
+    for name, snapshot in region_snapshot.items():
+        np.testing.assert_array_equal(result.semantic_region_masks[name], snapshot)
 
 
 def test_result_rejects_empty_targets_and_invalid_provenance():
@@ -886,7 +1012,8 @@ def test_result_rejects_empty_targets_and_invalid_provenance():
             result.faces,
             (replace(front, source_vertex_indices=bad_indices),)
             + result.per_view[1:],
-            result.observations,
+            result.observation_target_names,
+            result.semantic_region_masks,
         )
 
     bad_points = front.model_points.copy()
@@ -896,7 +1023,8 @@ def test_result_rejects_empty_targets_and_invalid_provenance():
             result.candidate_vertices,
             result.faces,
             (replace(front, model_points=bad_points),) + result.per_view[1:],
-            result.observations,
+            result.observation_target_names,
+            result.semantic_region_masks,
         )
 
     bad_targets = tuple("not-an-observation-target" for _ in front.boundary_names)
@@ -905,13 +1033,42 @@ def test_result_rejects_empty_targets_and_invalid_provenance():
             result.candidate_vertices,
             result.faces,
             (replace(front, boundary_names=bad_targets),) + result.per_view[1:],
-            result.observations,
+            result.observation_target_names,
+            result.semantic_region_masks,
         )
 
     bad_weights = front.source_weights.copy()
     bad_weights[0] = (-0.5, 1.5)
     with pytest.raises(ValueError, match="provenance|weight"):
         replace(front, source_weights=bad_weights)
+
+
+def test_result_rejects_unknown_and_mislabeled_semantic_sources():
+    candidate, semantic, observations, views = _problem()
+    result = project_multiview_nasal_boundaries(
+        candidate,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    front = result.per_view[0]
+    unknown = ("not-a-semantic-region",) + front.source_labels[1:]
+    with pytest.raises(ValueError, match="canonical.*source|semantic region"):
+        replace(front, source_labels=unknown)
+
+    labels = list(front.source_labels)
+    left_index = labels.index("subject_left_nose_wing")
+    labels[left_index] = "subject_right_nose_wing"
+    mislabeled = replace(front, source_labels=tuple(labels))
+    with pytest.raises(ValueError, match="source.*region|represented"):
+        MultiviewNasalProjection(
+            result.candidate_vertices,
+            result.faces,
+            (mislabeled,) + result.per_view[1:],
+            result.observation_target_names,
+            result.semantic_region_masks,
+        )
 
 
 def test_missing_mandatory_front_alar_group_fails_clearly():
