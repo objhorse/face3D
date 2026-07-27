@@ -22,7 +22,7 @@ __all__ = [
     "perspective_projection_jacobian",
 ]
 
-_ROTATION_TOLERANCE = 1e-7
+_ROTATION_TOLERANCE = 1e-5
 _INTRINSIC_TOLERANCE = 1e-10
 
 
@@ -88,7 +88,11 @@ def _validate_rotation(value: np.ndarray) -> np.ndarray:
         raise ValueError("model-to-camera rotation must be rigid")
     if determinant <= 0.0 or abs(determinant - 1.0) > _ROTATION_TOLERANCE:
         raise ValueError("model-to-camera rotation must have determinant +1")
-    return rotation
+    left, _singular_values, right_t = np.linalg.svd(rotation)
+    projected = left @ right_t
+    if float(np.linalg.det(projected)) <= 0.0:
+        raise ValueError("model-to-camera rotation must not be a reflection")
+    return projected
 
 
 def _validate_intrinsics(value: np.ndarray) -> np.ndarray:
@@ -164,7 +168,7 @@ class ObservableFlameSubspaceConfig:
     """Fixed subject-independent screening and observability thresholds."""
 
     min_nasal_response_ratio: float = 0.55
-    max_protected_to_nasal_ratio: float = 0.75
+    max_protected_to_nasal_energy_ratio: float = 0.75
     relative_nasal_energy_floor: float = 0.03
     relative_singular_value_threshold: float = 1e-3
     max_rank: int = 24
@@ -180,8 +184,8 @@ class ObservableFlameSubspaceConfig:
             maximum=1.0,
         )
         _finite_real(
-            "max_protected_to_nasal_ratio",
-            self.max_protected_to_nasal_ratio,
+            "max_protected_to_nasal_energy_ratio",
+            self.max_protected_to_nasal_energy_ratio,
             minimum=0.0,
         )
         _finite_real(
@@ -213,14 +217,18 @@ class ObservableFlameSubspaceConfig:
 
 @dataclass(frozen=True)
 class ProjectionViewMetadata:
-    """Deterministic row scaling and numerical rank for one view block."""
+    """Intrinsic normalization, row scaling, and rank for one view block."""
 
     name: str
     row_count: int
     support_vertex_count: int
-    focal_scale: float
+    intrinsic_normalization_matrix: tuple[
+        tuple[float, float],
+        tuple[float, float],
+    ]
     row_scale: float
-    unscaled_frobenius_norm: float
+    pixel_frobenius_norm: float
+    balanced_frobenius_norm: float
     rank: int
 
     def __post_init__(self) -> None:
@@ -234,14 +242,34 @@ class ProjectionViewMetadata:
                 or int(value) < 0
             ):
                 raise ValueError(f"{name} must be a non-negative integer")
-        for name in ("focal_scale", "row_scale"):
-            if _finite_real(name, getattr(self, name), minimum=0.0) <= 0.0:
-                raise ValueError(f"{name} must be greater than zero")
-        _finite_real(
-            "unscaled_frobenius_norm",
-            self.unscaled_frobenius_norm,
-            minimum=0.0,
+        try:
+            normalization = np.asarray(
+                self.intrinsic_normalization_matrix,
+                dtype=np.float64,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "intrinsic_normalization_matrix must be numeric"
+            ) from exc
+        if normalization.shape != (2, 2) or not np.isfinite(
+            normalization
+        ).all():
+            raise ValueError(
+                "intrinsic_normalization_matrix must be a finite 2x2 matrix"
+            )
+        normalization_tuple = tuple(
+            tuple(float(item) for item in row)
+            for row in normalization
         )
+        object.__setattr__(
+            self,
+            "intrinsic_normalization_matrix",
+            normalization_tuple,
+        )
+        if _finite_real("row_scale", self.row_scale, minimum=0.0) <= 0.0:
+            raise ValueError("row_scale must be greater than zero")
+        for name in ("pixel_frobenius_norm", "balanced_frobenius_norm"):
+            _finite_real(name, getattr(self, name), minimum=0.0)
         if int(self.row_count) != 2 * int(self.support_vertex_count):
             raise ValueError(
                 "row_count must equal twice the support_vertex_count"
@@ -258,12 +286,12 @@ class ObservableFlameSubspaceResult:
     vertex_basis: np.ndarray
     candidate_mode_indices: np.ndarray
     screening_pass_mask: np.ndarray
-    nasal_rms: np.ndarray
-    outside_rms: np.ndarray
-    protected_rms: np.ndarray
+    nasal_mean_squared_energy: np.ndarray
+    outside_mean_squared_energy: np.ndarray
+    protected_mean_squared_energy: np.ndarray
     nasal_response_ratio: np.ndarray
-    outside_to_nasal_ratio: np.ndarray
-    protected_to_nasal_ratio: np.ndarray
+    outside_to_nasal_energy_ratio: np.ndarray
+    protected_to_nasal_energy_ratio: np.ndarray
     relative_nasal_energy: np.ndarray
     singular_values: np.ndarray
     retained_rank: int
@@ -290,12 +318,12 @@ class ObservableFlameSubspaceResult:
         )
         pass_mask = _readonly_array(self.screening_pass_mask, bool)
         metric_names = (
-            "nasal_rms",
-            "outside_rms",
-            "protected_rms",
+            "nasal_mean_squared_energy",
+            "outside_mean_squared_energy",
+            "protected_mean_squared_energy",
             "nasal_response_ratio",
-            "outside_to_nasal_ratio",
-            "protected_to_nasal_ratio",
+            "outside_to_nasal_energy_ratio",
+            "protected_to_nasal_energy_ratio",
             "relative_nasal_energy",
         )
         metrics = {
@@ -511,10 +539,13 @@ def perspective_projection_jacobian(
     return _readonly_array(jacobian, np.float64)
 
 
-def _per_vertex_rms(squared_energy: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def _mean_vertex_energy(
+    squared_energy: np.ndarray,
+    mask: np.ndarray,
+) -> np.ndarray:
     if not np.any(mask):
         return np.zeros(squared_energy.shape[1], dtype=np.float64)
-    return np.sqrt(np.mean(squared_energy[mask], axis=0))
+    return np.mean(squared_energy[mask], axis=0)
 
 
 def _screen_modes(
@@ -525,36 +556,36 @@ def _screen_modes(
 ):
     squared_energy = np.sum(shape_basis * shape_basis, axis=1)
     outside_mask = ~(support_mask | protected_mask)
-    nasal_rms = _per_vertex_rms(squared_energy, support_mask)
-    outside_rms = _per_vertex_rms(squared_energy, outside_mask)
-    protected_rms = _per_vertex_rms(squared_energy, protected_mask)
+    nasal_energy = _mean_vertex_energy(squared_energy, support_mask)
+    outside_energy = _mean_vertex_energy(squared_energy, outside_mask)
+    protected_energy = _mean_vertex_energy(squared_energy, protected_mask)
     epsilon = float(config.screening_epsilon)
 
-    response_denominator = nasal_rms + outside_rms
+    response_denominator = nasal_energy + outside_energy
     nasal_response_ratio = np.divide(
-        nasal_rms,
+        nasal_energy,
         response_denominator,
-        out=np.zeros_like(nasal_rms),
+        out=np.zeros_like(nasal_energy),
         where=response_denominator > epsilon,
     )
-    safe_nasal = np.maximum(nasal_rms, epsilon)
-    outside_to_nasal = outside_rms / safe_nasal
-    protected_to_nasal = protected_rms / safe_nasal
-    strongest_nasal = float(np.max(nasal_rms))
+    safe_nasal = np.maximum(nasal_energy, epsilon)
+    outside_to_nasal = outside_energy / safe_nasal
+    protected_to_nasal = protected_energy / safe_nasal
+    strongest_nasal = float(np.max(nasal_energy))
     if strongest_nasal <= epsilon:
-        relative_nasal = np.zeros_like(nasal_rms)
+        relative_nasal = np.zeros_like(nasal_energy)
     else:
-        relative_nasal = nasal_rms / strongest_nasal
+        relative_nasal = nasal_energy / strongest_nasal
 
     pass_mask = (
-        (nasal_rms > epsilon)
+        (nasal_energy > epsilon)
         & (
             nasal_response_ratio
             >= float(config.min_nasal_response_ratio)
         )
         & (
             protected_to_nasal
-            <= float(config.max_protected_to_nasal_ratio)
+            <= float(config.max_protected_to_nasal_energy_ratio)
         )
         & (
             relative_nasal
@@ -562,19 +593,31 @@ def _screen_modes(
         )
     )
     return {
-        "nasal_rms": nasal_rms,
-        "outside_rms": outside_rms,
-        "protected_rms": protected_rms,
+        "nasal_mean_squared_energy": nasal_energy,
+        "outside_mean_squared_energy": outside_energy,
+        "protected_mean_squared_energy": protected_energy,
         "nasal_response_ratio": nasal_response_ratio,
-        "outside_to_nasal_ratio": outside_to_nasal,
-        "protected_to_nasal_ratio": protected_to_nasal,
+        "outside_to_nasal_energy_ratio": outside_to_nasal,
+        "protected_to_nasal_energy_ratio": protected_to_nasal,
         "relative_nasal_energy": relative_nasal,
         "pass_mask": pass_mask,
     }
 
 
-def _focal_scale(intrinsic: np.ndarray) -> float:
-    return float(np.linalg.norm(intrinsic[:2, :2]) / np.sqrt(2.0))
+def _balance_view_jacobian(
+    pixel_jacobian: np.ndarray,
+    intrinsic: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    row_count = int(pixel_jacobian.shape[0])
+    normalization = np.linalg.inv(intrinsic[:2, :2])
+    normalized = np.einsum(
+        "ij,vjs->vis",
+        normalization,
+        pixel_jacobian.reshape(row_count // 2, 2, pixel_jacobian.shape[1]),
+        optimize=True,
+    ).reshape(pixel_jacobian.shape)
+    row_scale = 1.0 / np.sqrt(float(row_count))
+    return normalized * row_scale, normalization, row_scale
 
 
 def _numerical_rank(
@@ -613,9 +656,10 @@ def build_observable_flame_subspace(
 ) -> ObservableFlameSubspaceResult:
     """Screen FLAME modes and retain the fixed three-view observable subspace.
 
-    Row scaling divides every view block by its intrinsic focal scale and by
-    ``sqrt(2 * support_vertex_count)``. This converts pixel derivatives to a
-    resolution-neutral averaged angular response without amplifying a
+    Each per-vertex two-row pixel block is premultiplied by the inverse 2x2
+    intrinsic linear block, including focal anisotropy and skew, then divided
+    by ``sqrt(2 * support_vertex_count)``. This gives a resolution-neutral
+    averaged normalized-camera-coordinate response without amplifying a
     geometrically weak view to unit norm.
     """
     cfg = config or ObservableFlameSubspaceConfig()
@@ -647,18 +691,21 @@ def build_observable_flame_subspace(
             min_depth=float(cfg.min_depth),
         )
         row_count = int(raw_jacobian.shape[0])
-        focal_scale = _focal_scale(view.K)
-        row_scale = 1.0 / (focal_scale * np.sqrt(float(row_count)))
-        view_blocks.append(raw_jacobian * row_scale)
+        balanced, normalization, row_scale = _balance_view_jacobian(
+            raw_jacobian,
+            view.K,
+        )
+        view_blocks.append(balanced)
         metadata.append(
             ProjectionViewMetadata(
                 name=view.name,
                 row_count=row_count,
                 support_vertex_count=int(np.count_nonzero(support)),
-                focal_scale=focal_scale,
+                intrinsic_normalization_matrix=normalization,
                 row_scale=row_scale,
-                unscaled_frobenius_norm=float(np.linalg.norm(raw_jacobian)),
-                rank=_numerical_rank(raw_jacobian, cfg),
+                pixel_frobenius_norm=float(np.linalg.norm(raw_jacobian)),
+                balanced_frobenius_norm=float(np.linalg.norm(balanced)),
+                rank=_numerical_rank(balanced, cfg),
             )
         )
 
@@ -700,7 +747,7 @@ def build_observable_flame_subspace(
         optimize=True,
     )
     report = {
-        "schema": "observable-flame-subspace-v1",
+        "schema": "observable-flame-subspace-v2",
         "status": status,
         "config": asdict(cfg),
         "view_names": list(OBSERVABLE_FLAME_VIEW_NAMES),
@@ -711,20 +758,37 @@ def build_observable_flame_subspace(
         "candidate_mode_count": int(len(candidate_indices)),
         "candidate_mode_indices": [int(item) for item in candidate_indices],
         "retained_rank": retained_rank,
+        "view_validation": {
+            "rotation_orthogonality_tolerance": float(_ROTATION_TOLERANCE),
+            "rotation_determinant_tolerance": float(_ROTATION_TOLERANCE),
+            "accepted_rotation_handling": "nearest proper SO(3) via SVD",
+            "intrinsic_final_row_tolerance": float(_INTRINSIC_TOLERANCE),
+        },
         "screening": {
-            "energy_normalization": "per-vertex RMS displacement",
+            "energy_normalization": "mean per-vertex squared displacement",
             "outside_excludes_protected": True,
-            "nasal_rms": [float(item) for item in metrics["nasal_rms"]],
-            "outside_rms": [float(item) for item in metrics["outside_rms"]],
-            "protected_rms": [float(item) for item in metrics["protected_rms"]],
+            "nasal_mean_squared_energy": [
+                float(item)
+                for item in metrics["nasal_mean_squared_energy"]
+            ],
+            "outside_mean_squared_energy": [
+                float(item)
+                for item in metrics["outside_mean_squared_energy"]
+            ],
+            "protected_mean_squared_energy": [
+                float(item)
+                for item in metrics["protected_mean_squared_energy"]
+            ],
             "nasal_response_ratio": [
                 float(item) for item in metrics["nasal_response_ratio"]
             ],
-            "outside_to_nasal_ratio": [
-                float(item) for item in metrics["outside_to_nasal_ratio"]
+            "outside_to_nasal_energy_ratio": [
+                float(item)
+                for item in metrics["outside_to_nasal_energy_ratio"]
             ],
-            "protected_to_nasal_ratio": [
-                float(item) for item in metrics["protected_to_nasal_ratio"]
+            "protected_to_nasal_energy_ratio": [
+                float(item)
+                for item in metrics["protected_to_nasal_energy_ratio"]
             ],
             "relative_nasal_energy": [
                 float(item) for item in metrics["relative_nasal_energy"]
@@ -732,7 +796,9 @@ def build_observable_flame_subspace(
             "pass_mask": [bool(item) for item in metrics["pass_mask"]],
         },
         "row_balancing": (
-            "each view divided by focal_scale*sqrt(2*support_vertex_count)"
+            "each 2-row vertex block premultiplied by the inverse 2x2 "
+            "intrinsic linear block, then divided by "
+            "sqrt(2*support_vertex_count)"
         ),
         "singular_values": [float(item) for item in singular_values],
         "views": [asdict(item) for item in metadata],
@@ -742,12 +808,18 @@ def build_observable_flame_subspace(
         vertex_basis=vertex_basis,
         candidate_mode_indices=candidate_indices,
         screening_pass_mask=metrics["pass_mask"],
-        nasal_rms=metrics["nasal_rms"],
-        outside_rms=metrics["outside_rms"],
-        protected_rms=metrics["protected_rms"],
+        nasal_mean_squared_energy=metrics["nasal_mean_squared_energy"],
+        outside_mean_squared_energy=metrics["outside_mean_squared_energy"],
+        protected_mean_squared_energy=metrics[
+            "protected_mean_squared_energy"
+        ],
         nasal_response_ratio=metrics["nasal_response_ratio"],
-        outside_to_nasal_ratio=metrics["outside_to_nasal_ratio"],
-        protected_to_nasal_ratio=metrics["protected_to_nasal_ratio"],
+        outside_to_nasal_energy_ratio=metrics[
+            "outside_to_nasal_energy_ratio"
+        ],
+        protected_to_nasal_energy_ratio=metrics[
+            "protected_to_nasal_energy_ratio"
+        ],
         relative_nasal_energy=metrics["relative_nasal_energy"],
         singular_values=singular_values,
         retained_rank=retained_rank,

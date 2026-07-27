@@ -57,6 +57,56 @@ def _views(*, focal_scale: float = 1.0):
     )
 
 
+def test_real_like_near_rotation_is_projected_to_proper_so3():
+    angle = np.deg2rad(12.0)
+    exact = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ]
+    )
+    target_determinant = 0.99999968
+    first_scale = np.sqrt(1.0 - 4.41e-7)
+    real_like = (
+        np.diag([first_scale, target_determinant / first_scale, 1.0])
+        @ exact
+    )
+
+    error = float(np.max(np.abs(real_like @ real_like.T - np.eye(3))))
+    assert np.linalg.det(real_like) == pytest.approx(
+        target_determinant,
+        abs=1e-12,
+    )
+    assert error == pytest.approx(4.41e-7, abs=1e-12)
+    view = ProjectionView(
+        "front",
+        _view("front").K,
+        real_like,
+        np.zeros(3),
+    )
+
+    np.testing.assert_allclose(
+        view.R_model_to_camera @ view.R_model_to_camera.T,
+        np.eye(3),
+        atol=1e-12,
+    )
+    assert np.linalg.det(view.R_model_to_camera) == pytest.approx(1.0, abs=1e-12)
+    assert np.linalg.norm(view.R_model_to_camera - real_like) < 1e-5
+
+    shear = np.eye(3)
+    shear[0, 1] = 0.01
+    with pytest.raises(ValueError, match="rotation.*rigid"):
+        ProjectionView("front", _view("front").K, shear, np.zeros(3))
+    with pytest.raises(ValueError, match="determinant|reflection"):
+        ProjectionView(
+            "front",
+            _view("front").K,
+            np.diag([-1.0, 1.0, 1.0]),
+            np.zeros(3),
+        )
+
+
 def _problem(vertex_count: int = 10, mode_count: int = 4):
     x = np.linspace(-0.35, 0.42, vertex_count)
     y = np.linspace(-0.22, 0.31, vertex_count)
@@ -73,7 +123,7 @@ def _problem(vertex_count: int = 10, mode_count: int = 4):
 def _config(**overrides) -> ObservableFlameSubspaceConfig:
     values = {
         "min_nasal_response_ratio": 0.60,
-        "max_protected_to_nasal_ratio": 0.50,
+        "max_protected_to_nasal_energy_ratio": 0.50,
         "relative_nasal_energy_floor": 0.02,
         "relative_singular_value_threshold": 1e-7,
         "max_rank": 12,
@@ -136,16 +186,16 @@ def test_outside_and_protected_penalties_are_independent():
     result = _build(shape_basis, config=_config(relative_nasal_energy_floor=0.0))
 
     assert result.nasal_response_ratio[0] == pytest.approx(0.5)
-    assert result.protected_to_nasal_ratio[0] == pytest.approx(0.0)
+    assert result.protected_to_nasal_energy_ratio[0] == pytest.approx(0.0)
     assert result.nasal_response_ratio[1] == pytest.approx(1.0)
-    assert result.protected_to_nasal_ratio[1] == pytest.approx(1.0)
+    assert result.protected_to_nasal_energy_ratio[1] == pytest.approx(1.0)
     assert result.screening_pass_mask.tolist() == [False, False, True]
 
 
 def test_per_vertex_energy_normalization_avoids_mask_size_bias():
     config = _config(
         min_nasal_response_ratio=0.0,
-        max_protected_to_nasal_ratio=2.0,
+        max_protected_to_nasal_energy_ratio=2.0,
         relative_nasal_energy_floor=0.0,
     )
     ratios = []
@@ -162,8 +212,39 @@ def test_per_vertex_energy_normalization_avoids_mask_size_bias():
         )
         ratios.append(result.nasal_response_ratio[0])
 
-    assert ratios[0] == pytest.approx(2.0 / 3.0)
+    assert ratios[0] == pytest.approx(4.0 / 5.0)
     assert ratios[1] == pytest.approx(ratios[0])
+
+
+def test_screening_metrics_are_mean_per_vertex_squared_displacement_energy():
+    vertices, shape_basis, support, protected = _problem(10, 1)
+    shape_basis[support, :, 0] = np.array([3.0, 4.0, 0.0])
+    shape_basis[protected, :, 0] = np.array([0.0, 3.0, 4.0])
+    shape_basis[~(support | protected), :, 0] = np.array([0.0, 0.0, 2.0])
+    result = _build(
+        shape_basis,
+        config=_config(
+            min_nasal_response_ratio=0.0,
+            max_protected_to_nasal_energy_ratio=2.0,
+            relative_nasal_energy_floor=0.0,
+        ),
+        vertices=vertices,
+        support=support,
+        protected=protected,
+    )
+
+    assert result.nasal_mean_squared_energy[0] == pytest.approx(25.0)
+    assert result.outside_mean_squared_energy[0] == pytest.approx(4.0)
+    assert result.protected_mean_squared_energy[0] == pytest.approx(25.0)
+    assert result.nasal_response_ratio[0] == pytest.approx(25.0 / 29.0)
+    assert result.outside_to_nasal_energy_ratio[0] == pytest.approx(4.0 / 25.0)
+    assert result.protected_to_nasal_energy_ratio[0] == pytest.approx(1.0)
+    assert result.relative_nasal_energy[0] == pytest.approx(1.0)
+    screening_report = result.report_data["screening"]
+    assert screening_report["energy_normalization"] == (
+        "mean per-vertex squared displacement"
+    )
+    assert "nasal_rms" not in screening_report
 
 
 def test_tiny_absolute_energy_high_ratio_mode_is_excluded_by_relative_floor():
@@ -175,7 +256,7 @@ def test_tiny_absolute_energy_high_ratio_mode_is_excluded_by_relative_floor():
 
     np.testing.assert_array_equal(result.candidate_mode_indices, [0])
     assert result.nasal_response_ratio[1] == pytest.approx(1.0)
-    assert result.relative_nasal_energy[1] == pytest.approx(1e-5)
+    assert result.relative_nasal_energy[1] == pytest.approx(1e-10)
 
 
 def _project(vertices: np.ndarray, view: ProjectionView) -> np.ndarray:
@@ -337,7 +418,101 @@ def test_same_config_rules_hold_for_scaled_subjects_and_camera_focals():
         atol=1e-12,
     )
     assert first.report_data["config"] == second.report_data["config"]
+    assert first.report_data["view_validation"] == {
+        "rotation_orthogonality_tolerance": 1e-5,
+        "rotation_determinant_tolerance": 1e-5,
+        "accepted_rotation_handling": "nearest proper SO(3) via SVD",
+        "intrinsic_final_row_tolerance": 1e-10,
+    }
     assert "dataset" not in json.dumps(first.to_report_data()).lower()
+
+
+def test_anisotropic_intrinsics_and_skew_do_not_change_observability():
+    vertices, shape_basis, support, protected = _problem(mode_count=3)
+    shape_basis[:3, 0, 0] = [1.0, 0.4, -0.2]
+    shape_basis[:3, 1, 1] = [-0.3, 0.8, 0.2]
+    shape_basis[:3, 2, 2] = [0.2, -0.15, 0.35]
+    intrinsic_a = np.array(
+        [
+            [700.0, 80.0, 320.0],
+            [0.0, 1100.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    intrinsic_b = np.array(
+        [
+            [1700.0, -240.0, 510.0],
+            [0.0, 360.0, 190.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    geometry = _views()
+    views_a = tuple(
+        ProjectionView(
+            view.name,
+            intrinsic_a,
+            view.R_model_to_camera,
+            view.t_model_to_camera,
+        )
+        for view in geometry
+    )
+    views_b = tuple(
+        ProjectionView(
+            view.name,
+            intrinsic_b,
+            view.R_model_to_camera,
+            view.t_model_to_camera,
+        )
+        for view in geometry
+    )
+
+    raw_a = perspective_projection_jacobian(
+        vertices[support],
+        shape_basis[support],
+        views_a[0],
+    )
+    raw_b = perspective_projection_jacobian(
+        vertices[support],
+        shape_basis[support],
+        views_b[0],
+    )
+    assert not np.allclose(raw_a, raw_b)
+    result_a = _build(
+        shape_basis,
+        vertices=vertices,
+        support=support,
+        protected=protected,
+        views=views_a,
+    )
+    result_b = _build(
+        shape_basis,
+        vertices=vertices,
+        support=support,
+        protected=protected,
+        views=views_b,
+    )
+
+    np.testing.assert_allclose(
+        result_a.singular_values,
+        result_b.singular_values,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        result_a.coefficient_basis,
+        result_b.coefficient_basis,
+        atol=1e-12,
+    )
+    expected_a = tuple(
+        tuple(float(item) for item in row)
+        for row in np.linalg.inv(intrinsic_a[:2, :2])
+    )
+    assert result_a.per_view_metadata[0].intrinsic_normalization_matrix == (
+        expected_a
+    )
+    assert (
+        "inverse 2x2 intrinsic linear block"
+        in result_a.report_data["row_balancing"]
+    )
 
 
 def test_no_screened_modes_returns_diagnostic_zero_rank_without_fallback():
@@ -509,12 +684,12 @@ def test_build_does_not_mutate_inputs_and_result_arrays_are_deeply_immutable():
         result.vertex_basis,
         result.candidate_mode_indices,
         result.screening_pass_mask,
-        result.nasal_rms,
-        result.outside_rms,
-        result.protected_rms,
+        result.nasal_mean_squared_energy,
+        result.outside_mean_squared_energy,
+        result.protected_mean_squared_energy,
         result.nasal_response_ratio,
-        result.outside_to_nasal_ratio,
-        result.protected_to_nasal_ratio,
+        result.outside_to_nasal_energy_ratio,
+        result.protected_to_nasal_energy_ratio,
         result.relative_nasal_energy,
         result.singular_values,
     )
