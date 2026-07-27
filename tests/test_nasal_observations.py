@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cv2
+import inspect
 import numpy as np
 import pytest
 
@@ -75,7 +76,7 @@ def _config() -> NasalObservationConfig:
         mask_perturbation_px=2,
         distance_clip_px=24.0,
         min_boundary_points=8,
-        profile_prior_padding_px=10.0,
+        max_side_prior_distance_px=12.0,
         max_epipolar_distance_px=4.0,
     )
 
@@ -395,6 +396,7 @@ def test_profile_variants_and_point_order_survive_small_mask_perturbation():
         rig,
         _front_anchors(),
         "left",
+        _profile_priors("subject-left"),
         config=_config(),
     )
     shifted_mask = cv2.warpAffine(
@@ -409,6 +411,7 @@ def test_profile_variants_and_point_order_survive_small_mask_perturbation():
         rig,
         _front_anchors(),
         "left",
+        _profile_priors("subject-left"),
         config=_config(),
     )
 
@@ -444,6 +447,7 @@ def test_epipolar_evidence_selects_nose_over_mouth_and_rear_cheek():
         rig,
         _front_anchors(),
         "left",
+        _profile_priors("subject-left"),
         config=_config(),
     )
     right = build_profile_nasal_observation(
@@ -452,6 +456,7 @@ def test_epipolar_evidence_selects_nose_over_mouth_and_rear_cheek():
         rig,
         _front_anchors(),
         "right",
+        _profile_priors("subject-right"),
         config=_config(),
     )
 
@@ -461,9 +466,14 @@ def test_epipolar_evidence_selects_nose_over_mouth_and_rear_cheek():
     assert np.median(right_curve[:, 0]) > 70.0
     assert np.max(left_curve[:, 1]) < 96.0
     assert np.max(right_curve[:, 1]) < 96.0
+    assert left.coordinate_metadata["candidate_count"] == 1
+    assert right.coordinate_metadata["candidate_count"] == 1
+    assert max(
+        left.coordinate_metadata["selected_anchor_prior_errors_px"]
+    ) <= _config().max_side_prior_distance_px
 
 
-def test_rig_epipolar_change_changes_profile_selection():
+def test_rig_epipolar_change_can_invalidate_joint_prior_support():
     image = np.zeros((120, 160, 3), dtype=np.uint8)
     mask = _profile_mask("subject-left")
     baseline = build_profile_nasal_observation(
@@ -472,31 +482,25 @@ def test_rig_epipolar_change_changes_profile_selection():
         _rig(),
         _front_anchors(),
         "left",
+        _profile_priors("subject-left"),
         config=_config(),
     )
 
-    changed = build_profile_nasal_observation(
-        image,
-        mask,
-        _rig(side_height=0.08),
-        _front_anchors(),
-        "left",
-        config=_config(),
-    )
+    with pytest.raises(ValueError, match="side prior.*epipolar"):
+        build_profile_nasal_observation(
+            image,
+            mask,
+            _rig(side_height=0.08),
+            _front_anchors(),
+            "left",
+            _profile_priors("subject-left"),
+            config=_config(),
+        )
 
     baseline_lines = np.asarray(
         baseline.coordinate_metadata["epipolar_lines_work"]
     )
-    changed_lines = np.asarray(
-        changed.coordinate_metadata["epipolar_lines_work"]
-    )
-    baseline_curve = baseline.boundaries_work["nasal-profile"]
-    changed_curve = changed.boundaries_work["nasal-profile"]
     assert np.isfinite(baseline_lines).all()
-    assert not np.allclose(changed_lines, baseline_lines)
-    assert abs(
-        float(np.mean(changed_curve[:, 1]) - np.mean(baseline_curve[:, 1]))
-    ) > 8.0
 
 
 def test_profile_rejects_front_anchors_with_no_epipolar_intersection():
@@ -513,11 +517,49 @@ def test_profile_rejects_front_anchors_with_no_epipolar_intersection():
             _rig(),
             anchors,
             "left",
+            _profile_priors("subject-left"),
             config=_config(),
         )
 
 
-def test_production_api_builds_bilateral_observations_without_side_priors():
+def test_production_apis_require_projected_side_priors():
+    profile_parameter = inspect.signature(
+        build_profile_nasal_observation
+    ).parameters["side_prior_original"]
+    multiview_parameter = inspect.signature(
+        build_multiview_nasal_observations
+    ).parameters["side_priors_original"]
+
+    assert profile_parameter.default is inspect.Parameter.empty
+    assert multiview_parameter.default is inspect.Parameter.empty
+
+
+def test_multiview_api_rejects_missing_projected_side_prior():
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+
+    with pytest.raises(ValueError, match="side projected priors.*right"):
+        build_multiview_nasal_observations(
+            images_by_view={
+                "left": image,
+                "front": image,
+                "right": image,
+            },
+            front_semantic_nose_mask=_front_mask(),
+            side_face_masks={
+                "left": _profile_mask("subject-left"),
+                "right": _profile_mask("subject-right"),
+            },
+            rig=_rig(),
+            front_anchors_original=_front_anchors(),
+            side_priors_original={
+                "left": _profile_priors("subject-left"),
+            },
+            centerline_x_original=76.0,
+            config=_config(),
+        )
+
+
+def test_production_api_builds_bilateral_observations_with_side_priors():
     image = np.zeros((120, 160, 3), dtype=np.uint8)
     bundle = build_multiview_nasal_observations(
         images_by_view={
@@ -532,6 +574,10 @@ def test_production_api_builds_bilateral_observations_without_side_priors():
         },
         rig=_rig(),
         front_anchors_original=_front_anchors(),
+        side_priors_original={
+            "left": _profile_priors("subject-left"),
+            "right": _profile_priors("subject-right"),
+        },
         centerline_x_original=76.0,
         config=_config(),
     )
@@ -543,6 +589,24 @@ def test_production_api_builds_bilateral_observations_without_side_priors():
     }
     assert bundle.subject_left.boundaries_work["nasal-profile"].shape[0] >= 20
     assert bundle.subject_right.boundaries_work["nasal-profile"].shape[0] >= 20
+
+
+def test_side_prior_hard_constraint_rejects_epipolar_only_contour():
+    displaced_prior = {
+        name: (100.0, y)
+        for name, (_x, y) in _profile_priors("subject-left").items()
+    }
+
+    with pytest.raises(ValueError, match="side prior"):
+        build_profile_nasal_observation(
+            np.zeros((120, 160, 3), dtype=np.uint8),
+            _profile_mask("subject-left"),
+            _rig(),
+            _front_anchors(),
+            "left",
+            displaced_prior,
+            config=_config(),
+        )
 
 
 def test_low_confidence_on_one_profile_does_not_contaminate_the_other():

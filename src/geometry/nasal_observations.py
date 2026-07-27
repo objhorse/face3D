@@ -43,7 +43,7 @@ class NasalObservationConfig:
     mask_perturbation_px: int = 2
     gradient_window_px: int = 5
     front_alar_vertical_fraction: tuple[float, float] = (0.45, 0.94)
-    profile_prior_padding_px: float = 14.0
+    max_side_prior_distance_px: float = 18.0
     max_epipolar_distance_px: float = 5.0
     epipolar_samples_per_interval: int = 8
     distance_clip_px: float = 48.0
@@ -61,8 +61,8 @@ class NasalObservationConfig:
         lower, upper = self.front_alar_vertical_fraction
         if not 0.0 <= lower < upper <= 1.0:
             raise ValueError("front alar vertical fractions must satisfy 0 <= low < high <= 1")
-        if self.profile_prior_padding_px <= 0.0:
-            raise ValueError("profile prior padding must be positive")
+        if self.max_side_prior_distance_px <= 0.0:
+            raise ValueError("maximum side-prior distance must be positive")
         if self.max_epipolar_distance_px <= 0.0:
             raise ValueError("maximum epipolar distance must be positive")
         if self.epipolar_samples_per_interval < 2:
@@ -884,6 +884,30 @@ def _circular_true_runs(mask: np.ndarray) -> list[np.ndarray]:
     return runs
 
 
+def _sample_named_curve(
+    named_points: Mapping[str, np.ndarray],
+    samples_per_interval: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    anchor_values = np.asarray(
+        [named_points[name] for name in PROFILE_PRIOR_NAMES],
+        dtype=np.float64,
+    )
+    samples = []
+    for index in range(len(anchor_values) - 1):
+        for alpha in np.linspace(
+            0.0,
+            1.0,
+            int(samples_per_interval),
+            endpoint=False,
+        ):
+            samples.append(
+                (1.0 - alpha) * anchor_values[index]
+                + alpha * anchor_values[index + 1]
+            )
+    samples.append(anchor_values[-1])
+    return anchor_values, np.asarray(samples, dtype=np.float64)
+
+
 def _epipolar_lines_work(
     front_anchors_work: Mapping[str, np.ndarray],
     front_camera: Camera,
@@ -895,23 +919,14 @@ def _epipolar_lines_work(
         side_camera,
         config.work_size,
     )
-    anchor_values = np.asarray(
-        [front_anchors_work[name] for name in PROFILE_PRIOR_NAMES],
-        dtype=np.float64,
+    anchor_values, samples = _sample_named_curve(
+        front_anchors_work,
+        config.epipolar_samples_per_interval,
     )
     named_lines = {
         name: fundamental @ np.append(anchor_values[index], 1.0)
         for index, name in enumerate(PROFILE_PRIOR_NAMES)
     }
-    samples = []
-    count = int(config.epipolar_samples_per_interval)
-    for index in range(len(anchor_values) - 1):
-        for alpha in np.linspace(0.0, 1.0, count, endpoint=False):
-            samples.append(
-                (1.0 - alpha) * anchor_values[index]
-                + alpha * anchor_values[index + 1]
-            )
-    samples.append(anchor_values[-1])
     sampled_lines = np.asarray(
         [
             fundamental @ np.append(point, 1.0)
@@ -941,8 +956,14 @@ def _line_distance_matrix(
 def _ordered_epipolar_candidate(
     points: np.ndarray,
     named_lines: Mapping[str, np.ndarray],
+    side_prior_work: Mapping[str, np.ndarray],
     config: NasalObservationConfig,
-) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray] | None:
+) -> tuple[
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray,
+    np.ndarray,
+] | None:
     curve = np.asarray(points, dtype=np.float64).reshape(-1, 2)
     anchor_indices = np.asarray(
         [
@@ -980,7 +1001,22 @@ def _ordered_epipolar_candidate(
         name: curve[int(anchor_indices[index])]
         for index, name in enumerate(PROFILE_PRIOR_NAMES)
     }
-    return curve, anchors, anchor_errors
+    prior_errors = np.asarray(
+        [
+            float(
+                np.linalg.norm(
+                    anchors[name] - side_prior_work[name]
+                )
+            )
+            for name in PROFILE_PRIOR_NAMES
+        ],
+        dtype=np.float64,
+    )
+    if np.any(
+        prior_errors > float(config.max_side_prior_distance_px)
+    ):
+        return None
+    return curve, anchors, anchor_errors, prior_errors
 
 
 def _profile_curve_from_epipolar(
@@ -988,7 +1024,7 @@ def _profile_curve_from_epipolar(
     camera: Camera,
     front_camera: Camera,
     front_anchors_work: Mapping[str, np.ndarray],
-    side_prior_work: Mapping[str, np.ndarray] | None,
+    side_prior_work: Mapping[str, np.ndarray],
     roi_work_xyxy: tuple[float, float, float, float] | None,
     config: NasalObservationConfig,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], dict[str, Any]]:
@@ -1009,19 +1045,50 @@ def _profile_curve_from_epipolar(
     eligible = np.min(distances, axis=1) <= float(
         config.max_epipolar_distance_px
     )
+    prior_values, prior_samples = _sample_named_curve(
+        side_prior_work,
+        config.epipolar_samples_per_interval,
+    )
+    prior_radius = float(config.max_side_prior_distance_px)
+    prior_roi = (
+        float(np.min(prior_values[:, 0]) - prior_radius),
+        float(np.min(prior_values[:, 1]) - prior_radius),
+        float(np.max(prior_values[:, 0]) + prior_radius),
+        float(np.max(prior_values[:, 1]) + prior_radius),
+    )
+    effective_roi = prior_roi
     if roi_work_xyxy is not None:
-        x0, y0, x1, y1 = roi_work_xyxy
-        eligible &= (
-            (contour_work[:, 0] >= x0)
-            & (contour_work[:, 0] <= x1)
-            & (contour_work[:, 1] >= y0)
-            & (contour_work[:, 1] <= y1)
+        effective_roi = (
+            max(prior_roi[0], roi_work_xyxy[0]),
+            max(prior_roi[1], roi_work_xyxy[1]),
+            min(prior_roi[2], roi_work_xyxy[2]),
+            min(prior_roi[3], roi_work_xyxy[3]),
         )
+        if (
+            effective_roi[2] <= effective_roi[0]
+            or effective_roi[3] <= effective_roi[1]
+        ):
+            raise ValueError(
+                "explicit profile ROI does not overlap side prior ROI"
+            )
+    x0, y0, x1, y1 = effective_roi
+    eligible &= (
+        (contour_work[:, 0] >= x0)
+        & (contour_work[:, 0] <= x1)
+        & (contour_work[:, 1] >= y0)
+        & (contour_work[:, 1] <= y1)
+    )
+    prior_distances = np.linalg.norm(
+        contour_work[:, None, :] - prior_samples[None, :, :],
+        axis=2,
+    )
+    eligible &= np.min(prior_distances, axis=1) <= prior_radius
     runs = _circular_true_runs(eligible)
     runs = [run for run in runs if len(run) >= config.min_boundary_points]
     if not runs:
         raise ValueError(
-            "face mask has no continuous contour intersecting epipolar evidence"
+            "face mask has no continuous contour satisfying side prior "
+            "and epipolar evidence"
         )
 
     contour_center = np.mean(contour_work, axis=0)
@@ -1031,39 +1098,25 @@ def _profile_curve_from_epipolar(
         ordered = _ordered_epipolar_candidate(
             contour_work[run],
             named_lines,
+            side_prior_work,
             config,
         )
         if ordered is None:
             continue
-        curve, anchors, anchor_errors = ordered
+        curve, anchors, anchor_errors, anchor_prior_errors = ordered
         outwardness = float(
             np.mean(np.linalg.norm(curve - contour_center, axis=1))
         )
         candidate_curvature = float(
             np.percentile(curvature[run], 80.0)
         )
-        prior_error = 0.0
-        if side_prior_work is not None:
-            prior_values = np.asarray(
-                [side_prior_work[name] for name in PROFILE_PRIOR_NAMES],
-                dtype=np.float64,
-            )
-            prior_error = float(
-                np.mean(
-                    np.min(
-                        np.linalg.norm(
-                            curve[:, None, :] - prior_values[None, :, :],
-                            axis=2,
-                        ),
-                        axis=0,
-                    )
-                )
-            )
+        prior_error = float(np.mean(anchor_prior_errors))
         candidates.append(
             {
                 "curve": curve,
                 "anchors": anchors,
                 "anchor_errors": anchor_errors,
+                "anchor_prior_errors": anchor_prior_errors,
                 "outwardness": outwardness,
                 "curvature": candidate_curvature,
                 "prior_error": prior_error,
@@ -1071,7 +1124,8 @@ def _profile_curve_from_epipolar(
         )
     if not candidates:
         raise ValueError(
-            "face mask has no ordered nasal contour with epipolar support"
+            "face mask has no ordered nasal contour satisfying side prior "
+            "and epipolar support"
         )
 
     outward_scale = max(
@@ -1082,7 +1136,10 @@ def _profile_curve_from_epipolar(
         max(candidate["curvature"] for candidate in candidates),
         1e-6,
     )
-    prior_scale = max(float(config.profile_prior_padding_px), 1e-6)
+    prior_scale = max(
+        float(config.max_side_prior_distance_px),
+        1e-6,
+    )
     for candidate in candidates:
         candidate["score"] = (
             float(np.mean(candidate["anchor_errors"]))
@@ -1106,8 +1163,15 @@ def _profile_curve_from_epipolar(
             selected["anchor_errors"],
             dtype=float,
         ).tolist(),
+        "selected_anchor_prior_errors_px": np.asarray(
+            selected["anchor_prior_errors"],
+            dtype=float,
+        ).tolist(),
+        "side_prior_roi_work": list(prior_roi),
+        "effective_profile_roi_work": list(effective_roi),
+        "max_side_prior_distance_px": prior_radius,
         "selection_score": float(selected["score"]),
-        "used_side_prior": side_prior_work is not None,
+        "used_side_prior": True,
     }
     return selected["curve"], selected["anchors"], metadata
 
@@ -1118,8 +1182,8 @@ def build_profile_nasal_observation(
     rig: ProfileRig,
     front_anchors_original: Mapping[str, Any],
     side_view: str,
+    side_prior_original: Mapping[str, Any],
     *,
-    side_prior_original: Mapping[str, Any] | None = None,
     roi_original_xyxy: tuple[float, float, float, float] | None = None,
     config: NasalObservationConfig | None = None,
 ) -> NasalViewObservation:
@@ -1146,15 +1210,11 @@ def build_profile_nasal_observation(
         limits,
         label="front nasal anchors",
     )
-    side_prior_work = (
-        None
-        if side_prior_original is None
-        else _named_points_work(
-            side_prior_original,
-            camera,
-            limits,
-            label="side nasal prior",
-        )
+    side_prior_work = _named_points_work(
+        side_prior_original,
+        camera,
+        limits,
+        label="side nasal prior",
     )
     roi_work = (
         None
@@ -1197,16 +1257,10 @@ def build_profile_nasal_observation(
             variant_curves[name] = {"nasal-profile": candidate}
         except ValueError:
             variant_curves[name] = {}
-    if roi_work is None:
-        points = np.asarray(curve, dtype=np.float64)
-        observation_roi = (
-            float(np.min(points[:, 0])),
-            float(np.min(points[:, 1])),
-            float(np.max(points[:, 0]) + 1.0),
-            float(np.max(points[:, 1]) + 1.0),
-        )
-    else:
-        observation_roi = roi_work
+    observation_roi = tuple(
+        float(value)
+        for value in selection_metadata["effective_profile_roi_work"]
+    )
     return _make_observation(
         semantic_view=semantic_view,
         camera=camera,
@@ -1227,11 +1281,9 @@ def build_multiview_nasal_observations(
     side_face_masks: Mapping[str, np.ndarray],
     rig: ProfileRig,
     front_anchors_original: Mapping[str, Any],
+    side_priors_original: Mapping[str, Mapping[str, Any]],
     *,
     centerline_x_original: float,
-    side_priors_original: (
-        Mapping[str, Mapping[str, Any]] | None
-    ) = None,
     side_rois_original: (
         Mapping[str, tuple[float, float, float, float]] | None
     ) = None,
@@ -1255,6 +1307,15 @@ def build_multiview_nasal_observations(
         raise ValueError(
             "side face masks are missing views: " + ", ".join(missing_masks)
         )
+    missing_priors = [
+        view for view in ("left", "right")
+        if view not in side_priors_original
+    ]
+    if missing_priors:
+        raise ValueError(
+            "side projected priors are missing views: "
+            + ", ".join(missing_priors)
+        )
     front_camera = rig.cameras_by_view.get("front")
     if front_camera is None:
         raise ValueError("fixed rig is missing front camera")
@@ -1273,11 +1334,7 @@ def build_multiview_nasal_observations(
             rig,
             front_anchors_original,
             side_view,
-            side_prior_original=(
-                None
-                if side_priors_original is None
-                else side_priors_original.get(side_view)
-            ),
+            side_priors_original[side_view],
             roi_original_xyxy=(
                 None
                 if side_rois_original is None
