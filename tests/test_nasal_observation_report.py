@@ -6,6 +6,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from src.cross_view_geometry import Camera
 from src.geometry.nasal_observations import (
@@ -14,7 +15,9 @@ from src.geometry.nasal_observations import (
 )
 from src.geometry.observation_coordinates import ObservationCoordinates
 from src.reports.nasal_observation_report import (
+    read_image_file,
     write_nasal_observation_data,
+    write_image_file,
     write_nasal_observation_report,
 )
 
@@ -227,6 +230,58 @@ def test_bundle_json_npz_serialization_preserves_subject_semantics(tmp_path):
         assert left_key != right_key
 
 
+def test_npz_path_without_npz_suffix_is_normalized_and_referenced(tmp_path):
+    json_path = tmp_path / "nasal_observations.json"
+    requested_fields_path = tmp_path / "nasal_observation_fields.archive"
+
+    payload = write_nasal_observation_data(
+        _bundle(),
+        json_path,
+        requested_fields_path,
+    )
+
+    actual_fields_path = tmp_path / "nasal_observation_fields.archive.npz"
+    assert not requested_fields_path.exists()
+    assert actual_fields_path.is_file()
+    assert payload["fields_npz"] == actual_fields_path.name
+    restored = json.loads(json_path.read_text(encoding="utf-8"))
+    assert restored["fields_npz"] == actual_fields_path.name
+    with np.load(actual_fields_path, allow_pickle=False) as fields:
+        assert fields.files
+
+
+def test_unicode_image_paths_round_trip_without_opencv_path_io(tmp_path):
+    image = np.arange(8 * 9 * 3, dtype=np.uint8).reshape(8, 9, 3)
+    path = (
+        tmp_path
+        / "\u8bca\u65ad\u8def\u5f84"
+        / "\u89c2\u6d4b\u56fe\u50cf.png"
+    )
+    path.parent.mkdir()
+
+    write_image_file(path, image)
+    restored = read_image_file(path)
+
+    assert np.array_equal(restored, image)
+
+
+def test_image_io_failures_include_the_target_path(tmp_path):
+    corrupt_path = tmp_path / "\u635f\u574f\u56fe\u50cf.png"
+    corrupt_path.write_bytes(b"not an image")
+
+    with pytest.raises(RuntimeError) as read_error:
+        read_image_file(corrupt_path)
+    assert str(corrupt_path) in str(read_error.value)
+
+    unsupported_path = tmp_path / "\u8f93\u51fa\u56fe\u50cf.unsupported"
+    with pytest.raises(RuntimeError) as write_error:
+        write_image_file(
+            unsupported_path,
+            np.zeros((4, 4, 3), dtype=np.uint8),
+        )
+    assert str(unsupported_path) in str(write_error.value)
+
+
 def test_static_html_and_all_report_images_are_generated_and_referenced(
     tmp_path,
 ):
@@ -243,8 +298,9 @@ def test_static_html_and_all_report_images_are_generated_and_referenced(
         ),
     }
 
+    report_dir = tmp_path / "\u9f3b\u90e8\u89c2\u6d4b\u62a5\u544a"
     index_path = write_nasal_observation_report(
-        tmp_path,
+        report_dir,
         bundle,
         images_by_view={
             "left": image.copy(),
@@ -265,7 +321,7 @@ def test_static_html_and_all_report_images_are_generated_and_referenced(
     assert "http://" not in document
     assert "epipolar" in document.lower()
     assert "ROI" in document
-    assert all((tmp_path / reference).is_file() for reference in references)
+    assert all((report_dir / reference).is_file() for reference in references)
     assert {
         "front_overlay.png",
         "left_overlay.png",

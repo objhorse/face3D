@@ -26,6 +26,8 @@ from src.geometry.profile_triangulation import (
     load_profile_rig,
 )
 from src.reports.nasal_observation_report import (
+    read_image_file,
+    write_image_file,
     write_nasal_observation_data,
     write_nasal_observation_report,
 )
@@ -192,9 +194,11 @@ def _load_capture_images(
                 f"expected one RGB capture for {camera.name}/{view} in "
                 f"{capture_dir}, found {len(candidates)}"
             )
-        image_bgr = cv2.imread(str(candidates[0]), cv2.IMREAD_COLOR)
-        if image_bgr is None:
-            raise RuntimeError(f"cannot read capture image: {candidates[0]}")
+        image_bgr = read_image_file(
+            candidates[0],
+            cv2.IMREAD_COLOR,
+            description="capture image",
+        )
         actual_size = (image_bgr.shape[1], image_bgr.shape[0])
         if actual_size != tuple(camera.image_size):
             raise ValueError(
@@ -424,6 +428,128 @@ def project_flame_points_through_front_fit(
     return projected
 
 
+def _required_mapping(
+    container: Mapping[str, Any],
+    key: str,
+    *,
+    field_path: str,
+    metadata_path: Path,
+) -> Mapping[str, Any]:
+    if key not in container:
+        raise ValueError(
+            f"{metadata_path}: missing required field '{field_path}'"
+        )
+    value = container[key]
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"{metadata_path}: field '{field_path}' must be a JSON object"
+        )
+    return value
+
+
+def _required_numeric_array(
+    container: Mapping[str, Any],
+    key: str,
+    *,
+    field_path: str,
+    metadata_path: Path,
+    dtype: Any,
+    size: int | None = None,
+) -> np.ndarray:
+    if key not in container:
+        raise ValueError(
+            f"{metadata_path}: missing required field '{field_path}'"
+        )
+    value = container[key]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            f"{metadata_path}: field '{field_path}' must be a JSON array"
+        )
+    try:
+        result = np.asarray(value, dtype=dtype).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{metadata_path}: field '{field_path}' must contain numbers"
+        ) from exc
+    if not result.size:
+        raise ValueError(
+            f"{metadata_path}: field '{field_path}' must not be empty"
+        )
+    if size is not None and result.size != size:
+        raise ValueError(
+            f"{metadata_path}: field '{field_path}' must contain "
+            f"{size} numbers, found {result.size}"
+        )
+    if not np.isfinite(result).all():
+        raise ValueError(
+            f"{metadata_path}: field '{field_path}' must contain finite numbers"
+        )
+    return result
+
+
+def load_baseline_fit_parameters(
+    metadata_path: str | Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load and validate the baseline FLAME parameters needed by the audit."""
+    target = Path(metadata_path)
+    fit_meta = _read_json(target)
+    parameters = _required_mapping(
+        fit_meta,
+        "parameters",
+        field_path="parameters",
+        metadata_path=target,
+    )
+    optimized = _required_mapping(
+        parameters,
+        "optimized_parameters",
+        field_path="parameters.optimized_parameters",
+        metadata_path=target,
+    )
+    shape = _required_numeric_array(
+        optimized,
+        "shape_params",
+        field_path="parameters.optimized_parameters.shape_params",
+        metadata_path=target,
+        dtype=np.float32,
+    )
+    expression = _required_numeric_array(
+        optimized,
+        "expression_params",
+        field_path="parameters.optimized_parameters.expression_params",
+        metadata_path=target,
+        dtype=np.float32,
+    )
+    per_view = _required_mapping(
+        optimized,
+        "per_view",
+        field_path="parameters.optimized_parameters.per_view",
+        metadata_path=target,
+    )
+    front = _required_mapping(
+        per_view,
+        "front",
+        field_path="parameters.optimized_parameters.per_view.front",
+        metadata_path=target,
+    )
+    rotation = _required_numeric_array(
+        front,
+        "R",
+        field_path="parameters.optimized_parameters.per_view.front.R",
+        metadata_path=target,
+        dtype=np.float64,
+        size=9,
+    ).reshape(3, 3)
+    translation = _required_numeric_array(
+        front,
+        "t",
+        field_path="parameters.optimized_parameters.per_view.front.t",
+        metadata_path=target,
+        dtype=np.float64,
+        size=3,
+    )
+    return shape, expression, rotation, translation
+
+
 def _load_baseline_flame_landmarks(
     source_output: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Path]:
@@ -435,43 +561,9 @@ def _load_baseline_flame_landmarks(
     )
 
     fit_meta_path = source_output / "meshes" / "stable_fit_meta.json"
-    fit_meta = _read_json(fit_meta_path)
-    optimized = (
-        fit_meta.get("parameters", {})
-        .get("optimized_parameters", {})
+    shape, expression, fit_rotation, fit_translation = (
+        load_baseline_fit_parameters(fit_meta_path)
     )
-    if not isinstance(optimized, dict):
-        raise ValueError(
-            f"optimized_parameters are missing from {fit_meta_path}"
-        )
-
-    shape = np.asarray(
-        optimized.get("shape_params", []),
-        dtype=np.float32,
-    ).reshape(-1)
-    expression = np.asarray(
-        optimized.get("expression_params", []),
-        dtype=np.float32,
-    ).reshape(-1)
-    front = optimized.get("per_view", {}).get("front", {})
-    fit_rotation = np.asarray(
-        front.get("R", []),
-        dtype=np.float64,
-    )
-    fit_translation = np.asarray(
-        front.get("t", []),
-        dtype=np.float64,
-    )
-    if not len(shape) or not np.isfinite(shape).all():
-        raise ValueError(f"valid shape_params are required in {fit_meta_path}")
-    if not len(expression) or not np.isfinite(expression).all():
-        raise ValueError(
-            f"valid expression_params are required in {fit_meta_path}"
-        )
-    if fit_rotation.size != 9 or fit_translation.size != 3:
-        raise ValueError(
-            f"front per-view R/t are required in {fit_meta_path}"
-        )
 
     flame = FLAMEModel(
         cfg.FLAME_MODEL_PATH,
@@ -495,8 +587,8 @@ def _load_baseline_flame_landmarks(
     )
     return (
         landmarks,
-        fit_rotation.reshape(3, 3),
-        fit_translation.reshape(3),
+        fit_rotation,
+        fit_translation,
         fit_meta_path.resolve(),
     )
 
@@ -585,8 +677,20 @@ def _save_preprocess_nose_masks(
             dtype=np.uint8,
         )
         target = debug_dir / f"{view}_nose_mask.png"
-        if not cv2.imwrite(str(target), mask):
-            raise RuntimeError(f"failed to write preprocess nose mask: {target}")
+        write_image_file(
+            target,
+            mask,
+            description="preprocess nose mask",
+        )
+
+
+def release_raw_image_references(
+    raw_images: dict[str, np.ndarray],
+    undistorted_images: Mapping[str, np.ndarray],
+) -> None:
+    """Release source image arrays unless undistortion returned the same map."""
+    if raw_images is not undistorted_images:
+        raw_images.clear()
 
 
 def run_nasal_observation_audit(
@@ -632,6 +736,8 @@ def run_nasal_observation_audit(
                 alpha=float(cfg.UNDISTORT_ALPHA),
             )
         )
+        release_raw_image_references(raw_images, undistorted_images)
+        del raw_images
         if new_intrinsics is None:
             raise RuntimeError(
                 "calibrated undistortion did not return full-resolution new K"

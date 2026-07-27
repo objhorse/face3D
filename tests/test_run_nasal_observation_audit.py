@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -9,8 +10,10 @@ from run_nasal_observation_audit import (
     assert_file_tree_unchanged,
     build_undistorted_observation_rig,
     file_tree_hashes,
+    load_baseline_fit_parameters,
     make_nasal_audit_config,
     project_flame_points_through_front_fit,
+    release_raw_image_references,
     require_parser_nose_mask,
     validate_separate_output,
 )
@@ -134,22 +137,43 @@ def test_audit_config_scales_one_fixed_roi_rule_with_work_resolution():
     assert half.mask_perturbation_px == 1
 
 
-def test_baseline_flame_front_camera_rig_side_projection_matches_manual_transform():
-    rig = _rig()
-    angle = np.deg2rad(-11.0)
+def test_baseline_projection_matches_independent_fixed_numeric_oracle():
     fit_rotation = np.array(
-        [
-            [np.cos(angle), -np.sin(angle), 0.0],
-            [np.sin(angle), np.cos(angle), 0.0],
-            [0.0, 0.0, 1.0],
-        ],
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
-    fit_translation = np.array([0.01, -0.02, 0.62], dtype=np.float64)
-    points_flame = np.array(
-        [[0.01, 0.02, 0.03], [-0.03, 0.01, 0.02]],
+    front_rotation = fit_rotation.copy()
+    right_rotation = np.array(
+        [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
         dtype=np.float64,
     )
+    rig = ProfileRig(
+        cameras_by_view={
+            "left": _camera(
+                "camera1",
+                "left",
+                translation=np.array([1.0, 2.0, 3.0]),
+            ),
+            "front": _camera(
+                "camera2",
+                "front",
+                rotation=front_rotation,
+                translation=np.array([1.0, 2.0, 3.0]),
+            ),
+            "right": _camera(
+                "camera3",
+                "right",
+                rotation=right_rotation,
+                translation=np.array([-1.0, 1.0, 2.0]),
+            ),
+        },
+        reference_view="front",
+        units="meters",
+        calibration_path="numeric-oracle-rig.json",
+        stereo_rms_px={"left": 0.0, "front": 0.0, "right": 0.0},
+    )
+    fit_translation = np.array([10.0, 20.0, 30.0], dtype=np.float64)
+    points_flame = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
 
     projected = project_flame_points_through_front_fit(
         points_flame,
@@ -158,19 +182,187 @@ def test_baseline_flame_front_camera_rig_side_projection_matches_manual_transfor
         rig,
     )
 
-    front_camera = rig.cameras_by_view["front"]
-    points_front = points_flame @ fit_rotation.T + fit_translation
-    points_rig = (
-        points_front - front_camera.t_rig_to_camera
-    ) @ front_camera.R_rig_to_camera
-    for view, camera in rig.cameras_by_view.items():
-        points_camera = (
-            points_rig @ camera.R_rig_to_camera.T
-            + camera.t_rig_to_camera
-        )
-        homogeneous = points_camera @ camera.K.T
-        expected = homogeneous[:, :2] / homogeneous[:, 2:3]
-        assert projected[view] == pytest.approx(expected)
+    expected = {
+        "left": np.array([[164.84848484848484, 38.03030303030303]]),
+        "front": np.array([[113.93939393939394, 152.27272727272728]]),
+        "right": np.array([[45.0, -21.5625]]),
+    }
+    for view in ("left", "front", "right"):
+        assert projected[view] == pytest.approx(expected[view], abs=1e-12)
+
+
+def _valid_fit_metadata():
+    return {
+        "parameters": {
+            "optimized_parameters": {
+                "shape_params": [0.1, -0.2],
+                "expression_params": [0.3, 0.4],
+                "per_view": {
+                    "front": {
+                        "R": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "t": [0.0, 0.0, 0.6],
+                    }
+                },
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "field"),
+    [
+        ({}, "parameters"),
+        ({"parameters": []}, "parameters"),
+        ({"parameters": {}}, "parameters.optimized_parameters"),
+        (
+            {"parameters": {"optimized_parameters": []}},
+            "parameters.optimized_parameters",
+        ),
+        (
+            {
+                "parameters": {
+                    "optimized_parameters": {
+                        "shape_params": [0.1],
+                        "expression_params": [0.2],
+                        "per_view": [],
+                    }
+                }
+            },
+            "parameters.optimized_parameters.per_view",
+        ),
+        (
+            {
+                "parameters": {
+                    "optimized_parameters": {
+                        "shape_params": [0.1],
+                        "expression_params": [0.2],
+                        "per_view": {},
+                    }
+                }
+            },
+            "parameters.optimized_parameters.per_view.front",
+        ),
+    ],
+)
+def test_fit_metadata_rejects_bad_nested_mappings_with_exact_path(
+    tmp_path,
+    payload,
+    field,
+):
+    metadata_path = tmp_path / "meshes" / "stable_fit_meta.json"
+    metadata_path.parent.mkdir()
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        load_baseline_fit_parameters(metadata_path)
+
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert field in message
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("shape_params", None),
+        ("expression_params", "not-an-array"),
+        ("per_view.front.R", [[1.0, 0.0], [0.0, 1.0]]),
+        ("per_view.front.t", [0.0, 0.0]),
+    ],
+)
+def test_fit_metadata_rejects_bad_required_values_with_exact_path(
+    tmp_path,
+    field,
+    bad_value,
+):
+    payload = _valid_fit_metadata()
+    optimized = payload["parameters"]["optimized_parameters"]
+    if field.startswith("per_view.front."):
+        optimized["per_view"]["front"][field.rsplit(".", 1)[1]] = bad_value
+        expected_field = f"parameters.optimized_parameters.{field}"
+    else:
+        optimized[field] = bad_value
+        expected_field = f"parameters.optimized_parameters.{field}"
+    metadata_path = tmp_path / "stable_fit_meta.json"
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        load_baseline_fit_parameters(metadata_path)
+
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert expected_field in message
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "shape_params",
+        "expression_params",
+        "per_view.front.R",
+        "per_view.front.t",
+    ],
+)
+def test_fit_metadata_rejects_missing_required_values_with_exact_path(
+    tmp_path,
+    field,
+):
+    payload = _valid_fit_metadata()
+    optimized = payload["parameters"]["optimized_parameters"]
+    if field.startswith("per_view.front."):
+        del optimized["per_view"]["front"][field.rsplit(".", 1)[1]]
+    else:
+        del optimized[field]
+    expected_field = f"parameters.optimized_parameters.{field}"
+    metadata_path = tmp_path / "stable_fit_meta.json"
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        load_baseline_fit_parameters(metadata_path)
+
+    message = str(error.value)
+    assert str(metadata_path) in message
+    assert expected_field in message
+
+
+def test_fit_metadata_loader_returns_valid_arrays(tmp_path):
+    metadata_path = tmp_path / "stable_fit_meta.json"
+    metadata_path.write_text(
+        json.dumps(_valid_fit_metadata()),
+        encoding="utf-8",
+    )
+
+    shape, expression, rotation, translation = (
+        load_baseline_fit_parameters(metadata_path)
+    )
+
+    assert shape == pytest.approx([0.1, -0.2])
+    assert expression == pytest.approx([0.3, 0.4])
+    assert rotation == pytest.approx(np.eye(3))
+    assert translation == pytest.approx([0.0, 0.0, 0.6])
+
+
+def test_raw_image_references_are_released_after_separate_undistortion():
+    raw_pixel = np.full((8, 8, 3), 17, dtype=np.uint8)
+    raw_images = {"front": raw_pixel}
+    undistorted_images = {"front": raw_pixel.copy()}
+
+    release_raw_image_references(raw_images, undistorted_images)
+
+    assert raw_images == {}
+    assert np.array_equal(undistorted_images["front"], raw_pixel)
+
+
+def test_raw_image_release_preserves_aliased_undistortion_result():
+    raw_images = {"front": np.full((8, 8, 3), 17, dtype=np.uint8)}
+
+    release_raw_image_references(raw_images, raw_images)
+
+    assert "front" in raw_images
 
 
 def test_parser_nose_mask_missing_fails_explicitly():

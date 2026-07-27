@@ -48,6 +48,63 @@ ANCHOR_NUMBER = {
 }
 
 
+def read_image_file(
+    path: str | Path,
+    flags: int = cv2.IMREAD_COLOR,
+    *,
+    description: str = "image",
+) -> np.ndarray:
+    """Decode an image without relying on OpenCV's Windows path handling."""
+    target = Path(path)
+    try:
+        encoded = np.fromfile(str(target), dtype=np.uint8)
+    except OSError as exc:
+        raise RuntimeError(
+            f"failed to read {description} bytes from {target}: {exc}"
+        ) from exc
+    if encoded.size == 0:
+        raise RuntimeError(f"{description} file is empty: {target}")
+    try:
+        image = cv2.imdecode(encoded, int(flags))
+    except cv2.error as exc:
+        raise RuntimeError(
+            f"failed to decode {description} at {target}: {exc}"
+        ) from exc
+    if image is None:
+        raise RuntimeError(f"failed to decode {description}: {target}")
+    return image
+
+
+def write_image_file(
+    path: str | Path,
+    image: np.ndarray,
+    *,
+    description: str = "image",
+) -> None:
+    """Encode an image before writing it to a Windows-compatible path."""
+    target = Path(path)
+    suffix = target.suffix.lower()
+    if not suffix:
+        raise ValueError(
+            f"cannot encode {description} without a file extension: {target}"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        success, encoded = cv2.imencode(suffix, np.asarray(image))
+    except cv2.error as exc:
+        raise RuntimeError(
+            f"failed to encode {description} for {target}: {exc}"
+        ) from exc
+    if not success:
+        raise RuntimeError(f"failed to encode {description}: {target}")
+    try:
+        encoded.tofile(str(target))
+    except OSError as exc:
+        raise RuntimeError(
+            f"failed to write {description} to {target}: {exc}"
+        ) from exc
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.astype(float).tolist()
@@ -184,7 +241,12 @@ def write_nasal_observation_data(
 ) -> dict[str, Any]:
     """Write compact JSON metadata and compressed full-resolution work fields."""
     target_json = Path(json_path)
-    target_fields = Path(fields_path)
+    requested_fields = Path(fields_path)
+    target_fields = (
+        requested_fields
+        if requested_fields.suffix.lower() == ".npz"
+        else Path(f"{requested_fields}.npz")
+    )
     target_json.parent.mkdir(parents=True, exist_ok=True)
     target_fields.parent.mkdir(parents=True, exist_ok=True)
     fields: dict[str, np.ndarray] = {}
@@ -205,7 +267,8 @@ def write_nasal_observation_data(
         "metadata": _json_value(metadata or {}),
         "views": views,
     }
-    np.savez_compressed(target_fields, **fields)
+    with target_fields.open("wb") as handle:
+        np.savez_compressed(handle, **fields)
     target_json.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -342,8 +405,7 @@ def _draw_priors(
 
 
 def _save_image(path: Path, image: np.ndarray) -> None:
-    if not cv2.imwrite(str(path), image):
-        raise RuntimeError(f"failed to write report image: {path}")
+    write_image_file(path, image, description="report image")
 
 
 def _observation_by_camera_view(
