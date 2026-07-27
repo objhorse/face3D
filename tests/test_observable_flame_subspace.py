@@ -158,7 +158,7 @@ def _build(
         defaults[2] if support is None else support,
         defaults[3] if protected is None else protected,
         _views() if views is None else views,
-        config=config or _config(),
+        config=_config() if config is None else config,
     )
 
 
@@ -654,6 +654,28 @@ def test_invalid_views_intrinsics_extrinsics_depth_and_config_fail_clearly():
         ObservableFlameSubspaceConfig(min_nasal_response_ratio=1.1)
     with pytest.raises(ValueError, match="max_rank"):
         ObservableFlameSubspaceConfig(max_rank=0)
+
+
+@pytest.mark.parametrize(
+    "invalid_config",
+    [False, 0, {}],
+    ids=["false", "zero", "empty-mapping"],
+)
+def test_falsey_invalid_config_values_reach_type_validation(invalid_config):
+    vertices, shape_basis, support, protected = _problem(mode_count=1)
+    shape_basis[:3, 0, 0] = 1.0
+
+    with pytest.raises(
+        ValueError,
+        match="config must be an ObservableFlameSubspaceConfig",
+    ):
+        _build(
+            shape_basis,
+            config=invalid_config,
+            vertices=vertices,
+            support=support,
+            protected=protected,
+        )
 
 
 def test_build_does_not_mutate_inputs_and_result_arrays_are_deeply_immutable():

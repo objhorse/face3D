@@ -662,7 +662,7 @@ def build_observable_flame_subspace(
     averaged normalized-camera-coordinate response without amplifying a
     geometrically weak view to unit norm.
     """
-    cfg = config or ObservableFlameSubspaceConfig()
+    cfg = ObservableFlameSubspaceConfig() if config is None else config
     if not isinstance(cfg, ObservableFlameSubspaceConfig):
         raise ValueError("config must be an ObservableFlameSubspaceConfig")
     points = _validate_numeric_array("vertices", vertices, (3,))
