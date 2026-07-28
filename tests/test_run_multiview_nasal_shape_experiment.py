@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import shutil
 import struct
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -412,46 +414,119 @@ def _write_textured_glb(
     path: Path,
     *,
     include_bin: bool = True,
+    include_mesh: bool = False,
     texture_index: int = 0,
     image_bytes: bytes | None = None,
     buffer_view_length: int | None = None,
+    alpha_mode: str = "OPAQUE",
+    transparent_texture: bool = False,
+    index_values: tuple[int, int, int] = (0, 1, 2),
+    position_component_type: int = 5126,
 ) -> Path:
     if image_bytes is None:
         encoded = io.BytesIO()
-        Image.new("RGB", (2, 2), (20, 80, 140)).save(encoded, format="PNG")
+        Image.new(
+            "RGBA",
+            (2, 2),
+            (20, 80, 140, 0 if transparent_texture else 255),
+        ).save(encoded, format="PNG")
         image_bytes = encoded.getvalue()
-    payload = {
-        "asset": {"version": "2.0"},
-        "buffers": [{"byteLength": len(image_bytes)}],
-        "bufferViews": [
+    binary = bytearray()
+    buffer_views = []
+
+    def add_buffer_view(values: bytes) -> int:
+        binary.extend(b"\0" * ((-len(binary)) % 4))
+        offset = len(binary)
+        binary.extend(values)
+        buffer_views.append(
             {
                 "buffer": 0,
-                "byteOffset": 0,
-                "byteLength": (
-                    len(image_bytes)
-                    if buffer_view_length is None
-                    else buffer_view_length
-                ),
+                "byteOffset": offset,
+                "byteLength": len(values),
             }
-        ],
-        "images": [{"bufferView": 0, "mimeType": "image/png"}],
+        )
+        return len(buffer_views) - 1
+
+    image_view = add_buffer_view(image_bytes)
+    if buffer_view_length is not None:
+        buffer_views[image_view]["byteLength"] = buffer_view_length
+    payload = {
+        "asset": {"version": "2.0"},
+        "bufferViews": buffer_views,
+        "images": [{"bufferView": image_view, "mimeType": "image/png"}],
         "textures": [{"source": 0}],
         "materials": [
             {
+                "name": "hidden_bottom_white" if alpha_mode == "BLEND" else "face",
+                "alphaMode": alpha_mode,
                 "pbrMetallicRoughness": {
                     "baseColorTexture": {"index": texture_index}
                 }
             }
         ],
     }
+    if include_mesh:
+        position_view = add_buffer_view(
+            struct.pack(
+                "<9f",
+                -0.8,
+                -0.8,
+                0.0,
+                0.8,
+                -0.8,
+                0.0,
+                0.0,
+                0.8,
+                0.0,
+            )
+        )
+        texcoord_view = add_buffer_view(
+            struct.pack("<6f", 0.0, 0.0, 1.0, 0.0, 0.5, 1.0)
+        )
+        index_view = add_buffer_view(struct.pack("<3H", *index_values))
+        payload["accessors"] = [
+            {
+                "bufferView": position_view,
+                "componentType": position_component_type,
+                "count": 3,
+                "type": "VEC3",
+            },
+            {
+                "bufferView": texcoord_view,
+                "componentType": 5126,
+                "count": 3,
+                "type": "VEC2",
+            },
+            {
+                "bufferView": index_view,
+                "componentType": 5123,
+                "count": 3,
+                "type": "SCALAR",
+            },
+        ]
+        payload["meshes"] = [
+            {
+                "primitives": [
+                    {
+                        "mode": 4,
+                        "attributes": {"POSITION": 0, "TEXCOORD_0": 1},
+                        "indices": 2,
+                        "material": 0,
+                    }
+                ]
+            }
+        ]
+    payload["buffers"] = [{"byteLength": len(binary)}]
     json_chunk = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     json_chunk += b" " * ((-len(json_chunk)) % 4)
     chunks = [
         struct.pack("<II", len(json_chunk), 0x4E4F534A) + json_chunk
     ]
     if include_bin:
-        binary = image_bytes + b"\0" * ((-len(image_bytes)) % 4)
-        chunks.append(struct.pack("<II", len(binary), 0x004E4942) + binary)
+        binary.extend(b"\0" * ((-len(binary)) % 4))
+        chunks.append(
+            struct.pack("<II", len(binary), 0x004E4942) + bytes(binary)
+        )
     body = b"".join(chunks)
     path.write_bytes(struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body)
     return path
@@ -471,13 +546,45 @@ def _assert_no_candidate_outputs(output: Path) -> None:
 def test_embedded_textured_glb_validation_follows_texture_image_chain(
     tmp_path: Path,
 ) -> None:
-    path = _write_textured_glb(tmp_path / "valid.glb")
+    path = _write_textured_glb(tmp_path / "valid.glb", include_mesh=True)
 
     report = runner._validate_embedded_textured_glb(path)
 
     assert report["embedded_image_count"] == 1
     assert report["textured_material_count"] == 1
-    assert report["buffer_view_count"] == 1
+    assert report["buffer_view_count"] == 4
+    assert report["valid_triangle_primitive_count"] == 1
+
+
+def test_embedded_textured_glb_validation_rejects_texture_only_pseudo_glb(
+    tmp_path: Path,
+) -> None:
+    path = _write_textured_glb(tmp_path / "no-mesh.glb")
+
+    with pytest.raises(RuntimeError, match="no accessors|no meshes"):
+        runner._validate_embedded_textured_glb(path)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"index_values": (0, 1, 9)}, "index exceeds POSITION count"),
+        ({"position_component_type": 5123}, "POSITION accessor contract"),
+    ],
+)
+def test_embedded_textured_glb_validation_rejects_invalid_mesh_accessors(
+    tmp_path: Path,
+    kwargs: dict,
+    message: str,
+) -> None:
+    path = _write_textured_glb(
+        tmp_path / "invalid-mesh.glb",
+        include_mesh=True,
+        **kwargs,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        runner._validate_embedded_textured_glb(path)
 
 
 def test_embedded_textured_glb_validation_rejects_missing_bin(
@@ -532,6 +639,111 @@ def test_default_viewer_is_self_contained_without_historical_template(
     assert 'data-view="front"' in text
     assert 'data-view="left"' in text
     assert 'data-view="right"' in text
+
+
+def test_default_viewer_parses_gltf_alpha_modes_and_configures_blending(
+    tmp_path: Path,
+) -> None:
+    baseline = _write_textured_glb(
+        tmp_path / "baseline.glb",
+        include_mesh=True,
+    )
+    candidate = _write_textured_glb(
+        tmp_path / "candidate.glb",
+        include_mesh=True,
+        alpha_mode="BLEND",
+        transparent_texture=True,
+    )
+    assert runner._validate_embedded_textured_glb(baseline)[
+        "valid_triangle_primitive_count"
+    ] == 1
+    assert runner._validate_embedded_textured_glb(candidate)[
+        "valid_triangle_primitive_count"
+    ] == 1
+
+    viewer = runner._write_viewer(
+        template=None,
+        baseline_glb=baseline,
+        candidate_glb=candidate,
+        output=tmp_path / "alpha-viewer.html",
+        dataset_label="alpha_fixture",
+    )
+
+    text = viewer.read_text(encoding="utf-8")
+    assert '["OPAQUE", "MASK", "BLEND"]' in text
+    assert "material.alphaMode" in text
+    assert "material.alphaCutoff" in text
+    assert "uAlphaMode == 1" in text
+    assert "uAlphaMode == 2" in text
+    assert "discard" in text
+    assert "gl.enable(gl.BLEND)" in text
+    assert "gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)" in text
+    assert "gl.depthMask(!blended)" in text
+    assert "gl.depthMask(true)" in text
+
+
+def test_default_viewer_discards_transparent_blend_pixels_in_headless_chrome(
+    tmp_path: Path,
+) -> None:
+    chrome = next(
+        (
+            executable
+            for executable in (
+                shutil.which("chrome"),
+                shutil.which("google-chrome"),
+                shutil.which("chromium"),
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            )
+            if executable is not None and Path(executable).is_file()
+        ),
+        None,
+    )
+    if chrome is None:
+        pytest.skip("Chrome/Chromium is unavailable for the viewer pixel check")
+    baseline = _write_textured_glb(
+        tmp_path / "baseline.glb",
+        include_mesh=True,
+    )
+    candidate = _write_textured_glb(
+        tmp_path / "candidate.glb",
+        include_mesh=True,
+        alpha_mode="BLEND",
+        transparent_texture=True,
+    )
+    viewer = runner._write_viewer(
+        template=None,
+        baseline_glb=baseline,
+        candidate_glb=candidate,
+        output=tmp_path / "alpha-viewer.html",
+        dataset_label="alpha_fixture",
+    )
+    screenshot = tmp_path / "alpha-viewer.png"
+    completed = subprocess.run(
+        [
+            str(chrome),
+            "--headless=new",
+            "--no-sandbox",
+            "--enable-unsafe-swiftshader",
+            "--use-angle=swiftshader",
+            f"--user-data-dir={tmp_path / 'chrome-profile'}",
+            "--window-size=1200,800",
+            "--virtual-time-budget=4000",
+            f"--screenshot={screenshot}",
+            viewer.resolve().as_uri(),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert screenshot.is_file() and screenshot.stat().st_size > 0
+    rendered = Image.open(screenshot).convert("RGB")
+    background = (15, 20, 28)
+    assert rendered.getpixel((300, 450)) != background
+    assert rendered.getpixel((900, 450)) == background
+    candidate_region = rendered.crop((700, 180, 1100, 700))
+    assert all(pixel == background for pixel in candidate_region.getdata())
 
 
 def test_runner_happy_path_writes_outputs_and_preserves_source(

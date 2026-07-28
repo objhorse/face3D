@@ -9,6 +9,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import shutil
 import struct
 import tempfile
@@ -660,6 +661,7 @@ def _validate_embedded_textured_glb(path: Path) -> dict[str, Any]:
         raise RuntimeError("candidate GLB image/texture/material tables are invalid")
     decoded_images: set[int] = set()
     textured_material_count = 0
+    textured_material_indices: set[int] = set()
     for material_index, material in enumerate(materials):
         if not isinstance(material, Mapping):
             raise RuntimeError(
@@ -704,6 +706,7 @@ def _validate_embedded_textured_glb(path: Path) -> dict[str, Any]:
             or isinstance(view_index, bool)
             or view_index < 0
             or view_index >= len(validated_views)
+            or not isinstance(mime_type, str)
             or mime_type not in {"image/png", "image/jpeg"}
         ):
             raise RuntimeError(
@@ -726,9 +729,227 @@ def _validate_embedded_textured_glb(path: Path) -> dict[str, Any]:
             )
         decoded_images.add(image_index)
         textured_material_count += 1
+        textured_material_indices.add(material_index)
     if not decoded_images or not textured_material_count:
         raise RuntimeError(
             "candidate GLB must contain embedded images and textured materials"
+        )
+
+    accessors = json_payload.get("accessors")
+    meshes = json_payload.get("meshes")
+    if not isinstance(accessors, list) or not accessors:
+        raise RuntimeError("candidate GLB has no accessors")
+    if not isinstance(meshes, list) or not meshes:
+        raise RuntimeError("candidate GLB has no meshes")
+    component_sizes = {
+        5120: 1,
+        5121: 1,
+        5122: 2,
+        5123: 2,
+        5125: 4,
+        5126: 4,
+    }
+    component_formats = {
+        5120: "b",
+        5121: "B",
+        5122: "h",
+        5123: "H",
+        5125: "I",
+        5126: "f",
+    }
+    type_components = {
+        "SCALAR": 1,
+        "VEC2": 2,
+        "VEC3": 3,
+        "VEC4": 4,
+    }
+
+    def accessor_contract(
+        accessor_index: Any,
+        label: str,
+        *,
+        allowed_component_types: set[int],
+        expected_type: str,
+    ) -> dict[str, Any]:
+        if (
+            not isinstance(accessor_index, int)
+            or isinstance(accessor_index, bool)
+            or accessor_index < 0
+            or accessor_index >= len(accessors)
+            or not isinstance(accessors[accessor_index], Mapping)
+        ):
+            raise RuntimeError(f"candidate GLB {label} accessor index is invalid")
+        accessor = accessors[accessor_index]
+        if "sparse" in accessor:
+            raise RuntimeError(f"candidate GLB {label} sparse accessor is unsupported")
+        view_index = accessor.get("bufferView")
+        component_type = accessor.get("componentType")
+        accessor_type = accessor.get("type")
+        count = accessor.get("count")
+        accessor_offset = accessor.get("byteOffset", 0)
+        if (
+            not isinstance(view_index, int)
+            or isinstance(view_index, bool)
+            or view_index < 0
+            or view_index >= len(buffer_views)
+            or not isinstance(component_type, int)
+            or isinstance(component_type, bool)
+            or component_type not in allowed_component_types
+            or component_type not in component_sizes
+            or accessor_type != expected_type
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 1
+            or not isinstance(accessor_offset, int)
+            or isinstance(accessor_offset, bool)
+            or accessor_offset < 0
+        ):
+            raise RuntimeError(f"candidate GLB {label} accessor contract is invalid")
+        component_size = component_sizes[component_type]
+        component_count = type_components[accessor_type]
+        element_size = component_size * component_count
+        view = buffer_views[view_index]
+        stride = view.get("byteStride", element_size)
+        if (
+            not isinstance(stride, int)
+            or isinstance(stride, bool)
+            or stride < element_size
+            or stride > 252
+            or stride % component_size
+            or ("byteStride" in view and stride % 4)
+            or accessor_offset % component_size
+            or (
+                validated_views[view_index][0] + accessor_offset
+            ) % component_size
+        ):
+            raise RuntimeError(f"candidate GLB {label} accessor stride is invalid")
+        required_length = accessor_offset + (count - 1) * stride + element_size
+        if required_length > validated_views[view_index][1]:
+            raise RuntimeError(f"candidate GLB {label} accessor exceeds bufferView")
+        return {
+            "accessor_index": accessor_index,
+            "view_index": view_index,
+            "component_type": component_type,
+            "component_count": component_count,
+            "component_size": component_size,
+            "count": count,
+            "stride": stride,
+            "accessor_offset": accessor_offset,
+        }
+
+    def accessor_values(contract: Mapping[str, Any]) -> Any:
+        view_offset = validated_views[int(contract["view_index"])][0]
+        component_type = int(contract["component_type"])
+        component_size = int(contract["component_size"])
+        component_count = int(contract["component_count"])
+        count = int(contract["count"])
+        stride = int(contract["stride"])
+        accessor_offset = int(contract["accessor_offset"])
+        format_string = "<" + component_formats[component_type]
+        for row in range(count):
+            row_offset = view_offset + accessor_offset + row * stride
+            yield tuple(
+                struct.unpack_from(
+                    format_string,
+                    binary,
+                    row_offset + column * component_size,
+                )[0]
+                for column in range(component_count)
+            )
+
+    valid_triangle_primitives = 0
+    for mesh_index, mesh in enumerate(meshes):
+        if not isinstance(mesh, Mapping):
+            raise RuntimeError(f"candidate GLB meshes[{mesh_index}] is invalid")
+        primitives = mesh.get("primitives")
+        if not isinstance(primitives, list) or not primitives:
+            raise RuntimeError(
+                f"candidate GLB meshes[{mesh_index}] has no primitives"
+            )
+        for primitive_index, primitive in enumerate(primitives):
+            label = f"mesh {mesh_index} primitive {primitive_index}"
+            if not isinstance(primitive, Mapping):
+                raise RuntimeError(f"candidate GLB {label} is invalid")
+            if primitive.get("mode", 4) != 4:
+                continue
+            attributes = primitive.get("attributes")
+            if not isinstance(attributes, Mapping):
+                raise RuntimeError(f"candidate GLB {label} attributes are invalid")
+            if "POSITION" not in attributes or "TEXCOORD_0" not in attributes:
+                raise RuntimeError(
+                    f"candidate GLB {label} requires POSITION and TEXCOORD_0"
+                )
+            if "indices" not in primitive:
+                raise RuntimeError(f"candidate GLB {label} requires indices")
+            material_index = primitive.get("material")
+            if (
+                not isinstance(material_index, int)
+                or isinstance(material_index, bool)
+                or material_index < 0
+                or material_index >= len(materials)
+                or material_index not in textured_material_indices
+            ):
+                raise RuntimeError(
+                    f"candidate GLB {label} material reference is invalid"
+                )
+            position = accessor_contract(
+                attributes["POSITION"],
+                f"{label} POSITION",
+                allowed_component_types={5126},
+                expected_type="VEC3",
+            )
+            texcoord = accessor_contract(
+                attributes["TEXCOORD_0"],
+                f"{label} TEXCOORD_0",
+                allowed_component_types={5121, 5123, 5126},
+                expected_type="VEC2",
+            )
+            indices = accessor_contract(
+                primitive["indices"],
+                f"{label} indices",
+                allowed_component_types={5121, 5123, 5125},
+                expected_type="SCALAR",
+            )
+            if (
+                position["count"] < 3
+                or texcoord["count"] != position["count"]
+                or indices["count"] < 3
+                or indices["count"] % 3
+            ):
+                raise RuntimeError(
+                    f"candidate GLB {label} accessor counts are invalid"
+                )
+            if texcoord["component_type"] in {5121, 5123} and (
+                accessors[int(texcoord["accessor_index"])].get("normalized")
+                is not True
+            ):
+                raise RuntimeError(
+                    f"candidate GLB {label} integer TEXCOORD_0 must be normalized"
+                )
+            for attribute_name, contract in (
+                ("POSITION", position),
+                ("TEXCOORD_0", texcoord),
+            ):
+                if any(
+                    not math.isfinite(float(value))
+                    for row in accessor_values(contract)
+                    for value in row
+                ):
+                    raise RuntimeError(
+                        f"candidate GLB {label} {attribute_name} is non-finite"
+                    )
+            max_index = max(
+                int(row[0])
+                for row in accessor_values(indices)
+            )
+            if max_index >= int(position["count"]):
+                raise RuntimeError(
+                    f"candidate GLB {label} index exceeds POSITION count"
+                )
+            valid_triangle_primitives += 1
+    if valid_triangle_primitives < 1:
+        raise RuntimeError(
+            "candidate GLB must contain at least one valid TRIANGLES primitive"
         )
     return {
         "path": str(path),
@@ -738,6 +959,7 @@ def _validate_embedded_textured_glb(path: Path) -> dict[str, Any]:
         "textured_material_count": textured_material_count,
         "buffer_view_count": len(validated_views),
         "declared_binary_byte_count": declared_buffer_length,
+        "valid_triangle_primitive_count": valid_triangle_primitives,
     }
 
 
@@ -1011,6 +1233,19 @@ async function textureFor(model, materialIndex, gl) {{
   bitmap.close();
   return handle;
 }}
+async function materialFor(model, materialIndex, gl) {{
+  const material = model.gltf.materials?.[materialIndex] || {{}};
+  const pbr = material.pbrMetallicRoughness || {{}};
+  const alphaMode = ["OPAQUE", "MASK", "BLEND"].includes(material.alphaMode) ? material.alphaMode : "OPAQUE";
+  const alphaCutoff = Number.isFinite(material.alphaCutoff) ? material.alphaCutoff : 0.5;
+  const factor = Array.isArray(pbr.baseColorFactor) && pbr.baseColorFactor.length === 4 ? pbr.baseColorFactor : [1,1,1,1];
+  return {{
+    texture: await textureFor(model, materialIndex, gl),
+    alphaMode,
+    alphaCutoff,
+    baseColorFactor: factor
+  }};
+}}
 function shader(gl, type, source) {{
   const value = gl.createShader(type); gl.shaderSource(value, source); gl.compileShader(value);
   if (!gl.getShaderParameter(value, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(value));
@@ -1034,7 +1269,15 @@ async function makeRenderer(canvas, encoded) {{
   gl.attachShader(program, shader(gl, gl.FRAGMENT_SHADER, `#version 300 es
     precision highp float; in vec2 vUv; out vec4 color;
     uniform sampler2D uTexture; uniform bool uHasTexture;
-    void main() {{ color = uHasTexture ? texture(uTexture, vUv) : vec4(.72,.76,.80,1.); }}
+    uniform int uAlphaMode; uniform float uAlphaCutoff;
+    uniform vec4 uBaseColorFactor;
+    void main() {{
+      vec4 sampled = uHasTexture ? texture(uTexture, vUv) : vec4(1.0);
+      vec4 shaded = sampled * uBaseColorFactor;
+      if (uAlphaMode == 1 && shaded.a <= max(uAlphaCutoff, 0.001)) discard;
+      if (uAlphaMode == 2 && shaded.a <= 0.001) discard;
+      color = uAlphaMode == 0 ? vec4(shaded.rgb, 1.0) : shaded;
+    }}
   `));
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
@@ -1054,7 +1297,7 @@ async function makeRenderer(canvas, encoded) {{
     else {{ gl.disableVertexAttribArray(uvLocation); gl.vertexAttrib2f(uvLocation,0,0); }}
     let count=positions.count, indexed=false;
     if (primitive.indices !== undefined) {{ const source=accessorData(model, primitive.indices).values, indices=new Uint32Array(source); const indexBuffer=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,indexBuffer); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,indices,gl.STATIC_DRAW); count=indices.length; indexed=true; }}
-    drawables.push({{vao, count, indexed, texture: await textureFor(model, primitive.material, gl)}});
+    drawables.push({{vao, count, indexed, material: await materialFor(model, primitive.material, gl)}});
   }}
   const center=bounds[0].map((value,index)=>(value+bounds[1][index])/2), extent=bounds[0].map((value,index)=>bounds[1][index]-value), scale=Math.max(...extent)*0.62 || 1;
   return {{canvas, gl, program, drawables, center, scale}};
@@ -1068,7 +1311,23 @@ function draw() {{
     gl.uniform1f(gl.getUniformLocation(program,"uScale"), (renderer.sharedScale || renderer.scale)*state.zoom);
     gl.uniform1f(gl.getUniformLocation(program,"uAspect"), width/height);
     gl.uniform1f(gl.getUniformLocation(program,"uYaw"), state.yaw); gl.uniform1f(gl.getUniformLocation(program,"uPitch"), state.pitch);
-    for (const item of renderer.drawables) {{gl.bindVertexArray(item.vao); gl.uniform1i(gl.getUniformLocation(program,"uHasTexture"),!!item.texture); if(item.texture)gl.bindTexture(gl.TEXTURE_2D,item.texture); item.indexed?gl.drawElements(gl.TRIANGLES,item.count,gl.UNSIGNED_INT,0):gl.drawArrays(gl.TRIANGLES,0,item.count);}}
+    for (const alphaMode of ["OPAQUE","MASK","BLEND"]) {{
+      const blended = alphaMode === "BLEND";
+      blended ? gl.enable(gl.BLEND) : gl.disable(gl.BLEND);
+      if (blended) gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      gl.depthMask(!blended);
+      for (const item of renderer.drawables) {{
+        if (item.material.alphaMode !== alphaMode) continue;
+        gl.bindVertexArray(item.vao);
+        gl.uniform1i(gl.getUniformLocation(program,"uHasTexture"),!!item.material.texture);
+        gl.uniform1i(gl.getUniformLocation(program,"uAlphaMode"),{{OPAQUE:0,MASK:1,BLEND:2}}[alphaMode]);
+        gl.uniform1f(gl.getUniformLocation(program,"uAlphaCutoff"),item.material.alphaCutoff);
+        gl.uniform4fv(gl.getUniformLocation(program,"uBaseColorFactor"),item.material.baseColorFactor);
+        if(item.material.texture)gl.bindTexture(gl.TEXTURE_2D,item.material.texture);
+        item.indexed?gl.drawElements(gl.TRIANGLES,item.count,gl.UNSIGNED_INT,0):gl.drawArrays(gl.TRIANGLES,0,item.count);
+      }}
+    }}
+    gl.depthMask(true); gl.disable(gl.BLEND);
   }}
   requestAnimationFrame(draw);
 }}
