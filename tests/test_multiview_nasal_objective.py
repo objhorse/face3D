@@ -12,6 +12,8 @@ import src.geometry.multiview_nasal_objective as nasal_objective
 from src.appearance.projective_sampling import project_points_strict
 from src.cross_view_geometry import Camera, scale_intrinsics
 from src.geometry.multiview_nasal_objective import (
+    MultiviewNasalObjectiveConfig,
+    MultiviewNasalObjectiveContext,
     MultiviewNasalProjection,
     MultiviewNasalSamplingConfig,
     PreparedNasalProjectionContext,
@@ -24,6 +26,8 @@ from src.geometry.multiview_nasal_objective import (
     _sparse_visibility,
     build_candidate_nasal_mesh,
     build_candidate_nasal_mesh_prepared,
+    evaluate_multiview_nasal_objective,
+    prepare_multiview_nasal_objective_context,
     prepare_nasal_projection_context,
     project_multiview_nasal_boundaries,
     project_multiview_nasal_boundaries_prepared,
@@ -32,7 +36,10 @@ from src.geometry.nasal_observations import (
     NasalObservationBundle,
     NasalViewObservation,
 )
-from src.geometry.nasal_semantic_basis import build_nasal_semantic_basis
+from src.geometry.nasal_semantic_basis import (
+    NASAL_SEMANTIC_MODE_NAMES,
+    build_nasal_semantic_basis,
+)
 from src.geometry.observable_flame_subspace import (
     ObservableFlameSubspaceConfig,
     ProjectionView,
@@ -1405,3 +1412,687 @@ def test_calls_are_deterministic_with_identical_sample_order_and_confidence():
             "depth",
         ):
             np.testing.assert_array_equal(getattr(left, name), getattr(right, name))
+
+
+def _objective_semantic_basis():
+    vertices, _faces = _mesh()
+    _observable, semantic = _bases(len(vertices))
+    vectors = np.zeros((8, len(vertices), 3), dtype=np.float64)
+    subject_left = semantic.region_masks["subject_left_nose_wing"]
+    subject_right = semantic.region_masks["subject_right_nose_wing"]
+    tip = semantic.region_masks["nose_tip"]
+
+    vectors[0, subject_left, 0] = 0.12
+    vectors[0, subject_right, 0] = -0.12
+    vectors[1, subject_left, 0] = 0.10
+    vectors[1, subject_right, 0] = 0.10
+    vectors[2, subject_left | subject_right, 2] = -0.10
+    vectors[3, subject_left, 2] = -0.10
+    vectors[3, subject_right, 2] = 0.10
+    vectors[4, tip, 2] = -0.12
+    vectors[5, tip, 1] = 0.10
+    vectors[6, tip, 2] = -0.18
+    vectors[6, 4, 2] = -0.04
+    vectors[7, subject_left | subject_right, 1] = 0.08
+    values = dict(vars(semantic))
+    values.update(vectors=vectors, names=NASAL_SEMANTIC_MODE_NAMES)
+    return SimpleNamespace(**values)
+
+
+def _semantic_with_vectors(semantic, vectors):
+    values = dict(vars(semantic))
+    values["vectors"] = np.asarray(vectors, dtype=np.float64)
+    return SimpleNamespace(**values)
+
+
+def _objective_observable(vertex_count: int):
+    observable, _semantic = _bases(vertex_count)
+    return SimpleNamespace(
+        vertex_basis=observable.vertex_basis,
+        coefficient_basis=np.eye(2, dtype=np.float64),
+        retained_rank=2,
+    )
+
+
+def _constant_confidence_observations(
+    observations: NasalObservationBundle,
+    values,
+) -> NasalObservationBundle:
+    supplied = dict(values)
+
+    def changed(observation):
+        value = supplied.get(observation.semantic_view, 1.0)
+        confidence = np.asarray(value, dtype=np.float64)
+        if confidence.ndim == 0:
+            confidence = np.full(
+                observation.boundary.shape,
+                float(confidence),
+                dtype=np.float64,
+            )
+        return replace(observation, confidence=confidence)
+
+    return NasalObservationBundle(
+        front=changed(observations.front),
+        subject_left=changed(observations.subject_left),
+        subject_right=changed(observations.subject_right),
+    )
+
+
+def _distance_field_to_points(
+    shape: tuple[int, int],
+    points: np.ndarray,
+) -> np.ndarray:
+    yy, xx = np.indices(shape, dtype=np.float64)
+    delta_x = xx[:, :, None] - points[None, None, :, 0]
+    delta_y = yy[:, :, None] - points[None, None, :, 1]
+    return np.sqrt(np.min(delta_x * delta_x + delta_y * delta_y, axis=2))
+
+
+def _target_observations_from_static_slots(
+    observations: NasalObservationBundle,
+    prepared: PreparedNasalProjectionContext,
+    baseline_projection: MultiviewNasalProjection,
+    target_vertices: np.ndarray,
+    *,
+    constant_distance: float = None,
+) -> NasalObservationBundle:
+    changed = {}
+    for view, baseline_samples in zip(
+        prepared.views,
+        baseline_projection.per_view,
+    ):
+        target_points = np.sum(
+            target_vertices[baseline_samples.source_vertex_indices]
+            * baseline_samples.source_weights[:, :, None],
+            axis=1,
+        )
+        target_pixels = project_points_strict(
+            target_points,
+            view.K,
+            view.R_model_to_camera,
+            view.t_model_to_camera,
+        ).pixel_xy
+        observation = observations.by_view[baseline_samples.semantic_view]
+        fields = {}
+        for boundary_name in sorted(set(baseline_samples.boundary_names)):
+            selected = np.asarray(
+                [
+                    name == boundary_name
+                    for name in baseline_samples.boundary_names
+                ],
+                dtype=bool,
+            )
+            if constant_distance is None:
+                fields[boundary_name] = _distance_field_to_points(
+                    observation.boundary.shape,
+                    target_pixels[selected],
+                )
+            else:
+                fields[boundary_name] = np.full(
+                    observation.boundary.shape,
+                    float(constant_distance),
+                    dtype=np.float64,
+                )
+        aggregate = np.minimum.reduce(tuple(fields.values()))
+        changed[baseline_samples.semantic_view] = replace(
+            observation,
+            distance_fields=fields,
+            distance_field=aggregate,
+        )
+    return NasalObservationBundle(
+        front=changed["front"],
+        subject_left=changed["subject-left"],
+        subject_right=changed["subject-right"],
+    )
+
+
+def _objective_problem(
+    *,
+    target_semantic=None,
+    confidence=None,
+    sampling_config=None,
+    semantic=None,
+    observable=None,
+    flame_standard_deviations=None,
+    constant_distance: float = None,
+):
+    vertices, faces = _mesh()
+    semantic = _objective_semantic_basis() if semantic is None else semantic
+    observable = (
+        _objective_observable(len(vertices))
+        if observable is None
+        else observable
+    )
+    work_K = np.array(
+        [[40.0, 0.0, 50.0], [0.0, 42.0, 50.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    observations = _observations(work_K)
+    observations = _constant_confidence_observations(
+        observations,
+        {} if confidence is None else confidence,
+    )
+    sampling = (
+        MultiviewNasalSamplingConfig(
+            front_samples_per_region=10,
+            side_samples_per_view=16,
+        )
+        if sampling_config is None
+        else sampling_config
+    )
+    prepared = prepare_nasal_projection_context(
+        faces,
+        semantic,
+        observations,
+        _views(work_K),
+        config=sampling,
+    )
+    zero_candidate = build_candidate_nasal_mesh_prepared(
+        vertices,
+        observable,
+        prepared,
+        np.zeros(observable.retained_rank),
+        np.zeros(8),
+    )
+    baseline_projection = project_multiview_nasal_boundaries_prepared(
+        zero_candidate,
+        prepared,
+    )
+    semantic_values = (
+        np.zeros(8, dtype=np.float64)
+        if target_semantic is None
+        else np.asarray(target_semantic, dtype=np.float64)
+    )
+    target_candidate = build_candidate_nasal_mesh_prepared(
+        vertices,
+        observable,
+        prepared,
+        np.zeros(observable.retained_rank),
+        semantic_values,
+    )
+    target_observations = _target_observations_from_static_slots(
+        observations,
+        prepared,
+        baseline_projection,
+        target_candidate.vertices,
+        constant_distance=constant_distance,
+    )
+    prepared_target = prepare_nasal_projection_context(
+        faces,
+        semantic,
+        target_observations,
+        _views(work_K),
+        config=sampling,
+    )
+    context = prepare_multiview_nasal_objective_context(
+        vertices,
+        observable,
+        semantic,
+        target_observations,
+        projection_context=prepared_target,
+        flame_mode_standard_deviations=flame_standard_deviations,
+    )
+    return context, semantic_values
+
+
+def _image_focused_config(**overrides):
+    values = {
+        "front_image_weight": 4.0,
+        "side_image_weight": 4.0,
+        "flame_prior_weight": 0.01,
+        "semantic_prior_weight": 0.01,
+        "smoothness_weight": 0.01,
+        "symmetry_weight": 0.01,
+        "robust_f_scale": 10.0,
+    }
+    values.update(overrides)
+    return MultiviewNasalObjectiveConfig(**values)
+
+
+def test_unified_objective_prefers_known_shared_alar_widening():
+    target = np.zeros(8)
+    target[0] = 0.8
+    context, _ = _objective_problem(target_semantic=target)
+    config = _image_focused_config()
+
+    zero = evaluate_multiview_nasal_objective(
+        np.zeros(context.parameter_count),
+        context,
+        config,
+    )
+    correct = evaluate_multiview_nasal_objective(
+        np.r_[np.zeros(context.observable_rank), target],
+        context,
+        config,
+    )
+    wrong = evaluate_multiview_nasal_objective(
+        np.r_[np.zeros(context.observable_rank), -target],
+        context,
+        config,
+    )
+
+    assert correct.total_robust_cost < zero.total_robust_cost
+    assert correct.total_robust_cost < wrong.total_robust_cost
+
+
+def test_tip_roundness_target_prefers_roundness_over_pure_tip_depth():
+    target = np.zeros(8)
+    target[6] = 0.9
+    context, _ = _objective_problem(target_semantic=target)
+    config = _image_focused_config()
+    roundness = np.r_[np.zeros(context.observable_rank), target]
+    tip_depth = np.zeros(context.parameter_count)
+    tip_depth[context.observable_rank + 4] = target[6]
+
+    rounded = evaluate_multiview_nasal_objective(roundness, context, config)
+    deepened = evaluate_multiview_nasal_objective(tip_depth, context, config)
+
+    assert rounded.total_robust_cost < deepened.total_robust_cost
+
+
+def test_zero_confidence_image_rows_and_finite_difference_gradient_are_exactly_zero():
+    target = np.zeros(8)
+    target[0] = 0.7
+    context, _ = _objective_problem(
+        target_semantic=target,
+        confidence={
+            "front": 0.0,
+            "subject-left": 0.0,
+            "subject-right": 0.0,
+        },
+    )
+    theta = np.zeros(context.parameter_count)
+    base = evaluate_multiview_nasal_objective(theta, context)
+    perturbed_theta = theta.copy()
+    perturbed_theta[context.observable_rank] = 1e-6
+    perturbed = evaluate_multiview_nasal_objective(
+        perturbed_theta,
+        context,
+    )
+
+    for name in context.image_term_names:
+        np.testing.assert_array_equal(
+            base.term_residuals[name],
+            np.zeros_like(base.term_residuals[name]),
+        )
+        np.testing.assert_array_equal(
+            perturbed.term_residuals[name],
+            np.zeros_like(perturbed.term_residuals[name]),
+        )
+        np.testing.assert_array_equal(
+            (
+                perturbed.term_residuals[name]
+                - base.term_residuals[name]
+            )
+            / 1e-6,
+            np.zeros_like(base.term_residuals[name]),
+        )
+
+
+def test_per_image_term_confidence_normalization_is_duplicate_invariant():
+    target = np.zeros(8)
+    sparse, _ = _objective_problem(
+        target_semantic=target,
+        constant_distance=2.5,
+        sampling_config=MultiviewNasalSamplingConfig(
+            front_samples_per_region=5,
+            side_samples_per_view=7,
+        ),
+    )
+    duplicated, _ = _objective_problem(
+        target_semantic=target,
+        constant_distance=2.5,
+        sampling_config=MultiviewNasalSamplingConfig(
+            front_samples_per_region=10,
+            side_samples_per_view=14,
+        ),
+    )
+    sparse_result = evaluate_multiview_nasal_objective(
+        np.zeros(sparse.parameter_count),
+        sparse,
+    )
+    duplicate_result = evaluate_multiview_nasal_objective(
+        np.zeros(duplicated.parameter_count),
+        duplicated,
+    )
+
+    for name in sparse.image_term_names:
+        assert sparse_result.raw_costs[name] == pytest.approx(
+            duplicate_result.raw_costs[name],
+            rel=1e-12,
+            abs=1e-12,
+        )
+
+
+def test_symmetry_evidence_factor_is_continuous_and_suppresses_single_side_asymmetry():
+    target = np.zeros(8)
+    target[3] = 0.9
+    factors = []
+    best_coefficients = []
+    grid = np.linspace(0.0, target[3], 10)
+    for right_confidence in (0.0, 0.25, 0.5, 1.0):
+        context, _ = _objective_problem(
+            target_semantic=target,
+            confidence={
+                "front": 1.0,
+                "subject-left": 1.0,
+                "subject-right": right_confidence,
+            },
+        )
+        config = _image_focused_config(
+            semantic_prior_weight=0.02,
+            symmetry_weight=1.5,
+            symmetry_evidence_floor=0.1,
+            symmetry_evidence_ceiling=1.0,
+        )
+        results = []
+        for coefficient in grid:
+            theta = np.zeros(context.parameter_count)
+            theta[context.observable_rank + 3] = coefficient
+            results.append(
+                evaluate_multiview_nasal_objective(theta, context, config)
+            )
+        factors.append(
+            results[0].symmetry_evidence_factors[
+                "alar_depth_asymmetry"
+            ]
+        )
+        best_coefficients.append(grid[np.argmin(
+            [result.total_robust_cost for result in results]
+        )])
+
+    assert factors[0] > factors[1] > factors[2] > factors[3]
+    assert best_coefficients[0] < best_coefficients[-1]
+    assert factors[0] <= 1.0
+    assert factors[-1] >= 0.1
+
+
+def test_symmetric_and_asymmetric_targets_prefer_supported_parameters():
+    config = _image_focused_config(symmetry_weight=0.05)
+    for mode_index in (0, 1):
+        target = np.zeros(8)
+        target[mode_index] = 0.75
+        context, _ = _objective_problem(target_semantic=target)
+        correct_theta = np.r_[np.zeros(context.observable_rank), target]
+        competing = np.zeros(8)
+        competing[1 - mode_index] = target[mode_index]
+        competing_theta = np.r_[
+            np.zeros(context.observable_rank),
+            competing,
+        ]
+
+        correct = evaluate_multiview_nasal_objective(
+            correct_theta,
+            context,
+            config,
+        )
+        wrong = evaluate_multiview_nasal_objective(
+            competing_theta,
+            context,
+            config,
+        )
+
+        assert correct.total_robust_cost < wrong.total_robust_cost
+
+
+def test_smoothness_is_zero_continuous_and_penalizes_rough_local_basis():
+    base_semantic = _objective_semantic_basis()
+    smooth_vectors = np.array(base_semantic.vectors, copy=True)
+    rough_vectors = np.array(base_semantic.vectors, copy=True)
+    smooth_vectors[0] = 0.0
+    smooth_vectors[0, :, 0] = 0.12
+    rough_vectors[0] = 0.0
+    rough_vectors[0, 4, 0] = 0.12
+    smooth_context, _ = _objective_problem(
+        semantic=_semantic_with_vectors(base_semantic, smooth_vectors),
+    )
+    rough_context, _ = _objective_problem(
+        semantic=_semantic_with_vectors(base_semantic, rough_vectors),
+    )
+    zero = evaluate_multiview_nasal_objective(
+        np.zeros(smooth_context.parameter_count),
+        smooth_context,
+    )
+    small_theta = np.zeros(smooth_context.parameter_count)
+    small_theta[smooth_context.observable_rank] = 1e-6
+    small = evaluate_multiview_nasal_objective(
+        small_theta,
+        smooth_context,
+    )
+    large_theta = small_theta * 2.0
+    large = evaluate_multiview_nasal_objective(
+        large_theta,
+        smooth_context,
+    )
+    rough_theta = np.zeros(rough_context.parameter_count)
+    rough_theta[rough_context.observable_rank] = 1.0
+    smooth_theta = np.zeros(smooth_context.parameter_count)
+    smooth_theta[smooth_context.observable_rank] = 1.0
+
+    np.testing.assert_array_equal(
+        zero.term_residuals["surface_smoothness"],
+        np.zeros_like(zero.term_residuals["surface_smoothness"]),
+    )
+    assert np.linalg.norm(
+        large.term_residuals["surface_smoothness"]
+    ) == pytest.approx(
+        2.0 * np.linalg.norm(
+            small.term_residuals["surface_smoothness"]
+        ),
+        rel=1e-10,
+        abs=1e-16,
+    )
+    assert np.linalg.norm(
+        evaluate_multiview_nasal_objective(
+            rough_theta,
+            rough_context,
+        ).term_residuals["surface_smoothness"]
+    ) > np.linalg.norm(
+        evaluate_multiview_nasal_objective(
+            smooth_theta,
+            smooth_context,
+        ).term_residuals["surface_smoothness"]
+    )
+
+
+def test_prior_scales_parameter_order_and_zero_theta_reproduce_baseline():
+    context, _ = _objective_problem(
+        flame_standard_deviations=(2.0, 4.0),
+        confidence={
+            "front": 0.0,
+            "subject-left": 0.0,
+            "subject-right": 0.0,
+        },
+    )
+    semantic_stddevs = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+    config = MultiviewNasalObjectiveConfig(
+        flame_prior_weight=2.0,
+        semantic_prior_weight=3.0,
+        semantic_prior_standard_deviations=semantic_stddevs,
+        smoothness_weight=0.0,
+        symmetry_weight=0.0,
+    )
+    zero = evaluate_multiview_nasal_objective(
+        np.zeros(context.parameter_count),
+        context,
+        config,
+    )
+    theta = np.r_[np.array([2.0, 4.0]), np.arange(1.0, 9.0)]
+    result = evaluate_multiview_nasal_objective(theta, context, config)
+
+    np.testing.assert_array_equal(
+        zero.candidate.vertices,
+        context.baseline_vertices,
+    )
+    np.testing.assert_array_equal(
+        result.term_residuals["flame_prior"],
+        np.array([2.0, 2.0]),
+    )
+    np.testing.assert_array_equal(
+        result.term_residuals["semantic_prior"],
+        np.full(8, 3.0),
+    )
+    assert result.parameter_ordering == (
+        "observable_flame_0",
+        "observable_flame_1",
+    ) + NASAL_SEMANTIC_MODE_NAMES
+
+
+def test_objective_residual_layout_is_fixed_and_calls_are_deterministic():
+    context, _ = _objective_problem()
+    theta = np.zeros(context.parameter_count)
+    first = evaluate_multiview_nasal_objective(theta, context)
+    second = evaluate_multiview_nasal_objective(theta, context)
+    changed_theta = theta.copy()
+    changed_theta[context.observable_rank + 6] = 1e-7
+    changed = evaluate_multiview_nasal_objective(changed_theta, context)
+
+    assert first.term_slices == second.term_slices == changed.term_slices
+    assert len(first.residuals) == len(second.residuals) == len(changed.residuals)
+    np.testing.assert_array_equal(first.residuals, second.residuals)
+    assert tuple(first.term_slices) == (
+        context.image_term_names
+        + (
+            "flame_prior",
+            "semantic_prior",
+            "surface_smoothness",
+            "weak_symmetry",
+        )
+    )
+
+
+def _is_bytes_backed(array: np.ndarray) -> bool:
+    value = array
+    seen = set()
+    while isinstance(value, np.ndarray) and id(value) not in seen:
+        seen.add(id(value))
+        value = value.base
+    return isinstance(value, bytes)
+
+
+def test_objective_validation_reports_and_arrays_are_deeply_immutable():
+    context, _ = _objective_problem()
+    result = evaluate_multiview_nasal_objective(
+        np.zeros(context.parameter_count),
+        context,
+    )
+
+    with pytest.raises(ValueError, match="theta.*shape|length"):
+        evaluate_multiview_nasal_objective(
+            np.zeros(context.parameter_count + 1),
+            context,
+        )
+    invalid_theta = np.zeros(context.parameter_count)
+    invalid_theta[0] = np.nan
+    with pytest.raises(ValueError, match="theta.*finite"):
+        evaluate_multiview_nasal_objective(invalid_theta, context)
+    with pytest.raises(ValueError, match="front_image_weight.*finite"):
+        MultiviewNasalObjectiveConfig(front_image_weight=np.nan)
+    with pytest.raises(ValueError, match="baseline.*finite"):
+        replace(
+            context,
+            baseline_vertices=np.full_like(
+                context.baseline_vertices,
+                np.nan,
+            ),
+        )
+    with pytest.raises(ValueError, match="context"):
+        evaluate_multiview_nasal_objective(
+            np.zeros(context.parameter_count),
+            object(),
+        )
+
+    assert isinstance(context, MultiviewNasalObjectiveContext)
+    for value in (context, result):
+        arrays = _reachable_arrays(value)
+        assert arrays
+        for array in arrays:
+            assert not array.flags.writeable
+            assert _is_bytes_backed(array)
+            with pytest.raises(ValueError, match="WRITEABLE|writeable"):
+                array.setflags(write=True)
+    with pytest.raises(TypeError):
+        result.term_residuals["new"] = np.zeros(1)
+    with pytest.raises(TypeError):
+        result.report_data["new"] = 1
+
+    assert result.report_data["robust_loss"] == "soft_l1"
+    assert result.report_data["parameter_ordering"] == result.parameter_ordering
+    assert set(result.report_data["raw_costs"]) == set(result.term_slices)
+    assert set(result.report_data["robust_costs"]) == set(result.term_slices)
+    assert result.report_data["effective_observation_counts"]
+    assert result.report_data["effective_confidence_sums"]
+    assert result.report_data["symmetry_evidence_factors"]
+
+
+def test_real_semantic_and_observable_results_prepare_and_evaluate_objective():
+    vertices, faces, landmark_faces, barycentric = _real_basis_mesh()
+    semantic = build_nasal_semantic_basis(
+        vertices,
+        faces,
+        landmark_faces,
+        barycentric,
+        model_to_front_camera=np.eye(3),
+    )
+    work_K = np.array(
+        [[46.0, 1.0, 50.0], [0.0, 44.0, 50.0], [0.0, 0.0, 1.0]]
+    )
+    base_rotation = np.diag([-1.0, 1.0, -1.0])
+    views = (
+        ProjectionView(
+            "front",
+            work_K,
+            base_rotation,
+            np.array([0.0, 0.0, 4.0]),
+        ),
+        ProjectionView(
+            "subject-left",
+            work_K,
+            base_rotation @ _rotation_y(72.0),
+            np.array([0.0, 0.0, 4.0]),
+        ),
+        ProjectionView(
+            "subject-right",
+            work_K,
+            base_rotation @ _rotation_y(-72.0),
+            np.array([0.0, 0.0, 4.0]),
+        ),
+    )
+    observable = build_observable_flame_subspace(
+        vertices,
+        semantic.vectors[0][:, :, None],
+        semantic.support_mask,
+        semantic.protected_mask,
+        views,
+        config=ObservableFlameSubspaceConfig(
+            min_nasal_response_ratio=0.0,
+            max_protected_to_nasal_energy_ratio=1.0,
+            relative_nasal_energy_floor=0.0,
+            relative_singular_value_threshold=1e-6,
+            max_rank=1,
+        ),
+    )
+    observations = _constant_confidence_observations(
+        _observations(work_K),
+        {"front": 1.0, "subject-left": 1.0, "subject-right": 1.0},
+    )
+    context = prepare_multiview_nasal_objective_context(
+        vertices,
+        observable,
+        semantic,
+        observations,
+        faces=faces,
+        views=views,
+        sampling_config=MultiviewNasalSamplingConfig(
+            front_samples_per_region=6,
+            side_samples_per_view=8,
+        ),
+    )
+    result = evaluate_multiview_nasal_objective(
+        np.zeros(context.parameter_count),
+        context,
+    )
+
+    assert context.observable_rank == observable.retained_rank
+    assert result.residuals.ndim == 1
+    np.testing.assert_array_equal(result.candidate.vertices, vertices)
