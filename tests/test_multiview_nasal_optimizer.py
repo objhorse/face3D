@@ -1,0 +1,441 @@
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
+from types import MappingProxyType, SimpleNamespace
+
+import numpy as np
+import pytest
+
+import src.geometry.multiview_nasal_optimizer as nasal_optimizer
+from src.geometry.multiview_nasal_objective import (
+    MultiviewNasalObjectiveConfig,
+    evaluate_multiview_nasal_objective,
+    evaluate_multiview_nasal_objective_residuals,
+)
+from src.geometry.multiview_nasal_optimizer import (
+    NasalOptimizationConfig,
+    NasalOptimizationIteration,
+    fit_multiview_nasal_shape,
+)
+from tests.test_multiview_nasal_objective import _objective_problem
+
+
+def _synthetic_evaluator(context, residual_function):
+    template = evaluate_multiview_nasal_objective_residuals(
+        np.zeros(context.parameter_count),
+        context,
+    )
+    names = tuple(template.term_residuals)
+
+    def evaluate(coefficients, _context, _config):
+        residuals = np.asarray(
+            residual_function(np.asarray(coefficients, dtype=np.float64)),
+            dtype=np.float64,
+        )
+        terms = {names[0]: residuals}
+        terms.update(
+            {
+                name: np.empty(0, dtype=np.float64)
+                for name in names[1:]
+            }
+        )
+        return SimpleNamespace(
+            residuals=residuals,
+            term_residuals=MappingProxyType(terms),
+        )
+
+    return evaluate
+
+
+def test_default_zero_initialization_keeps_exact_zero_solution(monkeypatch):
+    context, _ = _objective_problem()
+    baseline = np.array(context.baseline_vertices, copy=True)
+    residual_calls = 0
+    full_calls = 0
+    real_full = evaluate_multiview_nasal_objective
+    synthetic = _synthetic_evaluator(
+        context,
+        lambda coefficients: np.zeros_like(coefficients),
+    )
+
+    def counted_residual(*args):
+        nonlocal residual_calls
+        residual_calls += 1
+        return synthetic(*args)
+
+    def counted_full(*args):
+        nonlocal full_calls
+        full_calls += 1
+        return real_full(*args)
+
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        counted_residual,
+    )
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective",
+        counted_full,
+    )
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert result.success
+    np.testing.assert_array_equal(
+        result.coefficients,
+        np.zeros(context.parameter_count),
+    )
+    np.testing.assert_array_equal(context.baseline_vertices, baseline)
+    assert result.jacobian_rank == 0
+    assert result.baseline_unchanged is True
+    assert residual_calls == result.objective_evaluation_count
+    assert residual_calls > full_calls
+    assert full_calls == 1
+
+
+def test_two_small_initializations_converge_to_same_synthetic_solution(
+    monkeypatch,
+):
+    context, _ = _objective_problem()
+    target = np.linspace(-0.35, 0.35, context.parameter_count)
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        _synthetic_evaluator(
+            context,
+            lambda coefficients: coefficients - target,
+        ),
+    )
+
+    first = fit_multiview_nasal_shape(
+        context,
+        initial_coefficients=np.full(context.parameter_count, 0.05),
+    )
+    second = fit_multiview_nasal_shape(
+        context,
+        initial_coefficients=np.full(context.parameter_count, -0.08),
+    )
+
+    assert first.success
+    assert second.success
+    np.testing.assert_allclose(first.coefficients, target, atol=1e-8)
+    np.testing.assert_allclose(second.coefficients, target, atol=1e-8)
+    np.testing.assert_allclose(
+        first.coefficients,
+        second.coefficients,
+        atol=1e-9,
+    )
+
+
+def test_best_so_far_trace_is_monotonic_and_term_costs_sum(monkeypatch):
+    context, _ = _objective_problem()
+    target = np.linspace(-0.2, 0.2, context.parameter_count)
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        _synthetic_evaluator(
+            context,
+            lambda coefficients: coefficients - target,
+        ),
+    )
+
+    result = fit_multiview_nasal_shape(
+        context,
+        initial_coefficients=np.full(context.parameter_count, 0.1),
+    )
+
+    costs = np.asarray(
+        [item.total_robust_cost for item in result.iteration_trace]
+    )
+    assert len(costs) >= 2
+    assert np.all(np.diff(costs) <= 1e-12)
+    for index, item in enumerate(result.iteration_trace):
+        assert sum(item.robust_term_costs.values()) == pytest.approx(
+            item.total_robust_cost,
+            abs=1e-12,
+        )
+        assert sum(
+            values[index]
+            for values in result.objective_term_trace.values()
+        ) == pytest.approx(item.total_robust_cost, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    "initial",
+    [
+        lambda count: np.r_[np.nan, np.zeros(count - 1)],
+        lambda count: np.zeros(count - 1),
+        lambda count: np.full(count, 3.01),
+    ],
+)
+def test_invalid_initial_coefficients_return_clear_failure(initial):
+    context, _ = _objective_problem()
+
+    result = fit_multiview_nasal_shape(
+        context,
+        initial_coefficients=initial(context.parameter_count),
+    )
+
+    assert not result.success
+    assert result.failure_reason == "invalid_initial_coefficients"
+    assert result.baseline_unchanged is True
+    assert result.nfev == 0
+    assert result.objective_evaluation_count == 0
+    assert result.final_objective is None
+
+
+@pytest.mark.parametrize("behavior", ["nan", "exception"])
+def test_invalid_objective_evaluation_returns_failure(monkeypatch, behavior):
+    context, _ = _objective_problem()
+    template = _synthetic_evaluator(
+        context,
+        lambda coefficients: coefficients,
+    )
+
+    def broken(*args):
+        if behavior == "exception":
+            raise RuntimeError("synthetic evaluation failure")
+        evaluated = template(*args)
+        values = np.array(evaluated.residuals, copy=True)
+        values[0] = np.nan
+        return SimpleNamespace(
+            residuals=values,
+            term_residuals=evaluated.term_residuals,
+        )
+
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        broken,
+    )
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert not result.success
+    assert result.failure_reason == "objective_evaluation_failed"
+    assert result.baseline_unchanged is True
+    assert "objective evaluation failed" in result.solver_message
+    assert result.objective_evaluation_count == 1
+
+
+def test_no_positive_confidence_evidence_returns_failure():
+    context, _ = _objective_problem(
+        confidence={
+            "front": 0.0,
+            "subject-left": 0.0,
+            "subject-right": 0.0,
+        }
+    )
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert not result.success
+    assert result.failure_reason == "no_effective_observations"
+    assert result.baseline_unchanged is True
+    assert result.report["effective_observation_counts"] == {
+        name: 0 for name in context.image_term_names
+    }
+    assert result.objective_evaluation_count == 0
+
+
+def test_singular_nonzero_problem_returns_failure(monkeypatch):
+    context, _ = _objective_problem()
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        _synthetic_evaluator(
+            context,
+            lambda _coefficients: np.ones(context.parameter_count),
+        ),
+    )
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert not result.success
+    assert result.failure_reason == "singular_jacobian"
+    assert result.jacobian_rank == 0
+    assert result.final_objective is not None
+    assert result.baseline_unchanged is True
+
+
+def test_solver_exception_returns_failure_with_available_trace(monkeypatch):
+    context, _ = _objective_problem()
+
+    def broken_solver(fun, x0, **_kwargs):
+        fun(x0)
+        raise RuntimeError("synthetic solver failure")
+
+    monkeypatch.setattr(nasal_optimizer, "least_squares", broken_solver)
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert not result.success
+    assert result.failure_reason == "solver_failed"
+    assert result.baseline_unchanged is True
+    assert result.objective_evaluation_count == 1
+    assert len(result.iteration_trace) == 1
+    assert result.final_objective is not None
+    assert "synthetic solver failure" in result.solver_message
+
+
+def test_scipy_receives_fixed_numerical_contract(monkeypatch):
+    flame_scales = np.array([0.4, 1.7])
+    context, _ = _objective_problem(
+        flame_standard_deviations=flame_scales,
+    )
+    semantic_scales = tuple(np.linspace(0.5, 1.2, 8))
+    objective_config = MultiviewNasalObjectiveConfig(
+        semantic_prior_standard_deviations=semantic_scales,
+        robust_f_scale=2.5,
+    )
+    optimization_config = NasalOptimizationConfig(
+        max_nfev=17,
+        diff_step=1e-5,
+    )
+    captured = {}
+
+    def spy(fun, x0, **kwargs):
+        captured["x0"] = x0
+        captured.update(kwargs)
+        residuals = fun(x0)
+        count = len(x0)
+        return SimpleNamespace(
+            x=np.asarray(x0),
+            fun=residuals,
+            success=True,
+            status=1,
+            message="spy converged",
+            nfev=1,
+            njev=1,
+            optimality=0.0,
+            active_mask=np.zeros(count, dtype=np.int64),
+            jac=np.eye(count, dtype=np.float64),
+        )
+
+    monkeypatch.setattr(nasal_optimizer, "least_squares", spy)
+
+    result = fit_multiview_nasal_shape(
+        context,
+        objective_config=objective_config,
+        optimization_config=optimization_config,
+    )
+
+    assert result.success
+    assert captured["jac"] == "2-point"
+    assert captured["method"] == "trf"
+    assert captured["bounds"][0] is context.parameter_lower_bounds
+    assert captured["bounds"][1] is context.parameter_upper_bounds
+    np.testing.assert_array_equal(
+        captured["bounds"][0],
+        np.full(context.parameter_count, -3.0),
+    )
+    np.testing.assert_array_equal(
+        captured["bounds"][1],
+        np.full(context.parameter_count, 3.0),
+    )
+    assert captured["loss"] == objective_config.robust_loss
+    assert captured["f_scale"] == objective_config.robust_f_scale
+    np.testing.assert_allclose(
+        captured["x_scale"],
+        np.r_[flame_scales, semantic_scales],
+    )
+    assert captured["diff_step"] == optimization_config.diff_step
+    assert captured["max_nfev"] == optimization_config.max_nfev
+
+
+def test_iterative_path_uses_residual_only_and_full_evaluator_once(
+    monkeypatch,
+):
+    context, _ = _objective_problem()
+    target = np.linspace(-0.25, 0.25, context.parameter_count)
+    synthetic = _synthetic_evaluator(
+        context,
+        lambda coefficients: coefficients - target,
+    )
+    real_full = evaluate_multiview_nasal_objective
+    residual_calls = 0
+    full_calls = 0
+
+    def counted_residual(*args):
+        nonlocal residual_calls
+        residual_calls += 1
+        return synthetic(*args)
+
+    def counted_full(*args):
+        nonlocal full_calls
+        full_calls += 1
+        return real_full(*args)
+
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        counted_residual,
+    )
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective",
+        counted_full,
+    )
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert result.success
+    assert residual_calls == result.objective_evaluation_count
+    assert residual_calls >= context.parameter_count + 2
+    assert full_calls == 1
+
+
+def test_result_trace_and_nested_report_are_deeply_immutable(monkeypatch):
+    context, _ = _objective_problem()
+    target = np.linspace(-0.1, 0.1, context.parameter_count)
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        _synthetic_evaluator(
+            context,
+            lambda coefficients: coefficients - target,
+        ),
+    )
+    result = fit_multiview_nasal_shape(context)
+
+    with pytest.raises(ValueError):
+        result.coefficients[0] = 9.0
+    with pytest.raises(ValueError):
+        result.active_mask[0] = 1
+    with pytest.raises(ValueError):
+        result.iteration_trace[0].coefficients[0] = 9.0
+    with pytest.raises(TypeError):
+        result.iteration_trace[0].robust_term_costs["new"] = 1.0
+    with pytest.raises(TypeError):
+        result.objective_term_trace["new"] = ()
+    with pytest.raises(TypeError):
+        result.report["bounds"]["lower"] = ()
+    with pytest.raises(FrozenInstanceError):
+        result.success = False
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_nfev": 0},
+        {"ftol": 0.0},
+        {"diff_step": np.nan},
+        {"trace_cost_tolerance": -1.0},
+        {"method": "dogbox"},
+        {"jac": "3-point"},
+    ],
+)
+def test_optimization_config_is_strict(kwargs):
+    with pytest.raises(ValueError):
+        NasalOptimizationConfig(**kwargs)
+
+
+def test_trace_dataclass_rejects_inconsistent_term_total():
+    with pytest.raises(ValueError):
+        NasalOptimizationIteration(
+            function_evaluation=1,
+            coefficients=np.zeros(2),
+            total_robust_cost=2.0,
+            robust_term_costs={"term": 1.0},
+        )
