@@ -1454,6 +1454,14 @@ def _semantic_with_vectors(semantic, vectors):
     return SimpleNamespace(**values)
 
 
+def _single_face_flip_semantic():
+    semantic = _objective_semantic_basis()
+    vectors = np.zeros_like(semantic.vectors)
+    _vertices, faces = _mesh()
+    vectors[0, faces[0, 2]] = (-1.0, 1.0, 0.0)
+    return _semantic_with_vectors(semantic, vectors)
+
+
 def _objective_observable(vertex_count: int):
     observable, _semantic = _bases(vertex_count)
     return SimpleNamespace(
@@ -2122,6 +2130,70 @@ def test_smoothness_is_zero_continuous_and_penalizes_rough_local_basis():
     )
 
 
+def test_surface_orientation_barrier_is_near_zero_at_baseline_and_strong_on_flip():
+    context, _ = _objective_problem(semantic=_single_face_flip_semantic())
+    baseline = evaluate_multiview_nasal_objective(
+        np.zeros(context.parameter_count),
+        context,
+    )
+    flipped_theta = np.zeros(context.parameter_count)
+    flipped_theta[context.observable_rank] = 1.0
+    flipped = evaluate_multiview_nasal_objective(
+        flipped_theta,
+        context,
+    )
+
+    assert np.linalg.norm(
+        baseline.term_residuals["surface_orientation_barrier"]
+    ) < 1e-4
+    assert baseline.report_data["surface_orientation_barrier"][
+        "min_signed_area_ratio"
+    ] == pytest.approx(1.0, abs=1e-14)
+    assert flipped.report_data["surface_orientation_barrier"][
+        "min_signed_area_ratio"
+    ] < 0.0
+    assert np.linalg.norm(
+        flipped.term_residuals["surface_orientation_barrier"]
+    ) > 50.0
+    assert len(
+        flipped.term_residuals["surface_orientation_barrier"]
+    ) == context.orientation_active_face_count + 1
+
+
+def test_orientation_context_selects_basis_or_support_faces_and_is_immutable():
+    context, _ = _objective_problem(semantic=_single_face_flip_semantic())
+    faces = context.projection_context.faces
+    expected_vertices = (
+        np.any(context.observable_vertex_basis != 0.0, axis=(1, 2))
+        | np.any(
+            context.projection_context.semantic_vectors != 0.0,
+            axis=(0, 2),
+        )
+        | context.projection_context.support_mask
+    )
+    expected_faces = np.flatnonzero(
+        np.any(expected_vertices[faces], axis=1)
+    )
+
+    np.testing.assert_array_equal(
+        context.orientation_face_indices,
+        expected_faces,
+    )
+    np.testing.assert_array_equal(
+        context.orientation_face_vertices,
+        faces[expected_faces],
+    )
+    assert context.orientation_active_face_count == len(expected_faces)
+    for array in (
+        context.orientation_face_indices,
+        context.orientation_face_vertices,
+        context.orientation_reference_cross,
+        context.orientation_reference_inverse_squared_norm,
+    ):
+        assert not array.flags.writeable
+        assert _is_bytes_backed(array)
+
+
 def test_prior_scales_parameter_order_and_zero_theta_reproduce_baseline():
     context, _ = _objective_problem(
         flame_standard_deviations=(2.0, 4.0),
@@ -2184,6 +2256,7 @@ def test_objective_residual_layout_is_fixed_and_calls_are_deterministic():
             "flame_prior",
             "semantic_prior",
             "surface_smoothness",
+            "surface_orientation_barrier",
             "weak_symmetry",
         )
     )
@@ -2784,7 +2857,24 @@ def test_scipy_least_squares_converges_to_manual_shared_widening():
 
     assert solved.success
     assert solved.x[0] == pytest.approx(1.0, abs=1e-6)
-    assert np.linalg.norm(solved.fun) < 1e-8
+    theta = np.zeros(context.parameter_count)
+    theta[context.observable_rank] = solved.x[0]
+    evaluated = evaluate_multiview_nasal_objective(
+        theta,
+        context,
+        config,
+    )
+    non_orientation = np.concatenate(
+        [
+            residual
+            for name, residual in evaluated.term_residuals.items()
+            if name != "surface_orientation_barrier"
+        ]
+    )
+    assert np.linalg.norm(non_orientation) < 1e-8
+    assert np.linalg.norm(
+        evaluated.term_residuals["surface_orientation_barrier"]
+    ) < 1e-6
 
 
 def test_residual_only_realistic_mesh_avoids_face_scale_visibility_cost():
@@ -2796,24 +2886,35 @@ def test_residual_only_realistic_mesh_avoids_face_scale_visibility_cost():
     columns = np.tile(np.arange(size), size)
     rows = np.repeat(np.arange(size), size)
     vertex_count = len(vertices)
-    subject_left = columns >= size // 2
-    subject_right = columns < size // 2
+    support = (
+        (np.abs(columns - center) <= 6)
+        & (np.abs(rows - center) <= 24)
+    )
+    subject_left = support & (columns >= size // 2)
+    subject_right = support & (columns < size // 2)
     tip = (
         (np.abs(columns - center) <= size * 0.08)
         & (np.abs(rows - center) <= size * 0.2)
+        & support
     )
     semantic = SimpleNamespace(
         vectors=np.zeros((8, vertex_count, 3), dtype=np.float64),
         names=NASAL_SEMANTIC_MODE_NAMES,
-        support_mask=np.ones(vertex_count, dtype=bool),
+        support_mask=support,
         protected_mask=np.zeros(vertex_count, dtype=bool),
-        mode_support_masks=np.ones((8, vertex_count), dtype=bool),
+        mode_support_masks=np.broadcast_to(
+            support,
+            (8, vertex_count),
+        ).copy(),
         region_masks={
-            "nose_bridge": np.abs(columns - center) <= size * 0.04,
+            "nose_bridge": (
+                (np.abs(columns - center) <= 3)
+                & support
+            ),
             "nose_tip": tip,
             "subject_left_nose_wing": subject_left,
             "subject_right_nose_wing": subject_right,
-            "tip_alar_transition": np.ones(vertex_count, dtype=bool),
+            "tip_alar_transition": support,
         },
     )
     observable = SimpleNamespace(
@@ -2850,6 +2951,7 @@ def test_residual_only_realistic_mesh_avoids_face_scale_visibility_cost():
         durations.append(time.perf_counter() - started)
 
     assert len(faces) > 159_000
+    assert context.orientation_active_face_count < 2_000
     assert np.median(durations) < 0.45
 
 
@@ -2897,6 +2999,10 @@ def test_objective_validation_reports_and_arrays_are_deeply_immutable():
         MultiviewNasalObjectiveConfig(depth_barrier_weight=0.0)
     with pytest.raises(ValueError, match="depth_barrier_scale"):
         MultiviewNasalObjectiveConfig(depth_barrier_scale=1.0)
+    with pytest.raises(ValueError, match="orientation_barrier_weight"):
+        MultiviewNasalObjectiveConfig(orientation_barrier_weight=0.0)
+    with pytest.raises(ValueError, match="orientation_barrier_margin"):
+        MultiviewNasalObjectiveConfig(orientation_barrier_margin=0.1)
     with pytest.raises(ValueError, match="robust_f_scale"):
         MultiviewNasalObjectiveConfig(robust_f_scale=0.1)
     with pytest.raises(ValueError, match="semantic_coefficient_bound"):
@@ -2922,6 +3028,18 @@ def test_objective_validation_reports_and_arrays_are_deeply_immutable():
             parameter_upper_bounds=np.full(
                 context.parameter_count,
                 4.0,
+            ),
+        )
+    with pytest.raises(ValueError, match="orientation.*faces"):
+        replace(
+            context,
+            orientation_face_indices=context.orientation_face_indices[:-1],
+        )
+    with pytest.raises(ValueError, match="orientation.*reference"):
+        replace(
+            context,
+            orientation_reference_cross=np.zeros_like(
+                context.orientation_reference_cross
             ),
         )
     with pytest.raises(ValueError, match="context"):
@@ -2956,6 +3074,19 @@ def test_objective_validation_reports_and_arrays_are_deeply_immutable():
     assert result.report_data["per_view_effective_confidence_sums"]
     assert result.report_data["per_view_sample_counts"]
     assert result.report_data["symmetry_evidence_factors"]
+    orientation_report = result.report_data[
+        "surface_orientation_barrier"
+    ]
+    assert orientation_report["active_face_count"] == (
+        context.orientation_active_face_count
+    )
+    assert set(orientation_report["signed_area_ratio_quantiles"]) == {
+        "p01",
+        "p05",
+        "p50",
+        "p95",
+        "p99",
+    }
 
 
 def test_real_semantic_and_observable_results_prepare_and_evaluate_objective():

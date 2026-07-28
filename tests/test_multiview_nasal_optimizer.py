@@ -17,7 +17,10 @@ from src.geometry.multiview_nasal_optimizer import (
     NasalOptimizationIteration,
     fit_multiview_nasal_shape,
 )
-from tests.test_multiview_nasal_objective import _objective_problem
+from tests.test_multiview_nasal_objective import (
+    _objective_problem,
+    _single_face_flip_semantic,
+)
 
 
 def _synthetic_evaluator(context, residual_function):
@@ -142,6 +145,61 @@ def test_two_small_initializations_converge_to_same_synthetic_solution(
         first.coefficients,
         second.coefficients,
         atol=1e-9,
+    )
+
+
+def test_real_image_target_converges_without_flipping_an_active_face():
+    target = np.zeros(8, dtype=np.float64)
+    target[0] = 1.0
+    context, _ = _objective_problem(
+        target_semantic=target,
+        semantic=_single_face_flip_semantic(),
+    )
+    config = MultiviewNasalObjectiveConfig(
+        front_image_weight=0.0,
+        side_image_weight=25.0,
+        flame_prior_weight=0.0,
+        semantic_prior_weight=0.0,
+        smoothness_weight=0.0,
+        symmetry_weight=0.0,
+    )
+    target_theta = np.r_[np.zeros(context.observable_rank), target]
+    target_result = evaluate_multiview_nasal_objective(
+        target_theta,
+        context,
+        config,
+    )
+    baseline_result = evaluate_multiview_nasal_objective(
+        np.zeros(context.parameter_count),
+        context,
+        config,
+    )
+
+    result = fit_multiview_nasal_shape(
+        context,
+        objective_config=config,
+        optimization_config=NasalOptimizationConfig(max_nfev=200),
+    )
+
+    assert target_result.report_data["surface_orientation_barrier"][
+        "min_signed_area_ratio"
+    ] < 0.0
+    assert result.success
+    assert result.final_objective is not None
+    assert abs(result.coefficients[context.observable_rank]) > 0.05
+    assert sum(
+        result.final_objective.raw_costs[name]
+        for name in context.image_term_names
+    ) < sum(
+        baseline_result.raw_costs[name]
+        for name in context.image_term_names
+    )
+    assert result.final_objective.report_data[
+        "surface_orientation_barrier"
+    ]["min_signed_area_ratio"] > 0.0
+    assert (
+        result.final_objective.raw_costs["surface_orientation_barrier"]
+        > 0.0
     )
 
 

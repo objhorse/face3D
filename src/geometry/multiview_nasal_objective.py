@@ -1950,6 +1950,7 @@ _OBJECTIVE_REGULARIZATION_TERM_NAMES = (
     "flame_prior",
     "semantic_prior",
     "surface_smoothness",
+    "surface_orientation_barrier",
     "weak_symmetry",
 )
 _ASYMMETRY_MODE_NAMES = (
@@ -1959,6 +1960,11 @@ _ASYMMETRY_MODE_NAMES = (
 _MIN_DEPTH_BARRIER_WEIGHT = 100.0
 _FIXED_DEPTH_BARRIER_SCALE = 0.02
 _FIXED_DEPTH_BARRIER_SOFTMIN_TEMPERATURE = 1e-4
+_FIXED_ORIENTATION_BARRIER_WEIGHT = 25.0
+_FIXED_ORIENTATION_BARRIER_MARGIN = 0.20
+_FIXED_ORIENTATION_BARRIER_SCALE = 0.05
+_FIXED_ORIENTATION_BARRIER_SOFTMIN_TEMPERATURE = 0.01
+_ORIENTATION_BASELINE_CROSS_SQUARED_EPSILON = 1e-20
 _MIN_ROBUST_F_SCALE = 1.0
 _FIXED_OBSERVABLE_COEFFICIENT_BOUND = 3.0
 _FIXED_SEMANTIC_COEFFICIENT_BOUND = 3.0
@@ -2026,6 +2032,18 @@ class MultiviewNasalObjectiveConfig:
     depth_barrier_softmin_temperature: float = (
         _FIXED_DEPTH_BARRIER_SOFTMIN_TEMPERATURE
     )
+    orientation_barrier_weight: float = (
+        _FIXED_ORIENTATION_BARRIER_WEIGHT
+    )
+    orientation_barrier_margin: float = (
+        _FIXED_ORIENTATION_BARRIER_MARGIN
+    )
+    orientation_barrier_scale: float = (
+        _FIXED_ORIENTATION_BARRIER_SCALE
+    )
+    orientation_barrier_softmin_temperature: float = (
+        _FIXED_ORIENTATION_BARRIER_SOFTMIN_TEMPERATURE
+    )
     observable_coefficient_bound: float = (
         _FIXED_OBSERVABLE_COEFFICIENT_BOUND
     )
@@ -2042,6 +2060,7 @@ class MultiviewNasalObjectiveConfig:
             "smoothness_weight",
             "symmetry_weight",
             "depth_barrier_weight",
+            "orientation_barrier_weight",
         ):
             _finite_real(name, getattr(self, name))
         if float(self.depth_barrier_weight) < _MIN_DEPTH_BARRIER_WEIGHT:
@@ -2060,6 +2079,9 @@ class MultiviewNasalObjectiveConfig:
             "depth_softplus_scale",
             "depth_barrier_scale",
             "depth_barrier_softmin_temperature",
+            "orientation_barrier_margin",
+            "orientation_barrier_scale",
+            "orientation_barrier_softmin_temperature",
             "robust_f_scale",
         ):
             _finite_real(name, getattr(self, name), strictly_positive=True)
@@ -2077,6 +2099,29 @@ class MultiviewNasalObjectiveConfig:
                 "feasibility value "
                 f"{_FIXED_DEPTH_BARRIER_SOFTMIN_TEMPERATURE:g}"
             )
+        for name, expected in (
+            (
+                "orientation_barrier_weight",
+                _FIXED_ORIENTATION_BARRIER_WEIGHT,
+            ),
+            (
+                "orientation_barrier_margin",
+                _FIXED_ORIENTATION_BARRIER_MARGIN,
+            ),
+            (
+                "orientation_barrier_scale",
+                _FIXED_ORIENTATION_BARRIER_SCALE,
+            ),
+            (
+                "orientation_barrier_softmin_temperature",
+                _FIXED_ORIENTATION_BARRIER_SOFTMIN_TEMPERATURE,
+            ),
+        ):
+            if float(getattr(self, name)) != expected:
+                raise ValueError(
+                    f"{name} is the fixed subject-independent value "
+                    f"{expected:g}"
+                )
         if float(self.robust_f_scale) < _MIN_ROBUST_F_SCALE:
             raise ValueError(
                 f"robust_f_scale must be at least {_MIN_ROBUST_F_SCALE:g}"
@@ -2347,6 +2392,10 @@ class MultiviewNasalObjectiveContext:
     smoothness_neighbors: np.ndarray
     smoothness_neighbor_offsets: np.ndarray
     smoothness_edge_count: int
+    orientation_face_indices: np.ndarray
+    orientation_face_vertices: np.ndarray
+    orientation_reference_cross: np.ndarray
+    orientation_reference_inverse_squared_norm: np.ndarray
     parameter_ordering: Tuple[str, ...]
     parameter_lower_bounds: np.ndarray
     parameter_upper_bounds: np.ndarray
@@ -2523,6 +2572,67 @@ class MultiviewNasalObjectiveContext:
             raise ValueError(
                 "smoothness_edge_count must match fixed support edges"
             )
+        (
+            expected_orientation_indices,
+            expected_orientation_faces,
+            expected_orientation_cross,
+            expected_orientation_inverse,
+        ) = _orientation_reference_data(
+            baseline,
+            prepared,
+            flame_basis,
+        )
+        orientation_indices = np.asarray(self.orientation_face_indices)
+        orientation_faces = np.asarray(self.orientation_face_vertices)
+        orientation_cross = np.asarray(
+            self.orientation_reference_cross,
+            dtype=np.float64,
+        )
+        orientation_inverse = np.asarray(
+            self.orientation_reference_inverse_squared_norm,
+            dtype=np.float64,
+        )
+        active_face_count = len(expected_orientation_indices)
+        if (
+            orientation_indices.ndim != 1
+            or not np.issubdtype(orientation_indices.dtype, np.integer)
+            or orientation_faces.shape != (active_face_count, 3)
+            or not np.issubdtype(orientation_faces.dtype, np.integer)
+            or orientation_cross.shape != (active_face_count, 3)
+            or orientation_inverse.shape != (active_face_count,)
+            or not np.isfinite(orientation_cross).all()
+            or not np.isfinite(orientation_inverse).all()
+            or np.any(orientation_inverse <= 0.0)
+        ):
+            raise ValueError(
+                "orientation reference arrays have invalid shapes or values"
+            )
+        if (
+            not np.array_equal(
+                orientation_indices,
+                expected_orientation_indices,
+            )
+            or not np.array_equal(
+                orientation_faces,
+                expected_orientation_faces,
+            )
+        ):
+            raise ValueError(
+                "orientation active faces do not match movable basis support"
+            )
+        if (
+            not np.array_equal(
+                orientation_cross,
+                expected_orientation_cross,
+            )
+            or not np.array_equal(
+                orientation_inverse,
+                expected_orientation_inverse,
+            )
+        ):
+            raise ValueError(
+                "orientation reference data do not match baseline faces"
+            )
         ordering = tuple(str(value) for value in self.parameter_ordering)
         expected_ordering = tuple(
             f"observable_flame_{index}" for index in range(rank)
@@ -2596,6 +2706,26 @@ class MultiviewNasalObjectiveContext:
             _readonly_array(offsets, np.int64),
         )
         object.__setattr__(self, "smoothness_edge_count", edge_count)
+        object.__setattr__(
+            self,
+            "orientation_face_indices",
+            _readonly_array(orientation_indices, np.int64),
+        )
+        object.__setattr__(
+            self,
+            "orientation_face_vertices",
+            _readonly_array(orientation_faces, np.int64),
+        )
+        object.__setattr__(
+            self,
+            "orientation_reference_cross",
+            _readonly_array(orientation_cross, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "orientation_reference_inverse_squared_norm",
+            _readonly_array(orientation_inverse, np.float64),
+        )
         object.__setattr__(self, "parameter_ordering", ordering)
         object.__setattr__(
             self,
@@ -2615,6 +2745,10 @@ class MultiviewNasalObjectiveContext:
     @property
     def parameter_count(self) -> int:
         return self.observable_rank + len(NASAL_SEMANTIC_MODE_NAMES)
+
+    @property
+    def orientation_active_face_count(self) -> int:
+        return len(self.orientation_face_indices)
 
     @property
     def image_term_names(self) -> Tuple[str, ...]:
@@ -3242,6 +3376,69 @@ def _smoothness_topology(
     )
 
 
+def _orientation_reference_data(
+    baseline_vertices: np.ndarray,
+    prepared: PreparedNasalProjectionContext,
+    observable_vertex_basis: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return static baseline references for every potentially moved face."""
+    baseline = np.asarray(baseline_vertices)
+    observable = np.asarray(observable_vertex_basis, dtype=np.float64)
+    movable_vertices = np.asarray(prepared.support_mask, dtype=bool).copy()
+    if observable.shape[2]:
+        movable_vertices |= np.any(observable != 0.0, axis=(1, 2))
+    movable_vertices |= np.any(
+        prepared.semantic_vectors != 0.0,
+        axis=(0, 2),
+    )
+    candidate_indices = np.flatnonzero(
+        np.any(movable_vertices[prepared.faces], axis=1)
+    )
+    candidate_faces = prepared.faces[candidate_indices]
+    triangles = np.asarray(
+        baseline[candidate_faces],
+        dtype=np.float64,
+    )
+    reference_cross = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    squared_norm = np.einsum(
+        "fi,fi->f",
+        reference_cross,
+        reference_cross,
+        optimize=True,
+    )
+    nondegenerate = (
+        np.isfinite(squared_norm)
+        & (
+            squared_norm
+            > _ORIENTATION_BASELINE_CROSS_SQUARED_EPSILON
+        )
+    )
+    active_indices = candidate_indices[nondegenerate].astype(
+        np.int64,
+        copy=False,
+    )
+    active_faces = candidate_faces[nondegenerate].astype(
+        np.int64,
+        copy=False,
+    )
+    active_cross = reference_cross[nondegenerate]
+    if not len(active_indices):
+        raise ValueError(
+            "orientation barrier requires at least one movable "
+            "nondegenerate baseline face"
+        )
+    inverse_squared_norm = 1.0 / squared_norm[nondegenerate]
+    return (
+        active_indices,
+        active_faces,
+        active_cross,
+        inverse_squared_norm,
+    )
+
+
 def _canonical_curve_quantile_points(
     curve: np.ndarray,
     quantiles: np.ndarray,
@@ -3503,6 +3700,16 @@ def prepare_multiview_nasal_objective_context(
             )
         )
     centers, neighbors, offsets, edge_count = _smoothness_topology(prepared)
+    (
+        orientation_indices,
+        orientation_faces,
+        orientation_cross,
+        orientation_inverse,
+    ) = _orientation_reference_data(
+        baseline,
+        prepared,
+        observable_basis,
+    )
     ordering = tuple(
         f"observable_flame_{index}" for index in range(rank)
     ) + tuple(NASAL_SEMANTIC_MODE_NAMES)
@@ -3524,6 +3731,10 @@ def prepare_multiview_nasal_objective_context(
         smoothness_neighbors=neighbors,
         smoothness_neighbor_offsets=offsets,
         smoothness_edge_count=edge_count,
+        orientation_face_indices=orientation_indices,
+        orientation_face_vertices=orientation_faces,
+        orientation_reference_cross=orientation_cross,
+        orientation_reference_inverse_squared_norm=orientation_inverse,
         parameter_ordering=ordering,
         parameter_lower_bounds=-upper_bounds,
         parameter_upper_bounds=upper_bounds,
@@ -3799,6 +4010,53 @@ def _soft_minimum_depth(
     )
 
 
+def _orientation_signed_area_ratios(
+    candidate_vertices: np.ndarray,
+    context: MultiviewNasalObjectiveContext,
+) -> np.ndarray:
+    triangles = np.asarray(
+        np.asarray(candidate_vertices)[
+            context.orientation_face_vertices
+        ],
+        dtype=np.float64,
+    )
+    candidate_cross = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    ratios = (
+        np.einsum(
+            "fi,fi->f",
+            candidate_cross,
+            context.orientation_reference_cross,
+            optimize=True,
+        )
+        * context.orientation_reference_inverse_squared_norm
+    )
+    if (
+        ratios.shape != (context.orientation_active_face_count,)
+        or not np.isfinite(ratios).all()
+    ):
+        raise ValueError(
+            "surface orientation signed area ratios are non-finite"
+        )
+    return ratios
+
+
+def _soft_minimum_orientation_ratio(
+    signed_area_ratios: np.ndarray,
+    temperature: float,
+) -> float:
+    values = np.asarray(signed_area_ratios, dtype=np.float64)
+    return float(
+        -float(temperature)
+        * _stable_logsumexp(
+            -values / float(temperature),
+            axis=0,
+        )
+    )
+
+
 @dataclass(frozen=True)
 class _SoftTermEvaluation:
     pixel_xy: np.ndarray
@@ -3823,6 +4081,8 @@ class _ObjectiveCoreEvaluation:
     per_view_confidence_sums: Mapping[str, float]
     symmetry_factors: Mapping[str, float]
     soft_minimum_depths: np.ndarray
+    orientation_signed_area_ratios: np.ndarray
+    orientation_soft_minimum_signed_area_ratio: float
 
 
 def _soft_l1_cost(residuals: np.ndarray, f_scale: float) -> float:
@@ -3896,6 +4156,14 @@ def _evaluate_multiview_nasal_objective_core(
         ).astype(candidate_vertices.dtype, copy=False)
     if not np.isfinite(candidate_vertices).all():
         raise ValueError("candidate vertices are non-finite")
+    orientation_ratios = _orientation_signed_area_ratios(
+        candidate_vertices,
+        context,
+    )
+    orientation_soft_minimum = _soft_minimum_orientation_ratio(
+        orientation_ratios,
+        float(limits.orientation_barrier_softmin_temperature),
+    )
 
     prepared = context.projection_context
     support_indices = context.depth_support_vertex_indices
@@ -4085,6 +4353,35 @@ def _evaluate_multiview_nasal_objective_core(
             * np.sqrt(float(context.smoothness_edge_count))
         )
     )
+    orientation_per_face = (
+        float(limits.orientation_barrier_weight)
+        * _stable_softplus(
+            (
+                float(limits.orientation_barrier_margin)
+                - orientation_ratios
+            )
+            / float(limits.orientation_barrier_scale)
+        )
+        / np.sqrt(float(context.orientation_active_face_count))
+    )
+    orientation_global = (
+        float(limits.orientation_barrier_weight)
+        * _stable_softplus(
+            np.asarray(
+                [
+                    (
+                        float(limits.orientation_barrier_margin)
+                        - orientation_soft_minimum
+                    )
+                    / float(limits.orientation_barrier_scale)
+                ],
+                dtype=np.float64,
+            )
+        )
+    )
+    orientation_barrier = np.concatenate(
+        (orientation_per_face, orientation_global)
+    )
     width_factor = _symmetry_factor(
         reliability["front_subject_left_alar"],
         reliability["front_subject_right_alar"],
@@ -4111,6 +4408,7 @@ def _evaluate_multiview_nasal_objective_core(
             "flame_prior": flame_prior,
             "semantic_prior": semantic_prior,
             "surface_smoothness": smoothness,
+            "surface_orientation_barrier": orientation_barrier,
             "weak_symmetry": symmetry,
         }
     )
@@ -4141,6 +4439,10 @@ def _evaluate_multiview_nasal_objective_core(
         ),
         symmetry_factors=MappingProxyType(symmetry_factors),
         soft_minimum_depths=soft_minimum_depths,
+        orientation_signed_area_ratios=orientation_ratios,
+        orientation_soft_minimum_signed_area_ratio=(
+            orientation_soft_minimum
+        ),
     )
 
 
@@ -4217,6 +4519,11 @@ def evaluate_multiview_nasal_objective(
     }
     total_raw = float(sum(raw_costs.values()))
     total_robust = float(sum(robust_costs.values()))
+    orientation_ratios = core.orientation_signed_area_ratios
+    orientation_quantiles = np.quantile(
+        orientation_ratios,
+        (0.01, 0.05, 0.50, 0.95, 0.99),
+    )
     report_data = {
         "raw_costs": raw_costs,
         "robust_costs": robust_costs,
@@ -4261,6 +4568,52 @@ def evaluate_multiview_nasal_objective(
             limits.semantic_prior_standard_deviations
         ),
         "smoothness_edge_count": context.smoothness_edge_count,
+        "surface_orientation_barrier": {
+            "active_face_count": (
+                context.orientation_active_face_count
+            ),
+            "total_mesh_face_count": len(
+                context.projection_context.faces
+            ),
+            "min_signed_area_ratio": float(
+                np.min(orientation_ratios)
+            ),
+            "max_signed_area_ratio": float(
+                np.max(orientation_ratios)
+            ),
+            "signed_area_ratio_quantiles": {
+                "p01": float(orientation_quantiles[0]),
+                "p05": float(orientation_quantiles[1]),
+                "p50": float(orientation_quantiles[2]),
+                "p95": float(orientation_quantiles[3]),
+                "p99": float(orientation_quantiles[4]),
+            },
+            "soft_min_signed_area_ratio": float(
+                core.orientation_soft_minimum_signed_area_ratio
+            ),
+            "nonpositive_face_count": int(
+                np.count_nonzero(orientation_ratios <= 0.0)
+            ),
+            "faces_below_margin_count": int(
+                np.count_nonzero(
+                    orientation_ratios
+                    < float(limits.orientation_barrier_margin)
+                )
+            ),
+            "per_face_residual_count": (
+                context.orientation_active_face_count
+            ),
+            "global_residual_count": 1,
+            "weight": float(limits.orientation_barrier_weight),
+            "margin": float(limits.orientation_barrier_margin),
+            "scale": float(limits.orientation_barrier_scale),
+            "softmin_temperature": float(
+                limits.orientation_barrier_softmin_temperature
+            ),
+            "baseline_cross_squared_epsilon": (
+                _ORIENTATION_BASELINE_CROSS_SQUARED_EPSILON
+            ),
+        },
         "depth_support_vertex_count": len(
             context.depth_support_vertex_indices
         ),
