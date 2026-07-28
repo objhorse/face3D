@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -179,6 +180,15 @@ def test_model_projection_views_preserve_front_fit_and_rig_chain() -> None:
 
 def _objective(vertices: np.ndarray, faces: np.ndarray) -> SimpleNamespace:
     candidate = SimpleNamespace(vertices=vertices, faces=faces)
+    projection = _Projection(
+        per_term=tuple(
+            _ProjectionTerm(
+                semantic_view=view,
+                pixel_xy=np.array([[20.0, 15.0], [24.0, 20.0]]),
+            )
+            for view in ("front", "subject-left", "subject-right")
+        )
+    )
     return SimpleNamespace(
         total_raw_cost=1.0,
         total_robust_cost=0.8,
@@ -206,9 +216,20 @@ def _objective(vertices: np.ndarray, faces: np.ndarray) -> SimpleNamespace:
         robust_loss="soft_l1",
         robust_f_scale=1.0,
         report_data={"geometry_only": True},
-        projection={"views": ["front", "subject-left", "subject-right"]},
+        projection=projection,
         candidate=candidate,
     )
+
+
+@dataclass(frozen=True)
+class _ProjectionTerm:
+    semantic_view: str
+    pixel_xy: np.ndarray
+
+
+@dataclass(frozen=True)
+class _Projection:
+    per_term: tuple[_ProjectionTerm, ...]
 
 
 def _computed(success: bool) -> runner.ComputedCandidate:
@@ -335,6 +356,64 @@ def _patch_lightweight_pipeline(
         "_compute_candidate",
         lambda _source, _observations: computed,
     )
+    monkeypatch.setattr(
+        runner,
+        "_load_observation_work_images",
+        lambda *_args: {
+            view: np.full((40, 60, 3), 32, dtype=np.uint8)
+            for view in ("front", "subject-left", "subject-right")
+        },
+    )
+
+
+def _fake_export_candidate(**kwargs):
+    target = Path(kwargs["output"])
+    meshes = target / "meshes"
+    textures = target / "textures"
+    meshes.mkdir(parents=True)
+    textures.mkdir(parents=True)
+    obj = meshes / "face_mesh.obj"
+    raw = meshes / "face_mesh.glb"
+    textured = meshes / "face_same_texture.glb"
+    texture = textures / "albedo_baseline_locked.png"
+    obj.write_text("fixture", encoding="ascii")
+    raw.write_bytes(b"raw-glb")
+    textured.write_bytes(b"textured-glb")
+    texture.write_bytes(b"texture")
+    return {
+        "candidate_obj": obj,
+        "candidate_geometry_glb": raw,
+        "candidate_textured_glb": textured,
+        "baseline_locked_texture": texture,
+        "baseline_locked_texture_sha256": "fixture",
+        "texture_matches_source": True,
+        "subdivided_vertex_count": 3,
+        "subdivided_face_count": 1,
+        "glb_validation": {
+            "path": str(textured),
+            "embedded_image_count": 1,
+        },
+    }
+
+
+def _fake_write_viewer(**kwargs):
+    target = Path(kwargs["output"])
+    target.write_text(
+        "embedded baseline candidate front left right",
+        encoding="utf-8",
+    )
+    return target
+
+
+def _assert_no_candidate_outputs(output: Path) -> None:
+    assert not (output / "meshes").exists()
+    assert not (output / "textures").exists()
+    assert not (output / "nasal_shape_compare.html").exists()
+    assert not (output / "debug" / "nasal_geometry").exists()
+    assert not any(
+        path.name.startswith(".nasal-shape-staging-")
+        for path in output.iterdir()
+    )
 
 
 def test_runner_happy_path_writes_outputs_and_preserves_source(
@@ -345,37 +424,6 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
     before = runner.file_tree_hashes(source)
     computed = _computed(success=True)
     _patch_lightweight_pipeline(monkeypatch, computed)
-
-    def export_candidate(**kwargs):
-        target = Path(kwargs["output"])
-        meshes = target / "meshes"
-        textures = target / "textures"
-        meshes.mkdir(parents=True)
-        textures.mkdir(parents=True)
-        obj = meshes / "face_mesh.obj"
-        raw = meshes / "face_mesh.glb"
-        textured = meshes / "face_same_texture.glb"
-        texture = textures / "albedo_baseline_locked.png"
-        obj.write_text("fixture", encoding="ascii")
-        raw.write_bytes(b"raw-glb")
-        textured.write_bytes(b"textured-glb")
-        texture.write_bytes(b"texture")
-        return {
-            "candidate_obj": obj,
-            "candidate_geometry_glb": raw,
-            "candidate_textured_glb": textured,
-            "baseline_locked_texture": texture,
-            "baseline_locked_texture_sha256": "fixture",
-            "texture_matches_source": True,
-            "subdivided_vertex_count": 3,
-            "subdivided_face_count": 1,
-            "glb_validation": {"embedded_image_count": 1},
-        }
-
-    def write_viewer(**kwargs):
-        target = Path(kwargs["output"])
-        target.write_text("embedded baseline candidate front left right", encoding="utf-8")
-        return target
 
     def render(**kwargs):
         target = Path(kwargs["output_dir"])
@@ -388,8 +436,8 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
                 result[role][view] = path
         return result
 
-    monkeypatch.setattr(runner, "_export_candidate", export_candidate)
-    monkeypatch.setattr(runner, "_write_viewer", write_viewer)
+    monkeypatch.setattr(runner, "_export_candidate", _fake_export_candidate)
+    monkeypatch.setattr(runner, "_write_viewer", _fake_write_viewer)
     monkeypatch.setattr(runner, "render_nasal_geometry_screenshots", render)
 
     report_path = runner.run_multiview_nasal_shape_experiment(
@@ -412,6 +460,10 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
     assert (output / "meshes" / "face_same_texture.glb").is_file()
     assert (output / "nasal_shape_compare.html").is_file()
     assert (output / "debug" / "nasal_geometry" / "index.html").is_file()
+    assert not any(
+        path.name.startswith(".nasal-shape-staging-")
+        for path in output.iterdir()
+    )
     assert runner.file_tree_hashes(source) == before
 
 
@@ -442,4 +494,78 @@ def test_runner_optimizer_failure_reports_before_any_export(
     assert report["status"] == "failed_optimization"
     assert report["fit"]["optimizer"]["failure_reason"] == "solver_failed"
     assert not (output / "meshes" / "face_same_texture.glb").exists()
+    assert runner.file_tree_hashes(source) == before
+
+
+def test_runner_export_failure_cleans_staging_and_candidate_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures, source, output, rig = _inputs(tmp_path)
+    before = runner.file_tree_hashes(source)
+    _patch_lightweight_pipeline(monkeypatch, _computed(success=True))
+
+    def failing_export(**kwargs):
+        partial = Path(kwargs["output"]) / "meshes" / "face_mesh.obj"
+        partial.parent.mkdir(parents=True)
+        partial.write_text("partial", encoding="ascii")
+        raise RuntimeError("synthetic export failure")
+
+    monkeypatch.setattr(runner, "_export_candidate", failing_export)
+
+    with pytest.raises(RuntimeError, match="synthetic export failure"):
+        runner.run_multiview_nasal_shape_experiment(
+            captures,
+            source,
+            output,
+            rig_calibration=rig,
+        )
+
+    report = json.loads(
+        (output / "nasal_fit_report.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "failed"
+    assert (output / "nasal_observations.json").is_file()
+    assert "candidate_same_texture_glb" not in report["paths"]
+    _assert_no_candidate_outputs(output)
+    assert runner.file_tree_hashes(source) == before
+
+
+def test_runner_render_failure_cleans_staging_and_candidate_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures, source, output, rig = _inputs(tmp_path)
+    before = runner.file_tree_hashes(source)
+    _patch_lightweight_pipeline(monkeypatch, _computed(success=True))
+    monkeypatch.setattr(runner, "_export_candidate", _fake_export_candidate)
+    monkeypatch.setattr(runner, "_write_viewer", _fake_write_viewer)
+
+    def failing_render(**kwargs):
+        partial = Path(kwargs["output_dir"]) / "baseline_front.png"
+        partial.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), (20, 30, 40)).save(partial)
+        raise RuntimeError("synthetic render failure")
+
+    monkeypatch.setattr(
+        runner,
+        "render_nasal_geometry_screenshots",
+        failing_render,
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic render failure"):
+        runner.run_multiview_nasal_shape_experiment(
+            captures,
+            source,
+            output,
+            rig_calibration=rig,
+        )
+
+    report = json.loads(
+        (output / "nasal_fit_report.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "failed_rendering"
+    assert (output / "nasal_observations.json").is_file()
+    assert "candidate_same_texture_glb" not in report["paths"]
+    _assert_no_candidate_outputs(output)
     assert runner.file_tree_hashes(source) == before

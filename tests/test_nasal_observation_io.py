@@ -47,6 +47,36 @@ def _observation(semantic_view: str, camera: Camera) -> NasalViewObservation:
         work_size=work_size,
         pixel_frame="undistorted",
     )
+    coordinate_metadata = coordinates.metadata()
+    coordinate_metadata.update(
+        {
+            "mask_pixel_layout": "original",
+            "distance_field": "unsigned_truncated_precise_euclidean_work_px",
+            "aggregate_distance_field_usage": "display_only",
+            "mask_canvas_shape_hw": [8, 12],
+            "color_space": "RGB",
+        }
+    )
+    if semantic_view != "front":
+        coordinate_metadata.update(
+            {
+                "epipolar_lines_work": [[1.0, 0.0, -2.0]] * 3,
+                "epipolar_anchor_names": [
+                    "upper_tip",
+                    "tip_apex",
+                    "lower_tip",
+                ],
+                "max_epipolar_distance_px": 4.0,
+                "candidate_count": 1,
+                "selected_anchor_epipolar_errors_px": [0.1, 0.2, 0.1],
+                "selected_anchor_prior_errors_px": [0.2, 0.1, 0.2],
+                "side_prior_roi_work": [0.0, 0.0, 6.0, 4.0],
+                "effective_profile_roi_work": [0.0, 0.0, 6.0, 4.0],
+                "max_side_prior_distance_px": 8.0,
+                "selection_score": 0.25,
+                "used_side_prior": True,
+            }
+        )
     camera_metadata = {
         "camera_name": camera.name,
         "camera_view": camera.view,
@@ -73,7 +103,7 @@ def _observation(semantic_view: str, camera: Camera) -> NasalViewObservation:
         variant_boundaries={"base": boundary},
         anchors_work={"tip": np.array([2.0, 1.5])},
         camera_metadata=camera_metadata,
-        coordinate_metadata=coordinates.metadata(),
+        coordinate_metadata=coordinate_metadata,
     )
 
 
@@ -138,6 +168,48 @@ def test_loader_rejects_invalid_camera_intrinsics(tmp_path: Path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="focal lengths"):
+        load_nasal_observation_bundle(path)
+
+
+@pytest.mark.parametrize(
+    "container_path",
+    [
+        (),
+        ("views", "front"),
+        ("views", "front", "camera"),
+        ("views", "front", "coordinate_metadata"),
+        ("views", "front", "fields"),
+    ],
+)
+def test_loader_rejects_unexpected_schema_keys(
+    tmp_path: Path,
+    container_path: tuple[str, ...],
+) -> None:
+    path = _write_bundle(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    container = payload
+    for name in container_path:
+        container = container[name]
+    container["unexpected_payload"] = "forbidden"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unexpected_payload"):
+        load_nasal_observation_bundle(path)
+
+
+@pytest.mark.parametrize("illegal_value", [float("nan"), float("inf")])
+def test_loader_rejects_nonfinite_nested_metadata(
+    tmp_path: Path,
+    illegal_value: float,
+) -> None:
+    path = _write_bundle(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["metadata"]["untrusted"] = {
+        "nested": [1.0, {"illegal": illegal_value}]
+    }
+    path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-finite"):
         load_nasal_observation_bundle(path)
 
 

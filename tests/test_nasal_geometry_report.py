@@ -6,8 +6,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import src.reports.nasal_geometry_report as geometry_report
 from src.reports.nasal_geometry_report import (
     validate_minimal_nasal_candidate,
+    write_nasal_evidence_overlays,
     write_nasal_geometry_report,
 )
 
@@ -94,6 +96,82 @@ def test_minimal_validity_detects_relative_face_flip() -> None:
     assert "new_face_flips" in report["issues"]
 
 
+@pytest.mark.parametrize(
+    ("override_name", "override_value"),
+    [
+        ("candidate_vertices", "not-an-array"),
+        ("candidate_vertices", np.zeros((2, 2))),
+        ("candidate_faces", np.array([[0, 1, 99]], dtype=np.int64)),
+        ("candidate_faces", np.array([0, 1, 2], dtype=np.int64)),
+    ],
+)
+def test_minimal_validity_returns_failure_for_malformed_mesh_inputs(
+    override_name: str,
+    override_value,
+) -> None:
+    vertices, _faces, _uv, _uv_faces = _triangle()
+
+    report = _validity(vertices, **{override_name: override_value})
+
+    assert not report["passed"]
+    assert report["issues"]
+
+
+def test_geometry_renderer_replaces_source_material() -> None:
+    source_mesh = type("SourceMesh", (), {"visual": object()})()
+
+    class Graph:
+        nodes_geometry = ("face",)
+
+        def __getitem__(self, _name):
+            return np.eye(4), "face_geometry"
+
+    source_scene = type(
+        "SourceScene",
+        (),
+        {"graph": Graph(), "geometry": {"face_geometry": source_mesh}},
+    )()
+    calls = []
+
+    class FakeScene:
+        def __init__(self, **_kwargs):
+            self.nodes = []
+
+        def add(self, mesh, pose):
+            self.nodes.append((mesh, pose))
+
+    class FakeMaterial:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeMesh:
+        @staticmethod
+        def from_trimesh(mesh, **kwargs):
+            calls.append((mesh, kwargs))
+            return "uniform-mesh"
+
+    fake_pyrender = type(
+        "FakePyrender",
+        (),
+        {
+            "Scene": FakeScene,
+            "MetallicRoughnessMaterial": FakeMaterial,
+            "Mesh": FakeMesh,
+        },
+    )
+
+    rendered = geometry_report._uniform_geometry_scene(
+        source_scene,
+        fake_pyrender,
+    )
+
+    assert len(rendered.nodes) == 1
+    assert calls[0][0] is source_mesh
+    assert isinstance(calls[0][1]["material"], FakeMaterial)
+    assert calls[0][1]["material"] is not source_mesh.visual
+    assert calls[0][1]["smooth"] is True
+
+
 def test_geometry_report_writes_six_images_and_offline_html(
     tmp_path: Path,
 ) -> None:
@@ -103,6 +181,25 @@ def test_geometry_report_writes_six_images_and_offline_html(
             path = tmp_path / f"{role}_{view}.png"
             Image.new("RGB", (8, 8), (40, 50, 60)).save(path)
             screenshots[role][view] = path
+    evidence_overlays = write_nasal_evidence_overlays(
+        tmp_path,
+        work_images_by_view={
+            view: np.full((40, 60, 3), 30, dtype=np.uint8)
+            for view in ("front", "subject-left", "subject-right")
+        },
+        observation_curves_by_view={
+            view: {"target": np.array([[10.0, 10.0], [20.0, 20.0]])}
+            for view in ("front", "subject-left", "subject-right")
+        },
+        baseline_projection_by_view={
+            view: np.array([[12.0, 10.0], [18.0, 18.0]])
+            for view in ("front", "subject-left", "subject-right")
+        },
+        candidate_projection_by_view={
+            view: np.array([[13.0, 10.0], [19.0, 18.0]])
+            for view in ("front", "subject-left", "subject-right")
+        },
+    )
     objective = {
         "raw_costs": {"front": 2.0},
         "robust_costs": {"front": 1.5},
@@ -123,6 +220,7 @@ def test_geometry_report_writes_six_images_and_offline_html(
         tmp_path,
         dataset_label="captures_fixture",
         screenshots=screenshots,
+        evidence_overlays=evidence_overlays,
         baseline_objective=objective,
         candidate_objective=objective,
         evidence={
@@ -138,9 +236,15 @@ def test_geometry_report_writes_six_images_and_offline_html(
     text = report.read_text(encoding="utf-8")
     assert "captures_fixture" in text
     assert "Low-confidence evidence: subject-left" in text
-    assert "Texture scoring is not part" in text
+    assert "texture scoring is not part" in text
+    assert "Uniform-material geometry renders" in text
+    assert "Original-image projection evidence" in text
+    assert "Observation" in text
+    assert "Baseline projection" in text
+    assert "Candidate projection" in text
     assert "baseline_front.png" in text
     assert "candidate_subject-right.png" in text
+    assert "evidence_subject-left.png" in text
 
 
 def test_geometry_report_rejects_missing_screenshot(tmp_path: Path) -> None:
@@ -151,11 +255,16 @@ def test_geometry_report_rejects_missing_screenshot(tmp_path: Path) -> None:
         }
         for role in ("baseline", "candidate")
     }
-    with pytest.raises(FileNotFoundError, match="screenshot"):
+    evidence_overlays = {
+        view: tmp_path / f"evidence_{view}.png"
+        for view in ("front", "subject-left", "subject-right")
+    }
+    with pytest.raises(FileNotFoundError, match="evidence image"):
         write_nasal_geometry_report(
             tmp_path,
             dataset_label="fixture",
             screenshots=screenshots,
+            evidence_overlays=evidence_overlays,
             baseline_objective={},
             candidate_objective={},
             evidence={},

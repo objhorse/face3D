@@ -8,6 +8,7 @@ import hashlib
 import json
 import shutil
 import struct
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -27,14 +28,19 @@ from run_nasal_observation_audit import (
     validate_separate_output,
 )
 from src.geometry.nasal_observations import NASAL_VIEWS, NasalObservationBundle
-from src.geometry.observation_coordinates import ObservationCoordinates
+from src.geometry.observation_coordinates import (
+    ObservationCoordinates,
+    normalize_image_to_work,
+)
 from src.geometry.observable_flame_subspace import ProjectionView
 from src.reports.nasal_geometry_report import (
     render_nasal_geometry_screenshots,
     validate_minimal_nasal_candidate,
+    write_nasal_evidence_overlays,
     write_nasal_geometry_report,
 )
 from src.reports.nasal_observation_io import load_nasal_observation_bundle
+from src.reports.nasal_observation_report import read_image_file
 
 
 @dataclass(frozen=True)
@@ -682,6 +688,81 @@ def _baseline_textured_glb(source_output: Path) -> Path:
     return path
 
 
+def _projection_points_by_view(objective: Any) -> dict[str, np.ndarray]:
+    grouped: dict[str, list[np.ndarray]] = {view: [] for view in NASAL_VIEWS}
+    projection = getattr(objective, "projection", None)
+    for term in getattr(projection, "per_term", ()):
+        semantic_view = str(getattr(term, "semantic_view", ""))
+        if semantic_view not in grouped:
+            raise ValueError(f"objective projection has unknown view: {semantic_view}")
+        points = np.asarray(getattr(term, "pixel_xy", None), dtype=np.float64)
+        if points.ndim != 2 or points.shape[1:] != (2,) or not np.isfinite(points).all():
+            raise ValueError(
+                f"objective projection for {semantic_view} must be finite (N, 2)"
+            )
+        grouped[semantic_view].append(points)
+    missing = [view for view, parts in grouped.items() if not parts]
+    if missing:
+        raise ValueError(
+            "objective projection is missing semantic views: " + ", ".join(missing)
+        )
+    return {
+        view: np.concatenate(parts, axis=0)
+        for view, parts in grouped.items()
+    }
+
+
+def _load_observation_work_images(
+    metadata_path: Path,
+    observations: NasalObservationBundle,
+    rig_calibration: Path,
+) -> dict[str, np.ndarray]:
+    import cv2
+
+    from src import config as cfg
+    from src.module0_intrinsics import undistort_images_with_calibration
+
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    capture_images = payload["metadata"]["paths"]["capture_images"]
+    raw_images = {}
+    for camera_view in ("left", "front", "right"):
+        image_bgr = read_image_file(
+            capture_images[camera_view],
+            cv2.IMREAD_COLOR,
+            description=f"{camera_view} capture image",
+        )
+        raw_images[camera_view] = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    undistorted, new_intrinsics = undistort_images_with_calibration(
+        raw_images,
+        calibration_path=rig_calibration,
+        alpha=float(cfg.UNDISTORT_ALPHA),
+    )
+    if new_intrinsics is None:
+        raise RuntimeError("rig calibration did not produce undistorted intrinsics")
+    camera_view_by_semantic = {
+        "front": "front",
+        "subject-left": "left",
+        "subject-right": "right",
+    }
+    result = {}
+    for semantic_view, camera_view in camera_view_by_semantic.items():
+        observation = observations.by_view[semantic_view]
+        expected_K = np.asarray(
+            observation.coordinate_metadata["intrinsics"],
+            dtype=np.float64,
+        )
+        actual_K = np.asarray(new_intrinsics[camera_view], dtype=np.float64)
+        if not np.allclose(actual_K, expected_K, atol=1e-6, rtol=0.0):
+            raise RuntimeError(
+                f"{semantic_view} undistorted intrinsics disagree with observations"
+            )
+        result[semantic_view] = normalize_image_to_work(
+            undistorted[camera_view],
+            _coordinates_for_observation(observation),
+        )
+    return result
+
+
 def _write_viewer(
     *,
     template: Path,
@@ -723,8 +804,10 @@ def _write_viewer(
 
 def _ensure_no_candidate_collision(output: Path) -> None:
     collisions = (
-        output / "meshes" / "face_same_texture.glb",
+        output / "meshes",
+        output / "textures",
         output / "nasal_shape_compare.html",
+        output / "debug" / "nasal_geometry",
     )
     existing = [str(path) for path in collisions if path.exists()]
     if existing:
@@ -732,6 +815,81 @@ def _ensure_no_candidate_collision(output: Path) -> None:
             "refusing to overwrite existing candidate artifacts: "
             + ", ".join(existing)
         )
+
+
+def _create_staging(output: Path) -> Path:
+    return Path(
+        tempfile.mkdtemp(
+            prefix=".nasal-shape-staging-",
+            dir=output,
+        )
+    )
+
+
+def _published_path(path: Path, staging: Path, output: Path) -> Path:
+    return output / path.resolve().relative_to(staging.resolve())
+
+
+def _remap_staging_paths(value: Any, staging: Path, output: Path) -> Any:
+    if isinstance(value, Path):
+        try:
+            return _published_path(value, staging, output)
+        except ValueError:
+            return value
+    if isinstance(value, str):
+        try:
+            candidate = Path(value)
+            return str(_published_path(candidate, staging, output))
+        except (OSError, ValueError):
+            return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _remap_staging_paths(item, staging, output)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _remap_staging_paths(item, staging, output)
+            for item in value
+        ]
+    return value
+
+
+def _publish_staging(staging: Path, output: Path) -> None:
+    publications = (
+        (staging / "meshes", output / "meshes"),
+        (staging / "textures", output / "textures"),
+        (
+            staging / "nasal_shape_compare.html",
+            output / "nasal_shape_compare.html",
+        ),
+        (
+            staging / "debug" / "nasal_geometry",
+            output / "debug" / "nasal_geometry",
+        ),
+        (
+            staging / "nasal_fit_report.json",
+            output / "nasal_fit_report.json",
+        ),
+    )
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source, destination in publications:
+            if not source.exists():
+                raise FileNotFoundError(f"staged artifact is missing: {source}")
+            if destination.exists():
+                raise FileExistsError(
+                    f"refusing to overwrite candidate artifact: {destination}"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(destination)
+            moved.append((source, destination))
+    except Exception:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                destination.replace(source)
+        raise
 
 
 def run_multiview_nasal_shape_experiment(
@@ -784,6 +942,7 @@ def run_multiview_nasal_shape_experiment(
         "profile_shape_v2_reference": _profile_shape_reference(source),
     }
     target.mkdir(parents=True, exist_ok=True)
+    staging: Path | None = None
     try:
         report["status"] = "building_observations"
         _run_nasal_observation_audit(
@@ -835,9 +994,10 @@ def run_multiview_nasal_shape_experiment(
             )
 
         report["status"] = "exporting"
+        staging = _create_staging(target)
         artifacts = _export_candidate(
             source_output=source,
-            output=target,
+            output=staging,
             baseline=baseline,
             candidate_vertices=candidate_vertices,
         )
@@ -851,7 +1011,7 @@ def run_multiview_nasal_shape_experiment(
             template=template,
             baseline_glb=baseline_glb,
             candidate_glb=Path(artifacts["candidate_textured_glb"]),
-            output=target / "nasal_shape_compare.html",
+            output=staging / "nasal_shape_compare.html",
             dataset_label=dataset_label,
         )
 
@@ -859,13 +1019,33 @@ def run_multiview_nasal_shape_experiment(
         screenshots = render_nasal_geometry_screenshots(
             baseline_glb=baseline_glb,
             candidate_glb=artifacts["candidate_textured_glb"],
-            output_dir=target / "debug" / "nasal_geometry",
+            output_dir=staging / "debug" / "nasal_geometry",
+        )
+        work_images = _load_observation_work_images(
+            target / "nasal_observations.json",
+            observations,
+            rig,
+        )
+        evidence_overlays = write_nasal_evidence_overlays(
+            staging / "debug" / "nasal_geometry",
+            work_images_by_view=work_images,
+            observation_curves_by_view={
+                view: observations.by_view[view].boundaries_work
+                for view in NASAL_VIEWS
+            },
+            baseline_projection_by_view=_projection_points_by_view(
+                computed.baseline_objective
+            ),
+            candidate_projection_by_view=_projection_points_by_view(
+                result.final_objective
+            ),
         )
         final_objective = _objective_summary(result.final_objective)
         geometry_report = write_nasal_geometry_report(
-            target / "debug" / "nasal_geometry",
+            staging / "debug" / "nasal_geometry",
             dataset_label=dataset_label,
             screenshots=screenshots,
+            evidence_overlays=evidence_overlays,
             baseline_objective=_objective_summary(
                 computed.baseline_objective
             )
@@ -874,21 +1054,42 @@ def run_multiview_nasal_shape_experiment(
             evidence=final_objective or {},
             validity=validity,
         )
-        report["paths"].update(
+        success_report = _jsonable(report)
+        success_report["paths"].update(
             {
                 "candidate_same_texture_glb": str(
-                    artifacts["candidate_textured_glb"]
+                    _published_path(
+                        Path(artifacts["candidate_textured_glb"]),
+                        staging,
+                        target,
+                    )
                 ),
                 "baseline_same_texture_glb": str(baseline_glb),
-                "viewer": str(viewer),
-                "geometry_report": str(geometry_report),
-                "screenshots": _jsonable(screenshots),
+                "viewer": str(_published_path(viewer, staging, target)),
+                "geometry_report": str(
+                    _published_path(geometry_report, staging, target)
+                ),
+                "screenshots": _jsonable(
+                    _remap_staging_paths(screenshots, staging, target)
+                ),
+                "evidence_overlays": _jsonable(
+                    _remap_staging_paths(
+                        evidence_overlays,
+                        staging,
+                        target,
+                    )
+                ),
             }
         )
-        report["artifacts"] = _jsonable(artifacts)
-        report["status"] = "success"
-        _write_report(report_path, report)
+        success_report["artifacts"] = _jsonable(
+            _remap_staging_paths(artifacts, staging, target)
+        )
+        success_report["status"] = "success"
+        _write_report(staging / "nasal_fit_report.json", success_report)
+        _publish_staging(staging, target)
     except Exception as exc:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging)
         if not str(report.get("status", "")).startswith("failed_"):
             report["status"] = (
                 "failed_rendering"
@@ -902,6 +1103,8 @@ def run_multiview_nasal_shape_experiment(
         _write_report(report_path, report)
         raise
     finally:
+        if staging is not None and staging.exists():
+            shutil.rmtree(staging)
         assert_file_tree_unchanged(source, source_hashes)
     return report_path
 

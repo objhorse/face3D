@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -31,6 +31,83 @@ def _face_vectors(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     )
 
 
+def _array_or_empty(
+    value: Any,
+    *,
+    dtype: Any | None,
+    empty_shape: tuple[int, ...],
+) -> tuple[np.ndarray, bool]:
+    try:
+        result = np.asarray(value, dtype=dtype)
+    except (TypeError, ValueError, OverflowError):
+        return np.empty(empty_shape, dtype=dtype or np.float64), False
+    return result, True
+
+
+def _mesh_input_is_safe(vertices: np.ndarray, faces: np.ndarray) -> bool:
+    return bool(
+        vertices.ndim == 2
+        and vertices.shape[1:] == (3,)
+        and np.isfinite(vertices).all()
+        and faces.ndim == 2
+        and faces.shape[1:] == (3,)
+        and np.issubdtype(faces.dtype, np.integer)
+        and (
+            faces.size == 0
+            or (
+                int(faces.min()) >= 0
+                and int(faces.max()) < len(vertices)
+            )
+        )
+    )
+
+
+def _invalid_mesh_quality(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    valid_indices = bool(
+        faces.ndim == 2
+        and faces.shape[1:] == (3,)
+        and np.issubdtype(faces.dtype, np.integer)
+        and (
+            faces.size == 0
+            or (
+                vertices.ndim == 2
+                and vertices.shape[1:] == (3,)
+                and int(faces.min()) >= 0
+                and int(faces.max()) < len(vertices)
+            )
+        )
+    )
+    face_count = int(len(faces)) if faces.ndim >= 1 else 0
+    return {
+        "label": label,
+        "vertex_count": int(len(vertices)) if vertices.ndim >= 1 else 0,
+        "face_count": face_count,
+        "finite_vertices": bool(
+            vertices.ndim == 2
+            and vertices.shape[1:] == (3,)
+            and np.isfinite(vertices).all()
+        ),
+        "finite_faces": bool(
+            faces.ndim == 2
+            and faces.shape[1:] == (3,)
+            and np.issubdtype(faces.dtype, np.integer)
+        ),
+        "valid_face_indices": valid_indices,
+        "degenerate_faces": face_count,
+        "tiny_faces": face_count,
+        "extreme_aspect_faces": face_count,
+        "boundary_edges": None,
+        "nonmanifold_edges": None,
+        "component_count": None,
+        "watertight": False,
+    }
+
+
 def validate_minimal_nasal_candidate(
     *,
     parameters: Any,
@@ -46,26 +123,62 @@ def validate_minimal_nasal_candidate(
     flip_dot_tolerance: float = -1e-8,
 ) -> dict[str, Any]:
     """Return the Batch D validity gate without anatomical or fit thresholds."""
-    baseline = np.asarray(baseline_vertices, dtype=np.float64)
-    candidate = np.asarray(candidate_vertices, dtype=np.float64)
-    faces = np.asarray(baseline_faces)
-    candidate_face_values = np.asarray(candidate_faces)
-    baseline_uv = np.asarray(baseline_uv_vertices)
-    candidate_uv = np.asarray(candidate_uv_vertices)
-    uv_faces = np.asarray(baseline_uv_faces)
-    candidate_uv_face_values = np.asarray(candidate_uv_faces)
-    try:
-        coefficient_values = np.asarray(parameters, dtype=np.float64)
-    except (TypeError, ValueError):
-        coefficient_values = np.array([np.nan], dtype=np.float64)
+    baseline, baseline_converted = _array_or_empty(
+        baseline_vertices,
+        dtype=np.float64,
+        empty_shape=(0, 3),
+    )
+    candidate, candidate_converted = _array_or_empty(
+        candidate_vertices,
+        dtype=np.float64,
+        empty_shape=(0, 3),
+    )
+    faces, faces_converted = _array_or_empty(
+        baseline_faces,
+        dtype=None,
+        empty_shape=(0, 3),
+    )
+    candidate_face_values, candidate_faces_converted = _array_or_empty(
+        candidate_faces,
+        dtype=None,
+        empty_shape=(0, 3),
+    )
+    baseline_uv, baseline_uv_converted = _array_or_empty(
+        baseline_uv_vertices,
+        dtype=np.float64,
+        empty_shape=(0, 2),
+    )
+    candidate_uv, candidate_uv_converted = _array_or_empty(
+        candidate_uv_vertices,
+        dtype=np.float64,
+        empty_shape=(0, 2),
+    )
+    uv_faces, uv_faces_converted = _array_or_empty(
+        baseline_uv_faces,
+        dtype=None,
+        empty_shape=(0, 3),
+    )
+    candidate_uv_face_values, candidate_uv_faces_converted = _array_or_empty(
+        candidate_uv_faces,
+        dtype=None,
+        empty_shape=(0, 3),
+    )
+    coefficient_values, parameters_converted = _array_or_empty(
+        parameters,
+        dtype=np.float64,
+        empty_shape=(0,),
+    )
 
     issues: list[str] = []
     finite_parameters = bool(
-        coefficient_values.ndim == 1
+        parameters_converted
+        and coefficient_values.ndim == 1
         and np.isfinite(coefficient_values).all()
     )
     finite_vertices = bool(
-        baseline.ndim == 2
+        baseline_converted
+        and candidate_converted
+        and baseline.ndim == 2
         and baseline.shape[1:] == (3,)
         and candidate.shape == baseline.shape
         and np.isfinite(baseline).all()
@@ -77,20 +190,32 @@ def validate_minimal_nasal_candidate(
         issues.append("vertices_are_nonfinite_or_have_changed_count")
 
     same_faces = bool(
-        faces.ndim == 2
+        faces_converted
+        and candidate_faces_converted
+        and faces.ndim == 2
         and faces.shape[1:] == (3,)
+        and np.issubdtype(faces.dtype, np.integer)
+        and np.issubdtype(candidate_face_values.dtype, np.integer)
         and candidate_face_values.shape == faces.shape
         and np.array_equal(candidate_face_values, faces)
     )
     same_uv_vertices = bool(
-        baseline_uv.ndim == 2
+        baseline_uv_converted
+        and candidate_uv_converted
+        and baseline_uv.ndim == 2
         and baseline_uv.shape[1:] == (2,)
         and candidate_uv.shape == baseline_uv.shape
+        and np.isfinite(baseline_uv).all()
+        and np.isfinite(candidate_uv).all()
         and np.array_equal(candidate_uv, baseline_uv)
     )
     same_uv_faces = bool(
-        uv_faces.ndim == 2
+        uv_faces_converted
+        and candidate_uv_faces_converted
+        and uv_faces.ndim == 2
         and uv_faces.shape[1:] == (3,)
+        and np.issubdtype(uv_faces.dtype, np.integer)
+        and np.issubdtype(candidate_uv_face_values.dtype, np.integer)
         and candidate_uv_face_values.shape == uv_faces.shape
         and np.array_equal(candidate_uv_face_values, uv_faces)
     )
@@ -106,17 +231,34 @@ def validate_minimal_nasal_candidate(
         max_new_nonmanifold_edges=0,
         max_new_boundary_edges=0,
     )
-    quality_baseline = compute_mesh_quality(
-        baseline,
-        faces,
-        label="baseline",
-        thresholds=thresholds,
-    )
-    quality_candidate = compute_mesh_quality(
+    baseline_mesh_safe = _mesh_input_is_safe(baseline, faces)
+    candidate_mesh_safe = _mesh_input_is_safe(
         candidate,
         candidate_face_values,
-        label="candidate",
-        thresholds=thresholds,
+    )
+    quality_baseline = (
+        compute_mesh_quality(
+            baseline,
+            faces,
+            label="baseline",
+            thresholds=thresholds,
+        )
+        if baseline_mesh_safe
+        else _invalid_mesh_quality(baseline, faces, label="baseline")
+    )
+    quality_candidate = (
+        compute_mesh_quality(
+            candidate,
+            candidate_face_values,
+            label="candidate",
+            thresholds=thresholds,
+        )
+        if candidate_mesh_safe
+        else _invalid_mesh_quality(
+            candidate,
+            candidate_face_values,
+            label="candidate",
+        )
     )
     quality_comparison = compare_mesh_quality(
         quality_baseline,
@@ -130,7 +272,7 @@ def validate_minimal_nasal_candidate(
 
     flip_indices: list[int] = []
     comparable_face_count = 0
-    if finite_vertices and same_faces:
+    if finite_vertices and same_faces and baseline_mesh_safe:
         baseline_vectors = _face_vectors(baseline, faces.astype(np.int64))
         candidate_vectors = _face_vectors(candidate, faces.astype(np.int64))
         baseline_lengths = np.linalg.norm(baseline_vectors, axis=1)
@@ -163,7 +305,12 @@ def validate_minimal_nasal_candidate(
         "checks": {
             "finite_parameters": finite_parameters,
             "finite_vertices": finite_vertices,
-            "same_vertex_count": bool(candidate.shape == baseline.shape),
+            "same_vertex_count": bool(
+                baseline_converted
+                and candidate_converted
+                and baseline.ndim == 2
+                and candidate.shape == baseline.shape
+            ),
             "same_faces": same_faces,
             "same_uv_vertices": same_uv_vertices,
             "same_uv_faces": same_uv_faces,
@@ -186,6 +333,30 @@ def validate_minimal_nasal_candidate(
     }
 
 
+def _uniform_geometry_scene(trimesh_scene: Any, pyrender: Any) -> Any:
+    material = pyrender.MetallicRoughnessMaterial(
+        baseColorFactor=[0.72, 0.76, 0.80, 1.0],
+        metallicFactor=0.0,
+        roughnessFactor=0.85,
+    )
+    scene = pyrender.Scene(
+        bg_color=np.array([15, 20, 27, 255]),
+        ambient_light=np.array([0.55, 0.55, 0.55]),
+    )
+    for node_name in trimesh_scene.graph.nodes_geometry:
+        transform, geometry_name = trimesh_scene.graph[node_name]
+        mesh = trimesh_scene.geometry[geometry_name]
+        scene.add(
+            pyrender.Mesh.from_trimesh(
+                mesh,
+                material=material,
+                smooth=True,
+            ),
+            pose=np.asarray(transform, dtype=np.float64),
+        )
+    return scene
+
+
 def _render_glb(source: Path, output: Path, yaw_degrees: float) -> None:
     import pyrender
     import trimesh
@@ -194,11 +365,7 @@ def _render_glb(source: Path, output: Path, yaw_degrees: float) -> None:
     trimesh_scene = trimesh.load(source, force="scene")
     if not trimesh_scene.geometry:
         raise ValueError(f"GLB contains no geometry: {source}")
-    scene = pyrender.Scene.from_trimesh_scene(
-        trimesh_scene,
-        bg_color=np.array([15, 20, 27, 255]),
-        ambient_light=np.array([0.55, 0.55, 0.55]),
-    )
+    scene = _uniform_geometry_scene(trimesh_scene, pyrender)
     bounds = np.asarray(trimesh_scene.bounds, dtype=np.float64)
     if bounds.shape != (2, 3) or not np.isfinite(bounds).all():
         raise ValueError(f"GLB bounds are invalid: {source}")
@@ -257,6 +424,62 @@ def render_nasal_geometry_screenshots(
     return result
 
 
+def write_nasal_evidence_overlays(
+    output_dir: str | Path,
+    *,
+    work_images_by_view: Mapping[str, Any],
+    observation_curves_by_view: Mapping[str, Mapping[str, Any]],
+    baseline_projection_by_view: Mapping[str, Any],
+    candidate_projection_by_view: Mapping[str, Any],
+) -> dict[str, Path]:
+    """Overlay observed and projected geometry on the three work-frame images."""
+    from PIL import Image, ImageDraw
+
+    target = Path(output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    result: dict[str, Path] = {}
+    for semantic_view in _SEMANTIC_YAWS:
+        if semantic_view not in work_images_by_view:
+            raise ValueError(f"missing original-image context for {semantic_view}")
+        image = np.asarray(work_images_by_view[semantic_view])
+        if (
+            image.ndim != 3
+            or image.shape[2] not in (3, 4)
+            or not np.isfinite(image).all()
+        ):
+            raise ValueError(f"{semantic_view} work image is invalid")
+        canvas = Image.fromarray(np.asarray(image[:, :, :3], dtype=np.uint8))
+        draw = ImageDraw.Draw(canvas)
+        curves = observation_curves_by_view.get(semantic_view, {})
+        for points in curves.values():
+            values = np.asarray(points, dtype=np.float64)
+            if values.ndim != 2 or values.shape[1:] != (2,) or not np.isfinite(values).all():
+                raise ValueError(f"{semantic_view} observation curve is invalid")
+            if len(values) >= 2:
+                draw.line(
+                    [tuple(point) for point in values],
+                    fill=(55, 217, 138),
+                    width=3,
+                )
+        for projected, color in (
+            (baseline_projection_by_view, (88, 200, 255)),
+            (candidate_projection_by_view, (255, 111, 174)),
+        ):
+            values = np.asarray(projected.get(semantic_view, ()), dtype=np.float64)
+            if values.ndim != 2 or values.shape[1:] != (2,) or not np.isfinite(values).all():
+                raise ValueError(f"{semantic_view} projected points are invalid")
+            for x, y in values:
+                radius = 2.5
+                draw.ellipse(
+                    (x - radius, y - radius, x + radius, y + radius),
+                    fill=color,
+                )
+        output = target / f"evidence_{semantic_view}.png"
+        canvas.save(output)
+        result[semantic_view] = output
+    return result
+
+
 def _objective_rows(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -310,6 +533,7 @@ def write_nasal_geometry_report(
     *,
     dataset_label: str,
     screenshots: Mapping[str, Mapping[str, str | Path]],
+    evidence_overlays: Mapping[str, str | Path],
     baseline_objective: Mapping[str, Any],
     candidate_objective: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -322,13 +546,24 @@ def write_nasal_geometry_report(
     for semantic_view in _SEMANTIC_YAWS:
         baseline = Path(screenshots["baseline"][semantic_view])
         candidate = Path(screenshots["candidate"][semantic_view])
-        for path in (baseline, candidate):
+        evidence_overlay = Path(evidence_overlays[semantic_view])
+        for path in (baseline, candidate, evidence_overlay):
             if not path.is_file() or path.stat().st_size <= 0:
-                raise FileNotFoundError(f"geometry screenshot missing: {path}")
+                raise FileNotFoundError(f"geometry evidence image missing: {path}")
         screenshot_cells.append(
             f"""
             <section>
               <h2>{html.escape(semantic_view)}</h2>
+              <h3>Original-image projection evidence</h3>
+              <figure class="evidence">
+                <img src="{html.escape(evidence_overlay.name)}">
+                <figcaption>
+                  <span class="observation">Observation</span>
+                  <span class="baseline">Baseline projection</span>
+                  <span class="candidate">Candidate projection</span>
+                </figcaption>
+              </figure>
+              <h3>Uniform-material geometry renders</h3>
               <div class="pair">
                 <figure><img src="{html.escape(baseline.name)}"><figcaption>Baseline</figcaption></figure>
                 <figure><img src="{html.escape(candidate.name)}"><figcaption>New candidate</figcaption></figure>
@@ -355,6 +590,8 @@ def write_nasal_geometry_report(
     report_data = {
         "dataset": dataset_label,
         "geometry_only": True,
+        "geometry_render_material": "uniform_untextured",
+        "original_images_used_for_context_only": True,
         "texture_scoring_included": False,
         "validity": validity,
         "evidence": evidence,
@@ -370,11 +607,17 @@ def write_nasal_geometry_report(
     main {{ max-width: 1180px; margin: auto; padding: 24px; }}
     h1 {{ font-size: 26px; margin: 0 0 6px; }}
     h2 {{ font-size: 18px; margin-top: 26px; }}
+    h3 {{ font-size: 15px; margin: 16px 0 8px; }}
     .note {{ color: #b8c3cf; }}
     .pair {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }}
     figure {{ margin: 0; background: #171e27; border: 1px solid #33404d; padding: 8px; }}
+    .evidence {{ max-width: 760px; }}
     img {{ display: block; width: 100%; height: auto; }}
     figcaption {{ padding: 7px 2px 1px; }}
+    figcaption span {{ margin-right: 16px; font-weight: bold; }}
+    .observation {{ color: #55d98a; }}
+    .baseline {{ color: #58c8ff; }}
+    .candidate {{ color: #ff6fae; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
     th, td {{ padding: 7px 8px; border: 1px solid #33404d; text-align: right; }}
     th:first-child, td:first-child {{ text-align: left; }}
@@ -384,7 +627,7 @@ def write_nasal_geometry_report(
 </head>
 <body><main>
   <h1>{html.escape(dataset_label)}: nasal geometry</h1>
-  <p class="note">Pure geometry report. Texture scoring is not part of the objective or validity gate.</p>
+  <p class="note">Geometry renders use one untextured material. Original images appear only behind projection evidence; texture scoring is not part of the objective or validity gate.</p>
   <p><strong>Evidence:</strong> {html.escape(warning)}</p>
   {''.join(screenshot_cells)}
   <h2>Unified objective</h2>
@@ -409,5 +652,6 @@ def write_nasal_geometry_report(
 __all__ = [
     "render_nasal_geometry_screenshots",
     "validate_minimal_nasal_candidate",
+    "write_nasal_evidence_overlays",
     "write_nasal_geometry_report",
 ]

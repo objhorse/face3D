@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,6 +28,38 @@ _CAMERA_CONTRACT = {
     "subject-left": ("camera1", "left"),
     "subject-right": ("camera3", "right"),
 }
+_COORDINATE_CORE_FIELDS = {
+    "source_pixel_frame",
+    "mask_layouts",
+    "observation_pixel_frame",
+    "original_size_wh",
+    "work_size_wh",
+    "intrinsics",
+    "distortion_coefficients",
+    "undistortion_applied",
+    "distorted_reverse_available",
+    "conversion_source",
+}
+_COORDINATE_AUDIT_FIELDS = {
+    "mask_pixel_layout",
+    "distance_field",
+    "aggregate_distance_field_usage",
+    "mask_canvas_shape_hw",
+    "color_space",
+}
+_PROFILE_SELECTION_FIELDS = {
+    "epipolar_lines_work",
+    "epipolar_anchor_names",
+    "max_epipolar_distance_px",
+    "candidate_count",
+    "selected_anchor_epipolar_errors_px",
+    "selected_anchor_prior_errors_px",
+    "side_prior_roi_work",
+    "effective_profile_roi_work",
+    "max_side_prior_distance_px",
+    "selection_score",
+    "used_side_prior",
+}
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -37,8 +70,38 @@ def _mapping(value: Any, path: str) -> Mapping[str, Any]:
 
 def _keys(value: Mapping[str, Any], expected: set[str], path: str) -> None:
     missing = sorted(expected - set(value))
-    if missing:
-        raise ValueError(f"{path} is missing required fields: {', '.join(missing)}")
+    unexpected = sorted(set(value) - expected)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected: " + ", ".join(unexpected))
+        raise ValueError(f"{path} schema mismatch ({'; '.join(details)})")
+
+
+def _safe_json_metadata(value: Any, path: str, *, depth: int = 0) -> None:
+    if depth > 32:
+        raise ValueError(f"{path} exceeds the safe metadata nesting limit")
+    if value is None or isinstance(value, (bool, str)):
+        return
+    if isinstance(value, int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} contains a non-finite number")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _safe_json_metadata(item, f"{path}[{index}]", depth=depth + 1)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} contains a non-string object key")
+            _safe_json_metadata(item, f"{path}.{key}", depth=depth + 1)
+        return
+    raise ValueError(f"{path} contains an unsupported metadata value")
 
 
 def _text(value: Any, path: str) -> str:
@@ -214,15 +277,11 @@ def _camera_from_payload(
         raise ValueError(f"{path}.rig_to_camera_rotation must be a proper rotation")
 
     coordinate_path = f"views.{semantic_view}.coordinate_metadata"
-    coordinate_required = {
-        "source_pixel_frame",
-        "observation_pixel_frame",
-        "original_size_wh",
-        "work_size_wh",
-        "intrinsics",
-        "distortion_coefficients",
-    }
+    coordinate_required = _COORDINATE_CORE_FIELDS | _COORDINATE_AUDIT_FIELDS
+    if semantic_view != "front":
+        coordinate_required |= _PROFILE_SELECTION_FIELDS
     _keys(coordinate_payload, coordinate_required, coordinate_path)
+    _safe_json_metadata(coordinate_payload, coordinate_path)
     source_frame = _text(
         coordinate_payload["source_pixel_frame"],
         f"{coordinate_path}.source_pixel_frame",
@@ -337,8 +396,10 @@ def _load_view(
         "anchors_work",
         "variant_boundaries_work",
         "fields",
+        "summary",
     }
     _keys(payload, required, path)
+    _safe_json_metadata(payload["summary"], f"{path}.summary")
     if _text(payload["semantic_view"], f"{path}.semantic_view") != semantic_view:
         raise ValueError(f"{path}.semantic_view is inconsistent")
     original_size = _integer_pair(payload["original_size_wh"], f"{path}.original_size_wh")
@@ -515,7 +576,8 @@ def load_nasal_observation_bundle(
     }
     if dict(camera_names) != expected_names:
         raise ValueError("camera_name_by_view violates the fixed rig contract")
-    _mapping(root["metadata"], "metadata")
+    metadata = _mapping(root["metadata"], "metadata")
+    _safe_json_metadata(metadata, "metadata")
     fields_path = _safe_fields_path(path, root["fields_npz"])
     used_fields: set[str] = set()
     try:
