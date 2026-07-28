@@ -24,13 +24,17 @@ __all__ = [
     "MultiviewNasalObjectiveConfig",
     "MultiviewNasalObjectiveContext",
     "MultiviewNasalObjectiveResult",
+    "MultiviewNasalResidualEvaluation",
+    "MultiviewNasalSoftProjection",
     "MultiviewNasalProjection",
     "MultiviewNasalSamplingConfig",
     "PreparedNasalProjectionContext",
     "ProjectedNasalSamples",
+    "SoftProfileNasalSlots",
     "build_candidate_nasal_mesh",
     "build_candidate_nasal_mesh_prepared",
     "evaluate_multiview_nasal_objective",
+    "evaluate_multiview_nasal_objective_residuals",
     "prepare_multiview_nasal_objective_context",
     "prepare_nasal_projection_context",
     "project_multiview_nasal_boundaries",
@@ -1942,6 +1946,7 @@ _OBJECTIVE_IMAGE_TERM_NAMES = tuple(
     value[0] for value in _OBJECTIVE_IMAGE_TERM_SPECS
 )
 _OBJECTIVE_REGULARIZATION_TERM_NAMES = (
+    "projection_depth_barrier",
     "flame_prior",
     "semantic_prior",
     "surface_smoothness",
@@ -1998,6 +2003,11 @@ class MultiviewNasalObjectiveConfig:
     symmetry_weight: float = 0.10
     symmetry_evidence_floor: float = 0.15
     symmetry_evidence_ceiling: float = 1.0
+    profile_vertical_sigma_px: float = 6.0
+    profile_softmax_temperature_px: float = 20.0
+    depth_softplus_scale: float = 0.02
+    depth_barrier_weight: float = 0.10
+    depth_barrier_scale: float = 0.02
     robust_loss: str = "soft_l1"
     robust_f_scale: float = 1.0
 
@@ -2009,10 +2019,15 @@ class MultiviewNasalObjectiveConfig:
             "semantic_prior_weight",
             "smoothness_weight",
             "symmetry_weight",
+            "depth_barrier_weight",
         ):
             _finite_real(name, getattr(self, name))
         for name in (
             "smoothness_scale",
+            "profile_vertical_sigma_px",
+            "profile_softmax_temperature_px",
+            "depth_softplus_scale",
+            "depth_barrier_scale",
             "robust_f_scale",
         ):
             _finite_real(name, getattr(self, name), strictly_positive=True)
@@ -2052,10 +2067,18 @@ class _PreparedObjectiveImageTerm:
     semantic_view: str
     boundary_name: str
     slot_quantiles: np.ndarray
+    target_slot_xy: np.ndarray
+    target_polyline: np.ndarray
+    support_vertex_indices: np.ndarray
+    direction_sign: int
     distance_field: np.ndarray
     confidence: np.ndarray
     work_size: Tuple[int, int]
     roi_work_xyxy: Tuple[float, float, float, float]
+    target_segment_starts: np.ndarray = field(init=False)
+    target_segment_deltas: np.ndarray = field(init=False)
+    target_segment_length_squared: np.ndarray = field(init=False)
+    slot_y: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
         valid_specs = {
@@ -2088,6 +2111,42 @@ class _PreparedObjectiveImageTerm:
             raise ValueError(
                 "objective slots must use deterministic midpoint quantiles"
             )
+        target_slots = np.asarray(self.target_slot_xy, dtype=np.float64)
+        polyline = np.asarray(self.target_polyline, dtype=np.float64)
+        support_indices = np.asarray(self.support_vertex_indices)
+        if (
+            target_slots.shape != (len(quantiles), 2)
+            or not np.isfinite(target_slots).all()
+        ):
+            raise ValueError(
+                "objective target slots must have finite shape (slot_count, 2)"
+            )
+        if (
+            polyline.ndim != 2
+            or polyline.shape[1:] != (2,)
+            or not len(polyline)
+            or not np.isfinite(polyline).all()
+        ):
+            raise ValueError(
+                "objective target polyline must have finite shape (N, 2)"
+            )
+        if (
+            support_indices.ndim != 1
+            or not len(support_indices)
+            or not np.issubdtype(support_indices.dtype, np.integer)
+            or np.any(support_indices < 0)
+            or np.any(np.diff(support_indices) <= 0)
+        ):
+            raise ValueError(
+                "objective semantic support indices must be sorted unique "
+                "non-negative integers"
+            )
+        direction = int(self.direction_sign)
+        if (
+            isinstance(self.direction_sign, (bool, np.bool_))
+            or direction not in (-1, 1)
+        ):
+            raise ValueError("objective profile direction_sign must be -1 or 1")
         distance = np.asarray(self.distance_field, dtype=np.float64)
         confidence = np.asarray(self.confidence, dtype=np.float64)
         work_size = tuple(int(value) for value in self.work_size)
@@ -2136,6 +2195,22 @@ class _PreparedObjectiveImageTerm:
         )
         object.__setattr__(
             self,
+            "target_slot_xy",
+            _readonly_array(target_slots, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "target_polyline",
+            _readonly_array(polyline, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "support_vertex_indices",
+            _readonly_array(support_indices, np.int64),
+        )
+        object.__setattr__(self, "direction_sign", direction)
+        object.__setattr__(
+            self,
             "distance_field",
             _readonly_array(distance, np.float64),
         )
@@ -2146,6 +2221,42 @@ class _PreparedObjectiveImageTerm:
         )
         object.__setattr__(self, "work_size", work_size)
         object.__setattr__(self, "roi_work_xyxy", roi)
+        if len(polyline) == 1:
+            segment_starts = polyline
+            segment_deltas = np.zeros((1, 2), dtype=np.float64)
+        else:
+            raw_deltas = np.diff(polyline, axis=0)
+            usable = np.sum(raw_deltas * raw_deltas, axis=1) > 1e-20
+            if np.any(usable):
+                segment_starts = polyline[:-1][usable]
+                segment_deltas = raw_deltas[usable]
+            else:
+                segment_starts = polyline[:1]
+                segment_deltas = np.zeros((1, 2), dtype=np.float64)
+        segment_length_squared = np.sum(
+            segment_deltas * segment_deltas,
+            axis=1,
+        )
+        object.__setattr__(
+            self,
+            "target_segment_starts",
+            _readonly_array(segment_starts, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "target_segment_deltas",
+            _readonly_array(segment_deltas, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "target_segment_length_squared",
+            _readonly_array(segment_length_squared, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "slot_y",
+            _readonly_array(target_slots[:, 1], np.float64),
+        )
 
     @property
     def sample_count(self) -> int:
@@ -2160,6 +2271,7 @@ class MultiviewNasalObjectiveContext:
     observable_vertex_basis: np.ndarray
     projection_context: PreparedNasalProjectionContext
     image_terms: Tuple[_PreparedObjectiveImageTerm, ...]
+    depth_support_vertex_indices: np.ndarray
     flame_mode_standard_deviations: np.ndarray
     smoothness_centers: np.ndarray
     smoothness_neighbors: np.ndarray
@@ -2236,6 +2348,68 @@ class MultiviewNasalObjectiveContext:
                     f"objective image term {term.name} does not match "
                     "its prepared observation contract"
                 )
+            if (
+                np.any(term.support_vertex_indices >= prepared.vertex_count)
+                or np.any(prepared.protected_mask[term.support_vertex_indices])
+                or np.any(~prepared.support_mask[term.support_vertex_indices])
+            ):
+                raise ValueError(
+                    f"objective semantic support is invalid for {term.name}"
+                )
+            if term.semantic_view == "front":
+                region_name = (
+                    "subject_left_nose_wing"
+                    if term.boundary_name == "subject-left-alar"
+                    else "subject_right_nose_wing"
+                )
+                expected_support = (
+                    prepared.region_masks[region_name]
+                    & prepared.support_mask
+                    & ~prepared.protected_mask
+                )
+            else:
+                expected_support = (
+                    (
+                        prepared.region_masks["nose_tip"]
+                        | prepared.region_masks["tip_alar_transition"]
+                        | prepared.region_masks["subject_left_nose_wing"]
+                        | prepared.region_masks["subject_right_nose_wing"]
+                    )
+                    & prepared.support_mask
+                    & ~prepared.protected_mask
+                )
+            if not np.array_equal(
+                term.support_vertex_indices,
+                np.flatnonzero(expected_support),
+            ):
+                raise ValueError(
+                    f"objective semantic support does not match {term.name}"
+                )
+        depth_support = np.asarray(self.depth_support_vertex_indices)
+        if (
+            depth_support.ndim != 1
+            or not len(depth_support)
+            or not np.issubdtype(depth_support.dtype, np.integer)
+            or np.any(depth_support < 0)
+            or np.any(depth_support >= prepared.vertex_count)
+            or np.any(np.diff(depth_support) <= 0)
+            or np.any(prepared.protected_mask[depth_support])
+            or np.any(~prepared.support_mask[depth_support])
+        ):
+            raise ValueError(
+                "depth support indices must be sorted unique unprotected "
+                "nasal support vertices"
+            )
+        if not np.array_equal(
+            depth_support,
+            np.flatnonzero(
+                prepared.support_mask & ~prepared.protected_mask
+            ),
+        ):
+            raise ValueError(
+                "depth support indices must cover the fixed unprotected "
+                "nasal support"
+            )
         centers = np.asarray(self.smoothness_centers)
         neighbors = np.asarray(self.smoothness_neighbors)
         offsets = np.asarray(self.smoothness_neighbor_offsets)
@@ -2299,6 +2473,11 @@ class MultiviewNasalObjectiveContext:
         object.__setattr__(self, "image_terms", terms)
         object.__setattr__(
             self,
+            "depth_support_vertex_indices",
+            _readonly_array(depth_support, np.int64),
+        )
+        object.__setattr__(
+            self,
             "flame_mode_standard_deviations",
             _readonly_array(standard_deviations, np.float64),
         )
@@ -2351,6 +2530,206 @@ def _freeze_objective_value(value):
 
 
 @dataclass(frozen=True)
+class SoftProfileNasalSlots:
+    """Continuous semantic-profile slots for one objective image term."""
+
+    name: str
+    semantic_view: str
+    boundary_name: str
+    pixel_xy: np.ndarray
+    depth: np.ndarray
+    confidence: np.ndarray
+    target_slot_y: np.ndarray
+    support_vertex_indices: np.ndarray
+    soft_weights: np.ndarray
+    direction_sign: int
+
+    def __post_init__(self) -> None:
+        valid_specs = {
+            name: (semantic_view, boundary_name)
+            for name, semantic_view, boundary_name
+            in _OBJECTIVE_IMAGE_TERM_SPECS
+        }
+        name = str(self.name)
+        semantic_view = str(self.semantic_view)
+        boundary_name = str(self.boundary_name)
+        if (
+            name not in valid_specs
+            or valid_specs[name] != (semantic_view, boundary_name)
+        ):
+            raise ValueError("soft profile slot identity is invalid")
+        pixels = np.asarray(self.pixel_xy, dtype=np.float64)
+        depth = np.asarray(self.depth, dtype=np.float64)
+        confidence = np.asarray(self.confidence, dtype=np.float64)
+        slot_y = np.asarray(self.target_slot_y, dtype=np.float64)
+        support = np.asarray(self.support_vertex_indices)
+        weights = np.asarray(self.soft_weights, dtype=np.float64)
+        count = len(pixels)
+        if (
+            pixels.ndim != 2
+            or pixels.shape[1:] != (2,)
+            or depth.shape != (count,)
+            or confidence.shape != (count,)
+            or slot_y.shape != (count,)
+            or weights.shape != (count, len(support))
+            or not all(
+                np.isfinite(value).all()
+                for value in (pixels, depth, confidence, slot_y, weights)
+            )
+            or np.any((confidence < 0.0) | (confidence > 1.0))
+            or np.any(weights < 0.0)
+            or not np.allclose(
+                np.sum(weights, axis=1),
+                np.ones(count),
+                atol=1e-12,
+                rtol=0.0,
+            )
+        ):
+            raise ValueError("soft profile slot arrays are invalid")
+        if (
+            support.ndim != 1
+            or not len(support)
+            or not np.issubdtype(support.dtype, np.integer)
+            or np.any(support < 0)
+            or np.any(np.diff(support) <= 0)
+        ):
+            raise ValueError("soft profile support indices are invalid")
+        direction = int(self.direction_sign)
+        if (
+            isinstance(self.direction_sign, (bool, np.bool_))
+            or direction not in (-1, 1)
+        ):
+            raise ValueError("soft profile direction_sign must be -1 or 1")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "semantic_view", semantic_view)
+        object.__setattr__(self, "boundary_name", boundary_name)
+        object.__setattr__(self, "pixel_xy", _readonly_array(pixels, np.float64))
+        object.__setattr__(self, "depth", _readonly_array(depth, np.float64))
+        object.__setattr__(
+            self,
+            "confidence",
+            _readonly_array(confidence, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "target_slot_y",
+            _readonly_array(slot_y, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "support_vertex_indices",
+            _readonly_array(support, np.int64),
+        )
+        object.__setattr__(
+            self,
+            "soft_weights",
+            _readonly_array(weights, np.float64),
+        )
+        object.__setattr__(self, "direction_sign", direction)
+
+
+@dataclass(frozen=True)
+class MultiviewNasalSoftProjection:
+    """Immutable C2 soft semantic-slot projection diagnostics."""
+
+    candidate_vertices: np.ndarray
+    per_term: Tuple[SoftProfileNasalSlots, ...]
+
+    def __post_init__(self) -> None:
+        vertices = _validate_vertices(self.candidate_vertices)
+        terms = tuple(self.per_term)
+        if (
+            tuple(term.name for term in terms)
+            != _OBJECTIVE_IMAGE_TERM_NAMES
+            or not all(isinstance(term, SoftProfileNasalSlots) for term in terms)
+        ):
+            raise ValueError(
+                "soft projection terms must use the fixed canonical order"
+            )
+        if any(
+            np.any(term.support_vertex_indices >= len(vertices))
+            for term in terms
+        ):
+            raise ValueError(
+                "soft projection support indices exceed candidate vertices"
+            )
+        object.__setattr__(
+            self,
+            "candidate_vertices",
+            _readonly_array(vertices, vertices.dtype),
+        )
+        object.__setattr__(self, "per_term", terms)
+
+    @property
+    def by_term(self) -> Mapping[str, SoftProfileNasalSlots]:
+        return MappingProxyType({term.name: term for term in self.per_term})
+
+
+@dataclass(frozen=True)
+class MultiviewNasalResidualEvaluation:
+    """Copy-safe minimal output for iterative least-squares solvers."""
+
+    residuals: np.ndarray
+    term_slices: Mapping[str, slice]
+    term_residuals: Mapping[str, np.ndarray]
+
+    def __post_init__(self) -> None:
+        residuals = np.asarray(self.residuals, dtype=np.float64)
+        expected_names = (
+            _OBJECTIVE_IMAGE_TERM_NAMES
+            + _OBJECTIVE_REGULARIZATION_TERM_NAMES
+        )
+        slices = dict(self.term_slices)
+        terms = dict(self.term_residuals)
+        if (
+            residuals.ndim != 1
+            or not np.isfinite(residuals).all()
+            or tuple(slices) != expected_names
+            or tuple(terms) != expected_names
+        ):
+            raise ValueError("minimal objective residual output is invalid")
+        cursor = 0
+        frozen_terms = {}
+        frozen_slices = {}
+        for name in expected_names:
+            term_slice = slices[name]
+            term = np.asarray(terms[name], dtype=np.float64)
+            if (
+                not isinstance(term_slice, slice)
+                or term_slice.step not in (None, 1)
+                or term_slice.start != cursor
+                or term_slice.stop is None
+                or term.shape != (term_slice.stop - cursor,)
+                or not np.array_equal(term, residuals[term_slice])
+            ):
+                raise ValueError("minimal objective term layout is invalid")
+            frozen_terms[name] = _readonly_array(term, np.float64)
+            frozen_slices[name] = slice(cursor, term_slice.stop)
+            cursor = term_slice.stop
+        if cursor != len(residuals):
+            raise ValueError("minimal objective terms do not cover residuals")
+        object.__setattr__(
+            self,
+            "residuals",
+            _readonly_array(residuals, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "term_slices",
+            MappingProxyType(frozen_slices),
+        )
+        object.__setattr__(
+            self,
+            "term_residuals",
+            MappingProxyType(frozen_terms),
+        )
+
+    @property
+    def residual_vector(self) -> np.ndarray:
+        return self.residuals
+
+
+@dataclass(frozen=True)
 class MultiviewNasalObjectiveResult:
     """One immutable unified residual evaluation and optimization report."""
 
@@ -2362,7 +2741,7 @@ class MultiviewNasalObjectiveResult:
     total_raw_cost: float
     total_robust_cost: float
     candidate: CandidateNasalMesh
-    projection: MultiviewNasalProjection
+    projection: MultiviewNasalSoftProjection
     effective_observation_counts: Mapping[str, int]
     sample_counts: Mapping[str, int]
     effective_confidence_sums: Mapping[str, float]
@@ -2422,8 +2801,10 @@ class MultiviewNasalObjectiveResult:
             raise ValueError("objective term slices must cover the residual vector")
         if not isinstance(self.candidate, CandidateNasalMesh):
             raise ValueError("candidate must be a CandidateNasalMesh")
-        if not isinstance(self.projection, MultiviewNasalProjection):
-            raise ValueError("projection must be a MultiviewNasalProjection")
+        if not isinstance(self.projection, MultiviewNasalSoftProjection):
+            raise ValueError(
+                "projection must be a MultiviewNasalSoftProjection"
+            )
         if not np.array_equal(
             self.candidate.vertices,
             self.projection.candidate_vertices,
@@ -2881,6 +3262,50 @@ def prepare_multiview_nasal_objective_context(
             ),
             dtype=np.float64,
         )
+    unprotected = prepared.support_mask & ~prepared.protected_mask
+    side_support = unprotected & (
+        prepared.region_masks["nose_tip"]
+        | prepared.region_masks["tip_alar_transition"]
+        | prepared.region_masks["subject_left_nose_wing"]
+        | prepared.region_masks["subject_right_nose_wing"]
+    )
+    support_by_term = {
+        "front_subject_left_alar": (
+            unprotected
+            & prepared.region_masks["subject_left_nose_wing"]
+        ),
+        "front_subject_right_alar": (
+            unprotected
+            & prepared.region_masks["subject_right_nose_wing"]
+        ),
+        "subject_left_nasal_profile": side_support,
+        "subject_right_nasal_profile": side_support,
+    }
+    if any(not np.any(mask) for mask in support_by_term.values()):
+        raise ValueError(
+            "every objective image term needs non-empty semantic support"
+        )
+    depth_support_indices = np.flatnonzero(unprotected).astype(np.int64)
+    baseline_pixels_by_view = {}
+    for semantic_view, view in zip(NASAL_VIEWS, prepared.views):
+        projected = project_points_strict(
+            baseline,
+            view.K,
+            view.R_model_to_camera,
+            view.t_model_to_camera,
+            epsilon=float(prepared.config.min_depth),
+        )
+        if np.any(
+            projected.depth[depth_support_indices]
+            <= float(prepared.config.min_depth)
+        ):
+            raise ValueError(
+                f"baseline nasal support has invalid depth in {semantic_view}"
+            )
+        baseline_pixels_by_view[semantic_view] = np.asarray(
+            projected.pixel_xy,
+            dtype=np.float64,
+        )
     image_terms = []
     for name, semantic_view, boundary_name in _OBJECTIVE_IMAGE_TERM_SPECS:
         observation = observations.by_view[semantic_view]
@@ -2907,12 +3332,36 @@ def prepare_multiview_nasal_objective_context(
                 f"{semantic_view} observation target {boundary_name} "
                 "extends outside its image evidence domain"
             )
+        target_polyline = np.asarray(
+            observation.boundaries_work[boundary_name],
+            dtype=np.float64,
+        )
+        support_indices = np.flatnonzero(
+            support_by_term[name]
+        ).astype(np.int64)
+        baseline_pixels = baseline_pixels_by_view[semantic_view]
+        baseline_center_x = float(
+            np.median(baseline_pixels[depth_support_indices, 0])
+        )
+        target_offset = float(
+            np.median(evidence_points[:, 0]) - baseline_center_x
+        )
+        if abs(target_offset) <= 1e-12:
+            offsets = target_polyline[:, 0] - baseline_center_x
+            target_offset = float(
+                offsets[np.argmax(np.abs(offsets))]
+            )
+        direction_sign = 1 if target_offset >= 0.0 else -1
         image_terms.append(
             _PreparedObjectiveImageTerm(
                 name=name,
                 semantic_view=semantic_view,
                 boundary_name=boundary_name,
                 slot_quantiles=quantiles,
+                target_slot_xy=evidence_points,
+                target_polyline=target_polyline,
+                support_vertex_indices=support_indices,
+                direction_sign=direction_sign,
                 distance_field=observation.distance_fields[boundary_name],
                 confidence=confidence,
                 work_size=tuple(observation.work_size),
@@ -2928,6 +3377,7 @@ def prepare_multiview_nasal_objective_context(
         observable_vertex_basis=observable_basis,
         projection_context=prepared,
         image_terms=tuple(image_terms),
+        depth_support_vertex_indices=depth_support_indices,
         flame_mode_standard_deviations=flame_standard_deviations,
         smoothness_centers=centers,
         smoothness_neighbors=neighbors,
@@ -2974,167 +3424,136 @@ def _bilinear_sample_clamped(
     return values, inside, outside_distance
 
 
-def _sample_unsigned_distance_extended(
-    field: np.ndarray,
-    pixels: np.ndarray,
-) -> np.ndarray:
-    border_distance, _inside, outside_distance = (
-        _bilinear_sample_clamped(field, pixels)
+def _stable_softplus(values: np.ndarray) -> np.ndarray:
+    source = np.asarray(values, dtype=np.float64)
+    return np.maximum(source, 0.0) + np.log1p(np.exp(-np.abs(source)))
+
+
+def _smooth_project_support(
+    points: np.ndarray,
+    view: ProjectionView,
+    min_depth: float,
+    depth_scale: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project finite points through a smooth positive-depth surrogate."""
+    source = np.asarray(points, dtype=np.float64)
+    with np.errstate(over="ignore", invalid="ignore"):
+        camera = source @ view.R_model_to_camera.T + view.t_model_to_camera
+    if not np.isfinite(camera).all():
+        raise ValueError("camera projection produced non-finite camera points")
+    raw_depth = camera[:, 2]
+    scaled_depth = (raw_depth - float(min_depth)) / float(depth_scale)
+    positive_depth = float(min_depth) + float(depth_scale) * _stable_softplus(
+        scaled_depth
     )
-    return border_distance + outside_distance
+    guarded_camera = np.array(camera, copy=True)
+    guarded_camera[:, 2] = positive_depth
+    with np.errstate(over="ignore", invalid="ignore"):
+        homogeneous = guarded_camera @ view.K.T
+    denominator = homogeneous[:, 2]
+    if (
+        not np.isfinite(homogeneous).all()
+        or np.any(np.abs(denominator) <= np.finfo(np.float64).tiny)
+    ):
+        raise ValueError("guarded camera projection is numerically invalid")
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        pixels = homogeneous[:, :2] / denominator[:, None]
+    if not np.isfinite(pixels).all():
+        raise ValueError("guarded camera projection produced non-finite pixels")
+    return pixels, raw_depth, positive_depth
+
+
+def _soft_profile_slots(
+    projected_support: np.ndarray,
+    raw_depth: np.ndarray,
+    slot_y: np.ndarray,
+    direction_sign: int,
+    sigma_y: float,
+    temperature: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pixels = np.asarray(projected_support, dtype=np.float64)
+    target_y = np.asarray(slot_y, dtype=np.float64)
+    vertical = (
+        pixels[None, :, 1] - target_y[:, None]
+    ) / float(sigma_y)
+    log_weights = (
+        -0.5 * vertical * vertical
+        + float(direction_sign) * pixels[None, :, 0] / float(temperature)
+    )
+    row_max = np.max(log_weights, axis=1, keepdims=True)
+    stabilized = np.exp(log_weights - row_max)
+    sums = np.sum(stabilized, axis=1, keepdims=True)
+    if (
+        not np.isfinite(stabilized).all()
+        or not np.isfinite(sums).all()
+        or np.any(sums <= 0.0)
+    ):
+        raise ValueError("soft profile weights are numerically invalid")
+    weights = stabilized / sums
+    slot_pixels = weights @ pixels
+    slot_depth = weights @ np.asarray(raw_depth, dtype=np.float64)
+    return slot_pixels, slot_depth, weights
+
+
+def _point_to_polyline_distance(
+    points: np.ndarray,
+    term: _PreparedObjectiveImageTerm,
+) -> np.ndarray:
+    """Exact unsigned Euclidean distance to immutable target segments."""
+    query = np.asarray(points, dtype=np.float64)
+    relative = query[:, None, :] - term.target_segment_starts[None, :, :]
+    lengths = term.target_segment_length_squared
+    denominator = np.where(lengths > 0.0, lengths, 1.0)
+    fraction = np.sum(
+        relative * term.target_segment_deltas[None, :, :],
+        axis=2,
+    ) / denominator[None, :]
+    fraction = np.clip(fraction, 0.0, 1.0)
+    closest = (
+        term.target_segment_starts[None, :, :]
+        + fraction[:, :, None] * term.target_segment_deltas[None, :, :]
+    )
+    squared = np.sum((query[:, None, :] - closest) ** 2, axis=2)
+    return np.sqrt(np.min(squared, axis=1))
+
+
+def _normalized_image_residual(
+    distances: np.ndarray,
+    confidence: np.ndarray,
+    view_confidence_sum: float,
+    term_weight: float,
+) -> np.ndarray:
+    if float(view_confidence_sum) == 0.0:
+        return np.zeros(len(confidence), dtype=np.float64)
+    return (
+        float(term_weight)
+        * np.sqrt(np.asarray(confidence, dtype=np.float64))
+        * np.asarray(distances, dtype=np.float64)
+        / np.sqrt(float(view_confidence_sum))
+    )
 
 
 @dataclass(frozen=True)
-class _CurrentObjectiveImageProjection:
-    model_points: np.ndarray
+class _SoftTermEvaluation:
     pixel_xy: np.ndarray
-    source_vertex_indices: np.ndarray
-    source_weights: np.ndarray
-    source_labels: Tuple[str, ...]
     depth: np.ndarray
-    visible: np.ndarray
+    soft_weights: np.ndarray
 
 
-def _project_current_objective_slots(
-    candidate: CandidateNasalMesh,
-    context: MultiviewNasalObjectiveContext,
-) -> Mapping[str, _CurrentObjectiveImageProjection]:
-    """Fill fixed quantile identities from the candidate's current contours."""
-    prepared = context.projection_context
-    result = {}
-    for semantic_view, view in zip(NASAL_VIEWS, prepared.views):
-        vertex_projection = project_points_strict(
-            candidate.vertices,
-            view.K,
-            view.R_model_to_camera,
-            view.t_model_to_camera,
-            epsilon=float(prepared.config.min_depth),
-        )
-        if np.any(
-            vertex_projection.depth[prepared.support_mask]
-            <= float(prepared.config.min_depth)
-        ):
-            raise ValueError(
-                f"current nasal support has invalid or behind-camera "
-                f"depth in {semantic_view}"
-            )
-        edge_groups = _current_prepared_edge_groups(
-            semantic_view,
-            prepared,
-            vertex_projection,
-        )
-        groups_by_boundary = {
-            boundary_name: (edges, count, source_label)
-            for edges, count, source_label, boundary_name in edge_groups
-        }
-        for term in context.image_terms:
-            if term.semantic_view != semantic_view:
-                continue
-            if term.boundary_name not in groups_by_boundary:
-                raise ValueError(
-                    f"current candidate has no contour group for "
-                    f"{term.name}"
-                )
-            edges, count, source_label = groups_by_boundary[
-                term.boundary_name
-            ]
-            if int(count) != term.sample_count:
-                raise ValueError(
-                    f"current candidate slot count changed for {term.name}"
-                )
-            edge_array = np.asarray(edges, dtype=np.int64)
-            if (
-                edge_array.ndim != 2
-                or edge_array.shape[1:] != (2,)
-                or not len(edge_array)
-            ):
-                raise ValueError(
-                    f"current candidate has no contour edges for {term.name}"
-                )
-            if np.any(
-                vertex_projection.depth[edge_array]
-                <= float(prepared.config.min_depth)
-            ):
-                raise ValueError(
-                    f"current objective contour for {term.name} contains "
-                    "invalid or behind-camera depth"
-                )
-            edge_sequence = tuple(
-                (int(edge[0]), int(edge[1]))
-                for edge in edge_array
-            )
-            model_points, indices, weights = _sample_edges(
-                edge_sequence,
-                term.sample_count,
-                candidate.vertices,
-                vertex_projection.pixel_xy,
-                vertex_projection.depth,
-            )
-            if len(model_points) != term.sample_count:
-                raise ValueError(
-                    f"current candidate has no valid contour for {term.name}"
-                )
-            if source_label is None:
-                labels = tuple(
-                    _source_label(
-                        int(edge[0]),
-                        int(edge[1]),
-                        prepared.region_masks,
-                    )
-                    for edge in indices
-                )
-                if any(label is None for label in labels):
-                    raise ValueError(
-                        f"current candidate profile provenance is invalid "
-                        f"for {term.name}"
-                    )
-            else:
-                labels = (source_label,) * term.sample_count
-            projected = project_points_strict(
-                model_points,
-                view.K,
-                view.R_model_to_camera,
-                view.t_model_to_camera,
-                epsilon=float(prepared.config.min_depth),
-            )
-            if not np.all(projected.front_facing):
-                raise ValueError(
-                    f"current objective slots for {term.name} must remain "
-                    "in front of the camera"
-                )
-            pixels = np.asarray(projected.pixel_xy, dtype=np.float64)
-            width, height = term.work_size
-            in_image = (
-                (pixels[:, 0] >= 0.0)
-                & (pixels[:, 0] <= float(width - 1))
-                & (pixels[:, 1] >= 0.0)
-                & (pixels[:, 1] <= float(height - 1))
-            )
-            visible = np.zeros(term.sample_count, dtype=bool)
-            selected = np.flatnonzero(in_image)
-            if len(selected):
-                visible[selected] = _sparse_visibility(
-                    pixels[selected],
-                    projected.depth[selected],
-                    vertex_projection.pixel_xy,
-                    vertex_projection.depth,
-                    candidate.faces,
-                    prepared.config,
-                )
-            result[term.name] = _CurrentObjectiveImageProjection(
-                model_points=model_points,
-                pixel_xy=pixels,
-                source_vertex_indices=indices,
-                source_weights=weights,
-                source_labels=labels,
-                depth=np.asarray(projected.depth, dtype=np.float64),
-                visible=visible,
-            )
-    if tuple(result) != _OBJECTIVE_IMAGE_TERM_NAMES:
-        raise ValueError(
-            "current objective projection did not fill canonical slot order"
-        )
-    return MappingProxyType(result)
+@dataclass(frozen=True)
+class _ObjectiveCoreEvaluation:
+    candidate_vertices: np.ndarray
+    residuals: np.ndarray
+    term_slices: Mapping[str, slice]
+    term_residuals: Mapping[str, np.ndarray]
+    soft_terms: Mapping[str, _SoftTermEvaluation]
+    effective_counts: Mapping[str, int]
+    sample_counts: Mapping[str, int]
+    confidence_sums: Mapping[str, float]
+    per_view_effective_counts: Mapping[str, int]
+    per_view_sample_counts: Mapping[str, int]
+    per_view_confidence_sums: Mapping[str, float]
+    symmetry_factors: Mapping[str, float]
 
 
 def _soft_l1_cost(residuals: np.ndarray, f_scale: float) -> float:
@@ -3160,19 +3579,25 @@ def _symmetry_factor(
     )
 
 
-def evaluate_multiview_nasal_objective(
+def _objective_config(
+    config: Optional[MultiviewNasalObjectiveConfig],
+) -> MultiviewNasalObjectiveConfig:
+    limits = MultiviewNasalObjectiveConfig() if config is None else config
+    if not isinstance(limits, MultiviewNasalObjectiveConfig):
+        raise ValueError("config must be a MultiviewNasalObjectiveConfig")
+    return limits
+
+
+def _evaluate_multiview_nasal_objective_core(
     theta: np.ndarray,
     context: MultiviewNasalObjectiveContext,
-    config: Optional[MultiviewNasalObjectiveConfig] = None,
-) -> MultiviewNasalObjectiveResult:
-    """Evaluate one fixed-length unified multiview nasal residual vector."""
+    config: Optional[MultiviewNasalObjectiveConfig],
+) -> _ObjectiveCoreEvaluation:
     if not isinstance(context, MultiviewNasalObjectiveContext):
         raise ValueError(
             "context must be a MultiviewNasalObjectiveContext"
         )
-    limits = MultiviewNasalObjectiveConfig() if config is None else config
-    if not isinstance(limits, MultiviewNasalObjectiveConfig):
-        raise ValueError("config must be a MultiviewNasalObjectiveConfig")
+    limits = _objective_config(config)
     values = _validate_coefficients(
         "theta",
         theta,
@@ -3200,13 +3625,22 @@ def evaluate_multiview_nasal_objective(
         ).astype(candidate_vertices.dtype, copy=False)
     if not np.isfinite(candidate_vertices).all():
         raise ValueError("candidate vertices are non-finite")
-    candidate = CandidateNasalMesh._from_validated(
-        candidate_vertices,
-        context.projection_context.faces,
-        reuse_faces=True,
-    )
 
-    current_slots = _project_current_objective_slots(candidate, context)
+    prepared = context.projection_context
+    support_indices = context.depth_support_vertex_indices
+    support_vertices = candidate_vertices[support_indices]
+    projected_by_view = {}
+    raw_depth_by_view = {}
+    for semantic_view, view in zip(NASAL_VIEWS, prepared.views):
+        pixels, raw_depth, _positive_depth = _smooth_project_support(
+            support_vertices,
+            view,
+            float(prepared.config.min_depth),
+            float(limits.depth_softplus_scale),
+        )
+        projected_by_view[semantic_view] = pixels
+        raw_depth_by_view[semantic_view] = raw_depth
+
     confidence_sums = {
         term.name: float(np.sum(term.confidence))
         for term in context.image_terms
@@ -3255,13 +3689,26 @@ def evaluate_multiview_nasal_objective(
         for semantic_view in NASAL_VIEWS
     }
     image_residuals = {}
+    soft_terms = {}
     reliability = {}
     for term in context.image_terms:
-        current = current_slots[term.name]
-        distances = _sample_unsigned_distance_extended(
-            term.distance_field,
-            current.pixel_xy,
+        local_indices = np.searchsorted(
+            support_indices,
+            term.support_vertex_indices,
         )
+        support_pixels = projected_by_view[term.semantic_view][local_indices]
+        support_raw_depth = raw_depth_by_view[
+            term.semantic_view
+        ][local_indices]
+        slot_pixels, slot_depth, weights = _soft_profile_slots(
+            support_pixels,
+            support_raw_depth,
+            term.slot_y,
+            term.direction_sign,
+            float(limits.profile_vertical_sigma_px),
+            float(limits.profile_softmax_temperature_px),
+        )
+        distances = _point_to_polyline_distance(slot_pixels, term)
         term_weight = (
             float(limits.front_image_weight)
             if term.semantic_view == "front"
@@ -3270,78 +3717,34 @@ def evaluate_multiview_nasal_objective(
         view_confidence_sum = per_view_confidence_sums[
             term.semantic_view
         ]
-        if view_confidence_sum == 0.0:
-            residual = np.zeros(term.sample_count, dtype=np.float64)
-        else:
-            residual = (
-                term_weight
-                * np.sqrt(term.confidence)
-                * distances
-                / np.sqrt(view_confidence_sum)
-            )
+        residual = _normalized_image_residual(
+            distances,
+            term.confidence,
+            view_confidence_sum,
+            term_weight,
+        )
         image_residuals[term.name] = residual
+        soft_terms[term.name] = _SoftTermEvaluation(
+            pixel_xy=slot_pixels,
+            depth=slot_depth,
+            soft_weights=weights,
+        )
         reliability[term.name] = (
             confidence_sums[term.name] / float(term.sample_count)
         )
 
-    per_view = []
-    for semantic_view in NASAL_VIEWS:
-        matching_terms = terms_by_view[semantic_view]
-        model_points = np.vstack(
-            [current_slots[term.name].model_points for term in matching_terms]
-        )
-        pixels = np.vstack(
-            [current_slots[term.name].pixel_xy for term in matching_terms]
-        )
-        depth = np.concatenate(
-            [current_slots[term.name].depth for term in matching_terms]
-        )
-        confidence = np.concatenate(
-            [term.confidence for term in matching_terms]
-        )
-        indices = np.vstack(
-            [
-                current_slots[term.name].source_vertex_indices
-                for term in matching_terms
-            ]
-        )
-        weights = np.vstack(
-            [
-                current_slots[term.name].source_weights
-                for term in matching_terms
-            ]
-        )
-        labels = tuple(
-            label
-            for term in matching_terms
-            for label in current_slots[term.name].source_labels
-        )
-        boundaries = tuple(
-            term.boundary_name
-            for term in matching_terms
-            for _ in range(term.sample_count)
-        )
-        visible = np.concatenate(
-            [current_slots[term.name].visible for term in matching_terms]
-        )
-        per_view.append(
-            ProjectedNasalSamples._from_canonical_slots(
-                semantic_view=semantic_view,
-                pixel_xy=pixels,
-                model_points=model_points,
-                source_vertex_indices=indices,
-                source_weights=weights,
-                confidence=confidence,
-                source_labels=labels,
-                boundary_names=boundaries,
-                visible=visible,
-                depth=depth,
+    raw_depths = np.concatenate(
+        [raw_depth_by_view[view] for view in NASAL_VIEWS]
+    )
+    depth_barrier = (
+        float(limits.depth_barrier_weight)
+        * _stable_softplus(
+            (
+                float(prepared.config.min_depth) - raw_depths
             )
+            / float(limits.depth_barrier_scale)
         )
-    projection = MultiviewNasalProjection._from_prepared(
-        candidate,
-        tuple(per_view),
-        context.projection_context,
+        / np.sqrt(float(len(raw_depths)))
     )
 
     flame_prior = (
@@ -3357,7 +3760,7 @@ def evaluate_multiview_nasal_objective(
             dtype=np.float64,
         )
     )
-    displacement = candidate.vertices - context.baseline_vertices
+    displacement = candidate_vertices - context.baseline_vertices
     neighbor_sums = np.add.reduceat(
         displacement[context.smoothness_neighbors],
         context.smoothness_neighbor_offsets[:-1],
@@ -3400,6 +3803,7 @@ def evaluate_multiview_nasal_objective(
     named_residuals = dict(image_residuals)
     named_residuals.update(
         {
+            "projection_depth_barrier": depth_barrier,
             "flame_prior": flame_prior,
             "semantic_prior": semantic_prior,
             "surface_smoothness": smoothness,
@@ -3415,6 +3819,74 @@ def evaluate_multiview_nasal_objective(
         term_slices[name] = slice(cursor, cursor + len(residual_array))
         cursor += len(residual_array)
     residual_vector = np.concatenate(residual_parts)
+    return _ObjectiveCoreEvaluation(
+        candidate_vertices=candidate_vertices,
+        residuals=residual_vector,
+        term_slices=MappingProxyType(term_slices),
+        term_residuals=MappingProxyType(named_residuals),
+        soft_terms=MappingProxyType(soft_terms),
+        effective_counts=MappingProxyType(effective_counts),
+        sample_counts=MappingProxyType(sample_counts),
+        confidence_sums=MappingProxyType(confidence_sums),
+        per_view_effective_counts=MappingProxyType(
+            per_view_effective_counts
+        ),
+        per_view_sample_counts=MappingProxyType(per_view_sample_counts),
+        per_view_confidence_sums=MappingProxyType(
+            per_view_confidence_sums
+        ),
+        symmetry_factors=MappingProxyType(symmetry_factors),
+    )
+
+
+def evaluate_multiview_nasal_objective_residuals(
+    theta: np.ndarray,
+    context: MultiviewNasalObjectiveContext,
+    config: Optional[MultiviewNasalObjectiveConfig] = None,
+) -> MultiviewNasalResidualEvaluation:
+    """Return the minimal immutable residual output for iterative solvers."""
+    core = _evaluate_multiview_nasal_objective_core(theta, context, config)
+    return MultiviewNasalResidualEvaluation(
+        residuals=core.residuals,
+        term_slices=core.term_slices,
+        term_residuals=core.term_residuals,
+    )
+
+
+def evaluate_multiview_nasal_objective(
+    theta: np.ndarray,
+    context: MultiviewNasalObjectiveContext,
+    config: Optional[MultiviewNasalObjectiveConfig] = None,
+) -> MultiviewNasalObjectiveResult:
+    """Evaluate unified residuals and construct immutable diagnostics."""
+    limits = _objective_config(config)
+    core = _evaluate_multiview_nasal_objective_core(theta, context, limits)
+    candidate = CandidateNasalMesh._from_validated(
+        core.candidate_vertices,
+        context.projection_context.faces,
+        reuse_faces=True,
+    )
+    soft_projection_terms = tuple(
+        SoftProfileNasalSlots(
+            name=term.name,
+            semantic_view=term.semantic_view,
+            boundary_name=term.boundary_name,
+            pixel_xy=core.soft_terms[term.name].pixel_xy,
+            depth=core.soft_terms[term.name].depth,
+            confidence=term.confidence,
+            target_slot_y=term.slot_y,
+            support_vertex_indices=term.support_vertex_indices,
+            soft_weights=core.soft_terms[term.name].soft_weights,
+            direction_sign=term.direction_sign,
+        )
+        for term in context.image_terms
+    )
+    projection = MultiviewNasalSoftProjection(
+        candidate_vertices=candidate.vertices,
+        per_term=soft_projection_terms,
+    )
+    named_residuals = core.term_residuals
+    term_slices = core.term_slices
     raw_costs = {
         name: float(0.5 * np.dot(residual, residual))
         for name, residual in named_residuals.items()
@@ -3433,17 +3905,17 @@ def evaluate_multiview_nasal_objective(
         "robust_costs": robust_costs,
         "total_raw_cost": total_raw,
         "total_robust_cost": total_robust,
-        "effective_observation_counts": effective_counts,
-        "sample_counts": sample_counts,
-        "effective_confidence_sums": confidence_sums,
+        "effective_observation_counts": core.effective_counts,
+        "sample_counts": core.sample_counts,
+        "effective_confidence_sums": core.confidence_sums,
         "per_view_effective_observation_counts": (
-            per_view_effective_counts
+            core.per_view_effective_counts
         ),
-        "per_view_sample_counts": per_view_sample_counts,
+        "per_view_sample_counts": core.per_view_sample_counts,
         "per_view_effective_confidence_sums": (
-            per_view_confidence_sums
+            core.per_view_confidence_sums
         ),
-        "symmetry_evidence_factors": symmetry_factors,
+        "symmetry_evidence_factors": core.symmetry_factors,
         "parameter_ordering": context.parameter_ordering,
         "term_slices": {
             name: (value.start, value.stop)
@@ -3463,12 +3935,24 @@ def evaluate_multiview_nasal_objective(
             limits.semantic_prior_standard_deviations
         ),
         "smoothness_edge_count": context.smoothness_edge_count,
+        "depth_support_vertex_count": len(
+            context.depth_support_vertex_indices
+        ),
+        "profile_vertical_sigma_px": float(
+            limits.profile_vertical_sigma_px
+        ),
+        "profile_softmax_temperature_px": float(
+            limits.profile_softmax_temperature_px
+        ),
+        "depth_softplus_scale": float(limits.depth_softplus_scale),
+        "depth_barrier_weight": float(limits.depth_barrier_weight),
+        "depth_barrier_scale": float(limits.depth_barrier_scale),
         "fixed_sampling_provenance": (
-            "current_candidate_midpoint_quantile_slots"
+            "continuous_soft_semantic_profile_midpoint_quantile_slots"
         ),
     }
     return MultiviewNasalObjectiveResult(
-        residuals=residual_vector,
+        residuals=core.residuals,
         term_slices=term_slices,
         term_residuals=named_residuals,
         raw_costs=raw_costs,
@@ -3477,17 +3961,17 @@ def evaluate_multiview_nasal_objective(
         total_robust_cost=total_robust,
         candidate=candidate,
         projection=projection,
-        effective_observation_counts=effective_counts,
-        sample_counts=sample_counts,
-        effective_confidence_sums=confidence_sums,
+        effective_observation_counts=core.effective_counts,
+        sample_counts=core.sample_counts,
+        effective_confidence_sums=core.confidence_sums,
         per_view_effective_observation_counts=(
-            per_view_effective_counts
+            core.per_view_effective_counts
         ),
-        per_view_sample_counts=per_view_sample_counts,
+        per_view_sample_counts=core.per_view_sample_counts,
         per_view_effective_confidence_sums=(
-            per_view_confidence_sums
+            core.per_view_confidence_sums
         ),
-        symmetry_evidence_factors=symmetry_factors,
+        symmetry_evidence_factors=core.symmetry_factors,
         parameter_ordering=context.parameter_ordering,
         robust_loss=limits.robust_loss,
         robust_f_scale=float(limits.robust_f_scale),
