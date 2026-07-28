@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Real
 from types import MappingProxyType
 from typing import Mapping, Optional, Sequence, Tuple
@@ -23,9 +23,13 @@ __all__ = [
     "CandidateNasalMesh",
     "MultiviewNasalProjection",
     "MultiviewNasalSamplingConfig",
+    "PreparedNasalProjectionContext",
     "ProjectedNasalSamples",
     "build_candidate_nasal_mesh",
+    "build_candidate_nasal_mesh_prepared",
+    "prepare_nasal_projection_context",
     "project_multiview_nasal_boundaries",
+    "project_multiview_nasal_boundaries_prepared",
 ]
 
 _REGION_NAMES = (
@@ -104,6 +108,143 @@ class MultiviewNasalSamplingConfig:
         _finite_real("barycentric_tolerance", self.barycentric_tolerance)
 
 
+@dataclass(frozen=True)
+class _PreparedViewTargetContract:
+    semantic_view: str
+    work_size: Tuple[int, int]
+    roi_work_xyxy: Tuple[int, int, int, int]
+    confidence: np.ndarray
+    target_names: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.semantic_view not in NASAL_VIEWS:
+            raise ValueError("prepared view semantic name is not canonical")
+        work_size = tuple(int(value) for value in self.work_size)
+        roi = tuple(int(value) for value in self.roi_work_xyxy)
+        if (
+            len(work_size) != 2
+            or min(work_size) < 1
+            or len(roi) != 4
+            or not (
+                0 <= roi[0] < roi[2] <= work_size[0]
+                and 0 <= roi[1] < roi[3] <= work_size[1]
+            )
+        ):
+            raise ValueError("prepared work size or ROI is invalid")
+        confidence = np.asarray(self.confidence, dtype=np.float64)
+        if confidence.shape != (work_size[1], work_size[0]):
+            raise ValueError("prepared confidence does not match work_size")
+        if not np.isfinite(confidence).all():
+            raise ValueError("prepared confidence must contain only finite values")
+        target_names = tuple(str(name) for name in self.target_names)
+        if not target_names or len(set(target_names)) != len(target_names):
+            raise ValueError("prepared target names must be non-empty and unique")
+        object.__setattr__(self, "work_size", work_size)
+        object.__setattr__(self, "roi_work_xyxy", roi)
+        object.__setattr__(
+            self,
+            "confidence",
+            _readonly_array(confidence, np.float64),
+        )
+        object.__setattr__(self, "target_names", target_names)
+
+
+@dataclass(frozen=True)
+class PreparedNasalProjectionContext:
+    """Deeply immutable static inputs reused by finite-difference probes."""
+
+    vertex_count: int
+    faces: np.ndarray
+    semantic_vectors: np.ndarray
+    support_mask: np.ndarray
+    protected_mask: np.ndarray
+    region_masks: Mapping[str, np.ndarray]
+    views: Tuple[ProjectionView, ...]
+    view_contracts: Tuple[_PreparedViewTargetContract, ...]
+    config: MultiviewNasalSamplingConfig
+    edge_vertices: np.ndarray = field(init=False)
+    edge_faces: np.ndarray = field(init=False)
+    front_loop_vertices: np.ndarray = field(init=False)
+    front_loop_offsets: np.ndarray = field(init=False)
+    front_loop_source_codes: np.ndarray = field(init=False)
+
+    def __post_init__(self) -> None:
+        vertex_count = int(self.vertex_count)
+        if vertex_count < 3:
+            raise ValueError("prepared vertex_count must be at least three")
+        faces = _validate_faces(self.faces, vertex_count)
+        vectors = _validate_basis_array(
+            "prepared semantic vectors",
+            self.semantic_vectors,
+            (len(NASAL_SEMANTIC_MODE_NAMES), vertex_count, 3),
+        )
+        support = np.asarray(self.support_mask)
+        protected = np.asarray(self.protected_mask)
+        for name, mask in (
+            ("support_mask", support),
+            ("protected_mask", protected),
+        ):
+            if mask.shape != (vertex_count,) or not np.issubdtype(
+                mask.dtype,
+                np.bool_,
+            ):
+                raise ValueError(f"prepared {name} must be boolean shape (V,)")
+        if np.any(support & protected):
+            raise ValueError("prepared support and protected masks must be disjoint")
+        regions = _snapshot_region_masks(self.region_masks, vertex_count)
+        canonical_views = _canonical_views(self.views)
+        contracts = tuple(self.view_contracts)
+        if (
+            len(contracts) != len(NASAL_VIEWS)
+            or not all(
+                isinstance(contract, _PreparedViewTargetContract)
+                for contract in contracts
+            )
+            or tuple(contract.semantic_view for contract in contracts)
+            != tuple(NASAL_VIEWS)
+        ):
+            raise ValueError(
+                "prepared view contracts must use canonical three-view order"
+            )
+        if not isinstance(self.config, MultiviewNasalSamplingConfig):
+            raise ValueError("prepared config must be MultiviewNasalSamplingConfig")
+
+        face_snapshot = _readonly_array(faces, faces.dtype)
+        edge_vertices, edge_faces = _build_edge_adjacency_arrays(face_snapshot)
+        loop_vertices, loop_offsets, loop_codes = _prepare_front_composite_loops(
+            face_snapshot,
+            edge_vertices,
+            edge_faces,
+            regions,
+            protected,
+        )
+        object.__setattr__(self, "vertex_count", vertex_count)
+        object.__setattr__(self, "faces", face_snapshot)
+        object.__setattr__(
+            self,
+            "semantic_vectors",
+            _readonly_array(vectors, np.float64),
+        )
+        object.__setattr__(self, "support_mask", _readonly_array(support, bool))
+        object.__setattr__(
+            self,
+            "protected_mask",
+            _readonly_array(protected, bool),
+        )
+        object.__setattr__(self, "region_masks", regions)
+        object.__setattr__(self, "views", canonical_views)
+        object.__setattr__(self, "view_contracts", contracts)
+        object.__setattr__(self, "edge_vertices", edge_vertices)
+        object.__setattr__(self, "edge_faces", edge_faces)
+        object.__setattr__(self, "front_loop_vertices", loop_vertices)
+        object.__setattr__(self, "front_loop_offsets", loop_offsets)
+        object.__setattr__(self, "front_loop_source_codes", loop_codes)
+
+    @property
+    def observation_target_names(self) -> Tuple[Tuple[str, ...], ...]:
+        return tuple(contract.target_names for contract in self.view_contracts)
+
+
 def _validate_vertices(value: np.ndarray) -> np.ndarray:
     vertices = np.asarray(value)
     if (
@@ -180,6 +321,36 @@ class CandidateNasalMesh:
             _readonly_array(vertices, vertices.dtype),
         )
         object.__setattr__(self, "faces", _readonly_array(faces, faces.dtype))
+
+    @classmethod
+    def _from_validated(
+        cls,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        *,
+        reuse_faces: bool,
+        reuse_vertices: bool = False,
+    ) -> "CandidateNasalMesh":
+        validated_vertices = _validate_vertices(vertices)
+        instance = object.__new__(cls)
+        object.__setattr__(
+            instance,
+            "vertices",
+            (
+                validated_vertices
+                if reuse_vertices
+                else _readonly_array(
+                    validated_vertices,
+                    validated_vertices.dtype,
+                )
+            ),
+        )
+        object.__setattr__(
+            instance,
+            "faces",
+            faces if reuse_faces else _readonly_array(faces, faces.dtype),
+        )
+        return instance
 
 
 def _validate_basis_array(
@@ -301,7 +472,68 @@ def build_candidate_nasal_mesh(
         candidate += semantic_displacement.astype(candidate.dtype, copy=False)
         if not np.isfinite(candidate).all():
             raise ValueError("candidate vertices are non-finite")
-    return CandidateNasalMesh(candidate, topology)
+    return CandidateNasalMesh._from_validated(
+        candidate,
+        topology,
+        reuse_faces=False,
+    )
+
+
+def build_candidate_nasal_mesh_prepared(
+    baseline_vertices: np.ndarray,
+    observable_flame,
+    prepared: PreparedNasalProjectionContext,
+    flame_coefficients: np.ndarray,
+    semantic_coefficients: np.ndarray,
+) -> CandidateNasalMesh:
+    """Build a candidate while reusing prepared topology and semantics."""
+    if not isinstance(prepared, PreparedNasalProjectionContext):
+        raise ValueError("prepared must be a PreparedNasalProjectionContext")
+    baseline = _validate_vertices(baseline_vertices)
+    if len(baseline) != prepared.vertex_count:
+        raise ValueError("baseline vertex count does not match prepared context")
+    flame_basis = _validate_basis_array(
+        "observable FLAME vertex_basis",
+        getattr(observable_flame, "vertex_basis", None),
+        (prepared.vertex_count, 3, None),
+    )
+    if hasattr(observable_flame, "retained_rank") and int(
+        observable_flame.retained_rank
+    ) != flame_basis.shape[2]:
+        raise ValueError(
+            "observable FLAME retained rank does not match vertex_basis"
+        )
+    flame_values = _validate_coefficients(
+        "FLAME",
+        flame_coefficients,
+        flame_basis.shape[2],
+    )
+    semantic_values = _validate_coefficients(
+        "semantic",
+        semantic_coefficients,
+        prepared.semantic_vectors.shape[0],
+    )
+    candidate = np.array(baseline, copy=True)
+    if np.any(flame_values) or np.any(semantic_values):
+        candidate += np.einsum(
+            "vcr,r->vc",
+            flame_basis,
+            flame_values,
+            optimize=True,
+        ).astype(candidate.dtype, copy=False)
+        candidate += np.einsum(
+            "mvc,m->vc",
+            prepared.semantic_vectors,
+            semantic_values,
+            optimize=True,
+        ).astype(candidate.dtype, copy=False)
+        if not np.isfinite(candidate).all():
+            raise ValueError("candidate vertices are non-finite")
+    return CandidateNasalMesh._from_validated(
+        candidate,
+        prepared.faces,
+        reuse_faces=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -434,6 +666,84 @@ def _snapshot_region_masks(
     return MappingProxyType(snapshots)
 
 
+def _validate_dynamic_projection(
+    vertices: np.ndarray,
+    views: Tuple[ProjectedNasalSamples, ...],
+    target_names: Tuple[Tuple[str, ...], ...],
+    region_masks: Mapping[str, np.ndarray],
+) -> None:
+    if (
+        len(views) != len(NASAL_VIEWS)
+        or not all(isinstance(value, ProjectedNasalSamples) for value in views)
+        or tuple(value.semantic_view for value in views) != tuple(NASAL_VIEWS)
+    ):
+        raise ValueError("per_view samples must use canonical three-view order")
+    if len(target_names) != len(NASAL_VIEWS) or any(
+        not names or len(set(names)) != len(names)
+        for names in target_names
+    ):
+        raise ValueError(
+            "observation_target_names must contain non-empty unique "
+            "targets for all three views"
+        )
+    for samples, allowed_targets in zip(views, target_names):
+        if not len(samples.pixel_xy):
+            raise ValueError(
+                f"{samples.semantic_view} sample collection must not be empty"
+            )
+        if (
+            np.any(samples.source_vertex_indices < 0)
+            or np.any(samples.source_vertex_indices >= len(vertices))
+        ):
+            raise ValueError(
+                f"{samples.semantic_view} source indices are out of range"
+            )
+        reconstructed = np.sum(
+            vertices[samples.source_vertex_indices]
+            * samples.source_weights[:, :, None],
+            axis=1,
+        )
+        if not np.allclose(
+            reconstructed,
+            samples.model_points,
+            atol=1e-10,
+            rtol=1e-10,
+        ):
+            raise ValueError(
+                f"{samples.semantic_view} provenance does not reconstruct "
+                "model_points"
+            )
+        unknown_targets = set(samples.boundary_names) - set(allowed_targets)
+        if unknown_targets:
+            raise ValueError(
+                f"{samples.semantic_view} boundary target is absent from "
+                "the corresponding observation: "
+                + ", ".join(sorted(unknown_targets))
+            )
+        for label, edge in zip(
+            samples.source_labels,
+            samples.source_vertex_indices,
+        ):
+            if not np.all(region_masks[label][edge]):
+                raise ValueError(
+                    f"{samples.semantic_view} source edge is not represented "
+                    f"by semantic region {label}"
+                )
+    front_samples = views[0]
+    for source_label, boundary_name in _FRONT_REGIONS:
+        contributed = any(
+            label == source_label and target == boundary_name
+            for label, target in zip(
+                front_samples.source_labels,
+                front_samples.boundary_names,
+            )
+        )
+        if not contributed:
+            raise ValueError(
+                f"mandatory front target {boundary_name} has no visible samples"
+            )
+
+
 @dataclass(frozen=True)
 class MultiviewNasalProjection:
     """Candidate geometry and ordered immutable samples for all fixed views."""
@@ -462,70 +772,12 @@ class MultiviewNasalProjection:
             tuple(str(name) for name in names)
             for names in self.observation_target_names
         )
-        if len(target_names) != len(NASAL_VIEWS) or any(
-            not names or len(set(names)) != len(names)
-            for names in target_names
-        ):
-            raise ValueError(
-                "observation_target_names must contain non-empty unique "
-                "targets for all three views"
-            )
-        for samples, allowed_targets in zip(views, target_names):
-            if not len(samples.pixel_xy):
-                raise ValueError(
-                    f"{samples.semantic_view} sample collection must not be empty"
-                )
-            if (
-                np.any(samples.source_vertex_indices < 0)
-                or np.any(samples.source_vertex_indices >= len(vertices))
-            ):
-                raise ValueError(
-                    f"{samples.semantic_view} source indices are out of range"
-                )
-            reconstructed = np.sum(
-                vertices[samples.source_vertex_indices]
-                * samples.source_weights[:, :, None],
-                axis=1,
-            )
-            if not np.allclose(
-                reconstructed,
-                samples.model_points,
-                atol=1e-10,
-                rtol=1e-10,
-            ):
-                raise ValueError(
-                    f"{samples.semantic_view} provenance does not reconstruct "
-                    "model_points"
-                )
-            unknown_targets = set(samples.boundary_names) - set(allowed_targets)
-            if unknown_targets:
-                raise ValueError(
-                    f"{samples.semantic_view} boundary target is absent from "
-                    "the corresponding observation: "
-                    + ", ".join(sorted(unknown_targets))
-                )
-            for label, edge in zip(
-                samples.source_labels,
-                samples.source_vertex_indices,
-            ):
-                if not np.all(region_masks[label][edge]):
-                    raise ValueError(
-                        f"{samples.semantic_view} source edge is not represented "
-                        f"by semantic region {label}"
-                    )
-        front_samples = views[0]
-        for source_label, boundary_name in _FRONT_REGIONS:
-            contributed = any(
-                label == source_label and target == boundary_name
-                for label, target in zip(
-                    front_samples.source_labels,
-                    front_samples.boundary_names,
-                )
-            )
-            if not contributed:
-                raise ValueError(
-                    f"mandatory front target {boundary_name} has no visible samples"
-                )
+        _validate_dynamic_projection(
+            vertices,
+            views,
+            target_names,
+            region_masks,
+        )
         object.__setattr__(
             self,
             "candidate_vertices",
@@ -543,6 +795,33 @@ class MultiviewNasalProjection:
             "semantic_region_masks",
             region_masks,
         )
+
+    @classmethod
+    def _from_prepared(
+        cls,
+        candidate: CandidateNasalMesh,
+        per_view: Tuple[ProjectedNasalSamples, ...],
+        prepared: PreparedNasalProjectionContext,
+    ) -> "MultiviewNasalProjection":
+        views = tuple(per_view)
+        target_names = prepared.observation_target_names
+        _validate_dynamic_projection(
+            candidate.vertices,
+            views,
+            target_names,
+            prepared.region_masks,
+        )
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "candidate_vertices", candidate.vertices)
+        object.__setattr__(instance, "faces", prepared.faces)
+        object.__setattr__(instance, "per_view", views)
+        object.__setattr__(instance, "observation_target_names", target_names)
+        object.__setattr__(
+            instance,
+            "semantic_region_masks",
+            prepared.region_masks,
+        )
+        return instance
 
     @property
     def by_view(self) -> Mapping[str, ProjectedNasalSamples]:
@@ -571,8 +850,14 @@ def _canonical_views(views: Sequence[ProjectionView]) -> Tuple[ProjectionView, .
     return values
 
 
-def _region_masks(semantic_basis, vertex_count: int) -> Mapping[str, np.ndarray]:
-    _semantic_vectors(semantic_basis, vertex_count)
+def _region_masks(
+    semantic_basis,
+    vertex_count: int,
+    *,
+    validate_semantic: bool = True,
+) -> Mapping[str, np.ndarray]:
+    if validate_semantic:
+        _semantic_vectors(semantic_basis, vertex_count)
     raw = getattr(semantic_basis, "region_masks", None)
     if not isinstance(raw, Mapping):
         raise ValueError("semantic basis region_masks must be a mapping")
@@ -601,19 +886,55 @@ def _region_masks(semantic_basis, vertex_count: int) -> Mapping[str, np.ndarray]
     return result
 
 
+def _build_edge_adjacency_arrays(
+    faces: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build lexicographically ordered manifold edge adjacency arrays."""
+    face_count = len(faces)
+    directed = np.vstack(
+        (
+            faces[:, (0, 1)],
+            faces[:, (1, 2)],
+            faces[:, (2, 0)],
+        )
+    ).astype(np.int64, copy=False)
+    face_indices = np.tile(np.arange(face_count, dtype=np.int64), 3)
+    undirected = np.sort(directed, axis=1)
+    order = np.lexsort((undirected[:, 1], undirected[:, 0]))
+    sorted_edges = undirected[order]
+    sorted_faces = face_indices[order]
+    starts = np.flatnonzero(
+        np.concatenate(
+            (
+                np.ones(1, dtype=bool),
+                np.any(sorted_edges[1:] != sorted_edges[:-1], axis=1),
+            )
+        )
+    )
+    ends = np.concatenate((starts[1:], np.array([len(sorted_edges)])))
+    counts = ends - starts
+    if np.any(counts > 2):
+        raise ValueError("faces contain non-manifold topology edges")
+    edge_vertices = sorted_edges[starts]
+    edge_faces = np.full((len(starts), 2), -1, dtype=np.int64)
+    edge_faces[:, 0] = sorted_faces[starts]
+    paired = counts == 2
+    edge_faces[paired, 1] = sorted_faces[starts[paired] + 1]
+    return (
+        _readonly_array(edge_vertices, np.int64),
+        _readonly_array(edge_faces, np.int64),
+    )
+
+
 def _edge_adjacency(faces: np.ndarray):
-    adjacency = {}
-    for face_index, triangle in enumerate(faces):
-        for first, second in (
-            (triangle[0], triangle[1]),
-            (triangle[1], triangle[2]),
-            (triangle[2], triangle[0]),
-        ):
-            edge = tuple(sorted((int(first), int(second))))
-            adjacency.setdefault(edge, []).append(face_index)
+    edge_vertices, edge_faces = _build_edge_adjacency_arrays(faces)
     return tuple(
-        (edge[0], edge[1], tuple(adjacency[edge]))
-        for edge in sorted(adjacency)
+        (
+            int(edge[0]),
+            int(edge[1]),
+            tuple(int(value) for value in incident if value >= 0),
+        )
+        for edge, incident in zip(edge_vertices, edge_faces)
     )
 
 
@@ -663,6 +984,95 @@ def _projected_loop_area(
     return 0.5 * float(
         np.sum(points[:, 0] * next_points[:, 1])
         - np.sum(points[:, 1] * next_points[:, 0])
+    )
+
+
+def _prepare_front_composite_loops(
+    faces: np.ndarray,
+    edge_vertices: np.ndarray,
+    edge_faces: np.ndarray,
+    regions: Mapping[str, np.ndarray],
+    protected_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    composite = (
+        regions["subject_left_nose_wing"]
+        | regions["subject_right_nose_wing"]
+        | regions["nose_tip"]
+        | regions["tip_alar_transition"]
+    ) & ~np.asarray(protected_mask, dtype=bool)
+    active_faces = np.all(composite[faces], axis=1)
+    incident_active = active_faces[edge_faces[:, 0]].astype(np.int8)
+    paired = edge_faces[:, 1] >= 0
+    incident_active[paired] += active_faces[
+        edge_faces[paired, 1]
+    ].astype(np.int8)
+    boundary_edges = edge_vertices[incident_active == 1]
+    loops = _closed_boundary_loops(
+        tuple((int(edge[0]), int(edge[1])) for edge in boundary_edges)
+    )
+    if not loops:
+        raise ValueError("no valid external composite nasal contour exists")
+
+    flattened = []
+    offsets = [0]
+    source_codes = []
+    for loop in loops:
+        flattened.extend(loop)
+        for index, first in enumerate(loop):
+            second = loop[(index + 1) % len(loop)]
+            represented = [
+                region_index
+                for region_index, (name, _target) in enumerate(_FRONT_REGIONS)
+                if regions[name][first] and regions[name][second]
+            ]
+            source_codes.append(represented[0] if len(represented) == 1 else -1)
+        offsets.append(len(flattened))
+    return (
+        _readonly_array(np.asarray(flattened, dtype=np.int64), np.int64),
+        _readonly_array(np.asarray(offsets, dtype=np.int64), np.int64),
+        _readonly_array(np.asarray(source_codes, dtype=np.int8), np.int8),
+    )
+
+
+def _prepared_front_edge_groups(
+    prepared: PreparedNasalProjectionContext,
+    projected_vertices: np.ndarray,
+):
+    loops = tuple(
+        tuple(
+            int(value)
+            for value in prepared.front_loop_vertices[
+                prepared.front_loop_offsets[index] :
+                prepared.front_loop_offsets[index + 1]
+            ]
+        )
+        for index in range(len(prepared.front_loop_offsets) - 1)
+    )
+    ranked = sorted(
+        range(len(loops)),
+        key=lambda index: (
+            -abs(_projected_loop_area(loops[index], projected_vertices)),
+            loops[index],
+        ),
+    )
+    loop_index = ranked[0]
+    loop = loops[loop_index]
+    start = int(prepared.front_loop_offsets[loop_index])
+    codes = prepared.front_loop_source_codes[start : start + len(loop)]
+    classified = {index: [] for index in range(len(_FRONT_REGIONS))}
+    for index, code in enumerate(codes):
+        if int(code) >= 0:
+            edge = tuple(
+                sorted((loop[index], loop[(index + 1) % len(loop)]))
+            )
+            classified[int(code)].append(edge)
+    return tuple(
+        (
+            source_label,
+            boundary_name,
+            tuple(sorted(classified[index])),
+        )
+        for index, (source_label, boundary_name) in enumerate(_FRONT_REGIONS)
     )
 
 
@@ -769,18 +1179,59 @@ def _silhouette_edges(
     return tuple(result)
 
 
+def _silhouette_edges_from_arrays(
+    edge_vertices: np.ndarray,
+    edge_faces: np.ndarray,
+    camera_points: np.ndarray,
+    faces: np.ndarray,
+) -> np.ndarray:
+    triangles = camera_points[faces]
+    normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    centroids = np.mean(triangles, axis=1)
+    facing_measure = np.einsum("fi,fi->f", normals, -centroids)
+    nondegenerate = np.linalg.norm(normals, axis=1) > 1e-12
+    front_facing = facing_measure > 0.0
+    first_faces = edge_faces[:, 0]
+    second_faces = edge_faces[:, 1]
+    boundary = second_faces < 0
+    keep = boundary & nondegenerate[first_faces] & front_facing[first_faces]
+    paired = ~boundary
+    paired_indices = np.flatnonzero(paired)
+    if len(paired_indices):
+        first = first_faces[paired_indices]
+        second = second_faces[paired_indices]
+        keep[paired_indices] = (
+            nondegenerate[first]
+            & nondegenerate[second]
+            & (front_facing[first] != front_facing[second])
+        )
+    return edge_vertices[keep]
+
+
 def _sample_edges(
     edges: Sequence[Tuple[int, int]],
     count: int,
     vertices: np.ndarray,
     projected_vertices: np.ndarray,
+    camera_depth: np.ndarray,
 ):
+    depth = np.asarray(camera_depth, dtype=np.float64)
+    if depth.shape != (len(vertices),) or not np.isfinite(depth).all():
+        raise ValueError("camera endpoint depths must be finite shape (V,)")
     usable = []
     for first, second in sorted(edges):
         length = float(
             np.linalg.norm(projected_vertices[second] - projected_vertices[first])
         )
-        if np.isfinite(length) and length > 1e-10:
+        if (
+            np.isfinite(length)
+            and length > 1e-10
+            and depth[first] > 0.0
+            and depth[second] > 0.0
+        ):
             usable.append((first, second, length))
     if not usable:
         return (
@@ -800,7 +1251,20 @@ def _sample_edges(
     weights = []
     for target, segment_index in zip(targets, segment_indices):
         first, second, length = usable[int(segment_index)]
-        alpha = float((target - starts[int(segment_index)]) / length)
+        screen_fraction = float(
+            (target - starts[int(segment_index)]) / length
+        )
+        denominator = (
+            (1.0 - screen_fraction) * depth[second]
+            + screen_fraction * depth[first]
+        )
+        if not np.isfinite(denominator) or denominator <= 0.0:
+            raise ValueError(
+                "perspective edge interpolation has invalid depth denominator"
+            )
+        alpha = float(screen_fraction * depth[first] / denominator)
+        if not np.isfinite(alpha) or alpha < 0.0 or alpha > 1.0:
+            raise ValueError("perspective edge interpolation is invalid")
         points.append(
             (1.0 - alpha) * vertices[first] + alpha * vertices[second]
         )
@@ -930,14 +1394,16 @@ def _project_edge_groups(
     view: ProjectionView,
     config: MultiviewNasalSamplingConfig,
     regions: Optional[Mapping[str, np.ndarray]] = None,
+    vertex_projection=None,
 ) -> ProjectedNasalSamples:
-    vertex_projection = project_points_strict(
-        candidate.vertices,
-        view.K,
-        view.R_model_to_camera,
-        view.t_model_to_camera,
-        epsilon=float(config.min_depth),
-    )
+    if vertex_projection is None:
+        vertex_projection = project_points_strict(
+            candidate.vertices,
+            view.K,
+            view.R_model_to_camera,
+            view.t_model_to_camera,
+            epsilon=float(config.min_depth),
+        )
     all_points = []
     all_indices = []
     all_weights = []
@@ -949,6 +1415,7 @@ def _project_edge_groups(
             count,
             candidate.vertices,
             vertex_projection.pixel_xy,
+            vertex_projection.depth,
         )
         all_points.append(points)
         all_indices.append(indices)
@@ -1137,17 +1604,15 @@ def _validate_work_intrinsics(
             )
 
 
-def project_multiview_nasal_boundaries(
-    candidate: CandidateNasalMesh,
+def prepare_nasal_projection_context(
+    faces: np.ndarray,
     semantic_basis,
     observations: NasalObservationBundle,
     views: Sequence[ProjectionView],
     *,
     config: Optional[MultiviewNasalSamplingConfig] = None,
-) -> MultiviewNasalProjection:
-    """Project semantic front boundaries and visible side silhouettes."""
-    if not isinstance(candidate, CandidateNasalMesh):
-        raise ValueError("candidate must be a CandidateNasalMesh")
+) -> PreparedNasalProjectionContext:
+    """Validate and snapshot all candidate-independent projection state."""
     if not isinstance(observations, NasalObservationBundle):
         raise ValueError("observations must be a NasalObservationBundle")
     limits = MultiviewNasalSamplingConfig() if config is None else config
@@ -1155,24 +1620,114 @@ def project_multiview_nasal_boundaries(
         raise ValueError("config must be a MultiviewNasalSamplingConfig")
     canonical_views = _canonical_views(views)
     _validate_work_intrinsics(observations, canonical_views)
-    regions = _region_masks(semantic_basis, len(candidate.vertices))
-    adjacency = _edge_adjacency(candidate.faces)
-    per_view = []
-    for semantic_view, view in zip(NASAL_VIEWS, canonical_views):
+
+    support = np.asarray(getattr(semantic_basis, "support_mask", None))
+    if support.ndim != 1 or len(support) < 3 or not np.issubdtype(
+        support.dtype,
+        np.bool_,
+    ):
+        raise ValueError("semantic basis support_mask must be boolean shape (V,)")
+    vertex_count = len(support)
+    semantic_vectors = _semantic_vectors(semantic_basis, vertex_count)
+    regions = _region_masks(
+        semantic_basis,
+        vertex_count,
+        validate_semantic=False,
+    )
+    protected = np.asarray(semantic_basis.protected_mask, dtype=bool)
+
+    view_snapshots = tuple(
+        ProjectionView(
+            view.name,
+            view.K,
+            view.R_model_to_camera,
+            view.t_model_to_camera,
+        )
+        for view in canonical_views
+    )
+    contracts = []
+    for semantic_view in NASAL_VIEWS:
         observation = observations.by_view[semantic_view]
-        if semantic_view == "front":
-            vertex_projection = project_points_strict(
-                candidate.vertices,
-                view.K,
-                view.R_model_to_camera,
-                view.t_model_to_camera,
-                epsilon=float(limits.min_depth),
+        target_names = tuple(sorted(str(name) for name in observation.distance_fields))
+        mandatory_targets = (
+            {"subject-left-alar", "subject-right-alar"}
+            if semantic_view == "front"
+            else {"nasal-profile"}
+        )
+        missing = mandatory_targets - set(target_names)
+        if missing:
+            raise ValueError(
+                f"{semantic_view} observation is missing mandatory targets: "
+                + ", ".join(sorted(missing))
             )
-            front_groups = _front_external_edge_groups(
-                adjacency,
-                candidate.faces,
-                regions,
-                np.asarray(semantic_basis.protected_mask, dtype=bool),
+        contracts.append(
+            _PreparedViewTargetContract(
+                semantic_view=semantic_view,
+                work_size=tuple(observation.work_size),
+                roi_work_xyxy=tuple(observation.roi_work_xyxy),
+                confidence=observation.confidence,
+                target_names=target_names,
+            )
+        )
+    limits_snapshot = MultiviewNasalSamplingConfig(
+        front_samples_per_region=int(limits.front_samples_per_region),
+        side_samples_per_view=int(limits.side_samples_per_view),
+        min_depth=float(limits.min_depth),
+        visibility_relative_tolerance=float(
+            limits.visibility_relative_tolerance
+        ),
+        visibility_absolute_tolerance=float(
+            limits.visibility_absolute_tolerance
+        ),
+        barycentric_tolerance=float(limits.barycentric_tolerance),
+    )
+    return PreparedNasalProjectionContext(
+        vertex_count=vertex_count,
+        faces=faces,
+        semantic_vectors=semantic_vectors,
+        support_mask=support,
+        protected_mask=protected,
+        region_masks=regions,
+        views=view_snapshots,
+        view_contracts=tuple(contracts),
+        config=limits_snapshot,
+    )
+
+
+def project_multiview_nasal_boundaries_prepared(
+    candidate: CandidateNasalMesh,
+    prepared: PreparedNasalProjectionContext,
+) -> MultiviewNasalProjection:
+    """Project one candidate using previously validated static context."""
+    if not isinstance(candidate, CandidateNasalMesh):
+        raise ValueError("candidate must be a CandidateNasalMesh")
+    if not isinstance(prepared, PreparedNasalProjectionContext):
+        raise ValueError("prepared must be a PreparedNasalProjectionContext")
+    if len(candidate.vertices) != prepared.vertex_count:
+        raise ValueError("candidate vertex count does not match prepared context")
+    if candidate.faces is not prepared.faces:
+        raise ValueError(
+            "prepared projection requires candidate faces from the same context"
+        )
+
+    per_view = []
+    regions = prepared.region_masks
+    limits = prepared.config
+    for semantic_view, view, observation in zip(
+        NASAL_VIEWS,
+        prepared.views,
+        prepared.view_contracts,
+    ):
+        vertex_projection = project_points_strict(
+            candidate.vertices,
+            view.K,
+            view.R_model_to_camera,
+            view.t_model_to_camera,
+            epsilon=float(limits.min_depth),
+        )
+        if semantic_view == "front":
+            front_groups = _prepared_front_edge_groups(
+                prepared,
                 vertex_projection.pixel_xy,
             )
             edge_groups = [
@@ -1185,20 +1740,14 @@ def project_multiview_nasal_boundaries(
                 for source_label, boundary_name, edges in front_groups
             ]
         else:
-            vertex_projection = project_points_strict(
-                candidate.vertices,
-                view.K,
-                view.R_model_to_camera,
-                view.t_model_to_camera,
-                epsilon=float(limits.min_depth),
-            )
-            silhouettes = _silhouette_edges(
-                adjacency,
+            silhouettes = _silhouette_edges_from_arrays(
+                prepared.edge_vertices,
+                prepared.edge_faces,
                 vertex_projection.camera_points,
-                candidate.faces,
+                prepared.faces,
             )
             nasal_profile = (
-                np.asarray(semantic_basis.support_mask, dtype=bool)
+                prepared.support_mask
                 & (
                     regions["nose_tip"]
                     | regions["tip_alar_transition"]
@@ -1207,7 +1756,7 @@ def project_multiview_nasal_boundaries(
                 )
             )
             restricted = tuple(
-                edge
+                (int(edge[0]), int(edge[1]))
                 for edge in silhouettes
                 if nasal_profile[edge[0]] and nasal_profile[edge[1]]
             )
@@ -1238,15 +1787,41 @@ def project_multiview_nasal_boundaries(
             view,
             limits,
             regions,
+            vertex_projection,
         )
         per_view.append(samples)
-    return MultiviewNasalProjection(
-        candidate_vertices=candidate.vertices,
-        faces=candidate.faces,
-        per_view=tuple(per_view),
-        observation_target_names=tuple(
-            tuple(sorted(observations.by_view[name].distance_fields))
-            for name in NASAL_VIEWS
-        ),
-        semantic_region_masks=regions,
+    return MultiviewNasalProjection._from_prepared(
+        candidate,
+        tuple(per_view),
+        prepared,
+    )
+
+
+def project_multiview_nasal_boundaries(
+    candidate: CandidateNasalMesh,
+    semantic_basis,
+    observations: NasalObservationBundle,
+    views: Sequence[ProjectionView],
+    *,
+    config: Optional[MultiviewNasalSamplingConfig] = None,
+) -> MultiviewNasalProjection:
+    """Prepare once and project semantic front and visible side boundaries."""
+    if not isinstance(candidate, CandidateNasalMesh):
+        raise ValueError("candidate must be a CandidateNasalMesh")
+    prepared = prepare_nasal_projection_context(
+        candidate.faces,
+        semantic_basis,
+        observations,
+        views,
+        config=config,
+    )
+    prepared_candidate = CandidateNasalMesh._from_validated(
+        candidate.vertices,
+        prepared.faces,
+        reuse_faces=True,
+        reuse_vertices=True,
+    )
+    return project_multiview_nasal_boundaries_prepared(
+        prepared_candidate,
+        prepared,
     )

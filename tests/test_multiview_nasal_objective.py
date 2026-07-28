@@ -8,19 +8,25 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import src.geometry.multiview_nasal_objective as nasal_objective
 from src.appearance.projective_sampling import project_points_strict
 from src.cross_view_geometry import Camera, scale_intrinsics
 from src.geometry.multiview_nasal_objective import (
     MultiviewNasalProjection,
     MultiviewNasalSamplingConfig,
+    PreparedNasalProjectionContext,
     ProjectedNasalSamples,
     _edge_adjacency,
     _external_region_boundary_edges,
     _front_external_edge_groups,
     _silhouette_edges,
+    _sample_edges,
     _sparse_visibility,
     build_candidate_nasal_mesh,
+    build_candidate_nasal_mesh_prepared,
+    prepare_nasal_projection_context,
     project_multiview_nasal_boundaries,
+    project_multiview_nasal_boundaries_prepared,
 )
 from src.geometry.nasal_observations import (
     NasalObservationBundle,
@@ -939,6 +945,151 @@ def _reachable_arrays(value, seen=None):
             for array in _reachable_arrays(item, visited)
         ]
     return []
+
+
+def test_prepared_context_performs_static_work_once_for_multiple_evaluations(
+    monkeypatch,
+):
+    vertices, faces = _mesh()
+    observable, semantic = _bases(len(vertices))
+    K = np.array(
+        [[40.0, 0.0, 50.0], [0.0, 42.0, 50.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    observations = _observations(K)
+    views = _views(K)
+    calls = {
+        "_validate_faces": 0,
+        "_semantic_vectors": 0,
+        "_validate_work_intrinsics": 0,
+        "_build_edge_adjacency_arrays": 0,
+        "_prepare_front_composite_loops": 0,
+    }
+
+    for name in calls:
+        original = getattr(nasal_objective, name)
+
+        def counted(*args, _name=name, _original=original, **kwargs):
+            calls[_name] += 1
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(nasal_objective, name, counted)
+
+    prepared = prepare_nasal_projection_context(
+        faces,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    static_calls = calls.copy()
+    assert static_calls == {name: 1 for name in calls}
+
+    results = []
+    for semantic_scale in (0.0, 0.25):
+        semantic_coefficients = np.zeros(8, dtype=np.float64)
+        semantic_coefficients[0] = semantic_scale
+        candidate = build_candidate_nasal_mesh_prepared(
+            vertices,
+            observable,
+            prepared,
+            np.zeros(2, dtype=np.float64),
+            semantic_coefficients,
+        )
+        result = project_multiview_nasal_boundaries_prepared(
+            candidate,
+            prepared,
+        )
+        assert candidate.faces is prepared.faces
+        assert result.faces is prepared.faces
+        results.append(result)
+
+    assert calls == static_calls
+    assert not np.array_equal(
+        results[0].candidate_vertices,
+        results[1].candidate_vertices,
+    )
+    assert prepared.edge_vertices.ndim == 2
+    assert prepared.edge_faces.ndim == 2
+    assert prepared.front_loop_offsets.ndim == 1
+    for array in _reachable_arrays(prepared):
+        assert not array.flags.writeable
+        with pytest.raises(ValueError, match="WRITEABLE|writeable"):
+            array.setflags(write=True)
+
+
+def test_perspective_correct_slanted_edge_has_uniform_projected_samples():
+    vertices = np.array(
+        [
+            [-1.0, 0.0, 2.0],
+            [1.0, 0.0, 10.0],
+            [0.0, 1.0, 4.0],
+        ],
+        dtype=np.float64,
+    )
+    K = np.array(
+        [[100.0, 0.0, 100.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    projection = project_points_strict(
+        vertices,
+        K,
+        np.eye(3, dtype=np.float64),
+        np.zeros(3, dtype=np.float64),
+    )
+    count = 8
+
+    points, indices, weights = _sample_edges(
+        ((0, 1),),
+        count,
+        vertices,
+        projection.pixel_xy,
+        projection.depth,
+    )
+    sampled = project_points_strict(
+        points,
+        K,
+        np.eye(3, dtype=np.float64),
+        np.zeros(3, dtype=np.float64),
+    )
+    screen_fraction = (np.arange(count, dtype=np.float64) + 0.5) / count
+    expected_pixels = (
+        (1.0 - screen_fraction[:, None]) * projection.pixel_xy[0]
+        + screen_fraction[:, None] * projection.pixel_xy[1]
+    )
+    expected_alpha = (
+        screen_fraction * projection.depth[0]
+        / (
+            (1.0 - screen_fraction) * projection.depth[1]
+            + screen_fraction * projection.depth[0]
+        )
+    )
+
+    analytical_pixels = np.column_stack(
+        (
+            K[0, 0] * points[:, 0] / points[:, 2] + K[0, 2],
+            K[1, 1] * points[:, 1] / points[:, 2] + K[1, 2],
+        )
+    )
+    np.testing.assert_allclose(analytical_pixels, expected_pixels, atol=1e-12)
+    np.testing.assert_allclose(
+        sampled.pixel_xy,
+        expected_pixels,
+        atol=1e-5,
+        rtol=0.0,
+    )
+    np.testing.assert_allclose(
+        np.diff(analytical_pixels[:, 0]),
+        np.full(count - 1, 7.5),
+        atol=1e-12,
+    )
+    np.testing.assert_array_equal(indices, np.tile((0, 1), (count, 1)))
+    np.testing.assert_allclose(weights[:, 1], expected_alpha, atol=1e-12)
+    np.testing.assert_allclose(
+        points,
+        np.sum(vertices[indices] * weights[:, :, None], axis=1),
+        atol=1e-12,
+    )
 
 
 def test_every_reachable_result_array_is_deeply_immutable_and_isolated():
