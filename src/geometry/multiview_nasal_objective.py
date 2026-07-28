@@ -4118,6 +4118,45 @@ def _soft_minimum_orientation_ratio(
     )
 
 
+def _surface_orientation_barrier_residuals(
+    signed_area_ratios: np.ndarray,
+    config: MultiviewNasalObjectiveConfig,
+) -> Tuple[np.ndarray, float]:
+    """Build per-face residuals plus exact-min global feasibility."""
+    values = np.asarray(signed_area_ratios, dtype=np.float64)
+    actual_minimum = float(np.min(values))
+    per_face = (
+        float(config.orientation_barrier_weight)
+        * _stable_softplus(
+            (
+                float(config.orientation_barrier_margin)
+                - values
+            )
+            / float(config.orientation_barrier_scale)
+        )
+        / np.sqrt(float(len(values)))
+    )
+    global_feasibility = (
+        float(config.orientation_barrier_weight)
+        * _stable_softplus(
+            np.asarray(
+                [
+                    (
+                        float(config.orientation_barrier_margin)
+                        - actual_minimum
+                    )
+                    / float(config.orientation_barrier_scale)
+                ],
+                dtype=np.float64,
+            )
+        )
+    )
+    return (
+        np.concatenate((per_face, global_feasibility)),
+        actual_minimum,
+    )
+
+
 @dataclass(frozen=True)
 class _SoftTermEvaluation:
     pixel_xy: np.ndarray
@@ -4143,7 +4182,7 @@ class _ObjectiveCoreEvaluation:
     symmetry_factors: Mapping[str, float]
     soft_minimum_depths: np.ndarray
     orientation_signed_area_ratios: np.ndarray
-    orientation_soft_minimum_signed_area_ratio: float
+    orientation_actual_minimum_signed_area_ratio: float
 
 
 def _soft_l1_cost(residuals: np.ndarray, f_scale: float) -> float:
@@ -4220,10 +4259,6 @@ def _evaluate_multiview_nasal_objective_core(
     orientation_ratios = _orientation_signed_area_ratios(
         candidate_vertices,
         context,
-    )
-    orientation_soft_minimum = _soft_minimum_orientation_ratio(
-        orientation_ratios,
-        float(limits.orientation_barrier_softmin_temperature),
     )
 
     prepared = context.projection_context
@@ -4414,34 +4449,12 @@ def _evaluate_multiview_nasal_objective_core(
             * np.sqrt(float(context.smoothness_edge_count))
         )
     )
-    orientation_per_face = (
-        float(limits.orientation_barrier_weight)
-        * _stable_softplus(
-            (
-                float(limits.orientation_barrier_margin)
-                - orientation_ratios
-            )
-            / float(limits.orientation_barrier_scale)
-        )
-        / np.sqrt(float(context.orientation_active_face_count))
-    )
-    orientation_global = (
-        float(limits.orientation_barrier_weight)
-        * _stable_softplus(
-            np.asarray(
-                [
-                    (
-                        float(limits.orientation_barrier_margin)
-                        - orientation_soft_minimum
-                    )
-                    / float(limits.orientation_barrier_scale)
-                ],
-                dtype=np.float64,
-            )
-        )
-    )
-    orientation_barrier = np.concatenate(
-        (orientation_per_face, orientation_global)
+    (
+        orientation_barrier,
+        orientation_actual_minimum,
+    ) = _surface_orientation_barrier_residuals(
+        orientation_ratios,
+        limits,
     )
     width_factor = _symmetry_factor(
         reliability["front_subject_left_alar"],
@@ -4501,8 +4514,8 @@ def _evaluate_multiview_nasal_objective_core(
         symmetry_factors=MappingProxyType(symmetry_factors),
         soft_minimum_depths=soft_minimum_depths,
         orientation_signed_area_ratios=orientation_ratios,
-        orientation_soft_minimum_signed_area_ratio=(
-            orientation_soft_minimum
+        orientation_actual_minimum_signed_area_ratio=(
+            orientation_actual_minimum
         ),
     )
 
@@ -4585,6 +4598,12 @@ def evaluate_multiview_nasal_objective(
         orientation_ratios,
         (0.01, 0.05, 0.50, 0.95, 0.99),
     )
+    orientation_diagnostic_soft_aggregate = (
+        _soft_minimum_orientation_ratio(
+            orientation_ratios,
+            float(limits.orientation_barrier_softmin_temperature),
+        )
+    )
     report_data = {
         "raw_costs": raw_costs,
         "robust_costs": robust_costs,
@@ -4636,8 +4655,14 @@ def evaluate_multiview_nasal_objective(
             "total_mesh_face_count": len(
                 context.projection_context.faces
             ),
-            "min_signed_area_ratio": float(
-                np.min(orientation_ratios)
+            "min_signed_area_ratio": (
+                core.orientation_actual_minimum_signed_area_ratio
+            ),
+            "actual_min_signed_area_ratio": (
+                core.orientation_actual_minimum_signed_area_ratio
+            ),
+            "global_feasibility_signed_area_ratio": (
+                core.orientation_actual_minimum_signed_area_ratio
             ),
             "max_signed_area_ratio": float(
                 np.max(orientation_ratios)
@@ -4649,8 +4674,8 @@ def evaluate_multiview_nasal_objective(
                 "p95": float(orientation_quantiles[3]),
                 "p99": float(orientation_quantiles[4]),
             },
-            "soft_min_signed_area_ratio": float(
-                core.orientation_soft_minimum_signed_area_ratio
+            "diagnostic_normalized_log_mean_exp_signed_area_ratio": (
+                orientation_diagnostic_soft_aggregate
             ),
             "nonpositive_face_count": int(
                 np.count_nonzero(orientation_ratios <= 0.0)

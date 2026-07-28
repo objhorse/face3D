@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -872,6 +873,7 @@ def test_runner_publish_failure_restores_report_and_rolls_back_candidates(
             destination == output / "nasal_shape_compare.html"
             and not failed
         ):
+            assert report_path.read_bytes() == previous_report
             failed = True
             raise OSError("synthetic mid-publish failure")
         return original_replace(self, target)
@@ -1034,16 +1036,22 @@ def test_post_publish_source_check_rolls_back_success_artifacts(
         '{"status":"success"}',
         encoding="utf-8",
     )
+    previous_report = b'{"status":"failed","previous":"restore me"}\n'
+    published_report = output / "nasal_fit_report.json"
+    published_report.write_bytes(previous_report)
     expected_hashes = runner.file_tree_hashes(source)
-    original_replace = Path.replace
+    original_replace = os.replace
 
-    def replace_and_mutate_source(self, target):
-        result = original_replace(self, target)
-        if Path(target) == output / "nasal_fit_report.json":
+    def replace_and_mutate_source(source_path, target):
+        result = original_replace(source_path, target)
+        if (
+            Path(source_path) == staging / "nasal_fit_report.json"
+            and Path(target) == published_report
+        ):
             (source / "locked.txt").write_text("changed", encoding="utf-8")
         return result
 
-    monkeypatch.setattr(Path, "replace", replace_and_mutate_source)
+    monkeypatch.setattr(os, "replace", replace_and_mutate_source)
 
     with pytest.raises(RuntimeError, match="source files changed"):
         runner._publish_staging(
@@ -1057,12 +1065,12 @@ def test_post_publish_source_check_rolls_back_success_artifacts(
     assert not (output / "textures").exists()
     assert not (output / "nasal_shape_compare.html").exists()
     assert not (output / "debug" / "nasal_geometry").exists()
-    assert not (output / "nasal_fit_report.json").exists()
+    assert published_report.read_bytes() == previous_report
     assert (staging / "meshes" / "face_same_texture.glb").is_file()
     assert (staging / "textures" / "albedo_baseline_locked.png").is_file()
     assert (staging / "nasal_shape_compare.html").is_file()
     assert (staging / "debug" / "nasal_geometry" / "index.html").is_file()
-    assert (staging / "nasal_fit_report.json").is_file()
+    assert not (staging / "nasal_fit_report.json").exists()
 
 
 def test_runner_source_mutation_before_publish_leaves_only_failure_report(

@@ -2149,9 +2149,24 @@ def test_surface_orientation_barrier_is_near_zero_at_baseline_and_strong_on_flip
     assert baseline.report_data["surface_orientation_barrier"][
         "min_signed_area_ratio"
     ] == pytest.approx(1.0, abs=1e-14)
+    baseline_orientation = baseline.report_data[
+        "surface_orientation_barrier"
+    ]
+    assert baseline_orientation[
+        "global_feasibility_signed_area_ratio"
+    ] == baseline_orientation["actual_min_signed_area_ratio"]
     assert flipped.report_data["surface_orientation_barrier"][
         "min_signed_area_ratio"
     ] < 0.0
+    flipped_orientation = flipped.report_data[
+        "surface_orientation_barrier"
+    ]
+    assert flipped_orientation[
+        "global_feasibility_signed_area_ratio"
+    ] == flipped_orientation["actual_min_signed_area_ratio"]
+    assert flipped_orientation[
+        "diagnostic_normalized_log_mean_exp_signed_area_ratio"
+    ] >= flipped_orientation["actual_min_signed_area_ratio"]
     assert np.linalg.norm(
         flipped.term_residuals["surface_orientation_barrier"]
     ) > 50.0
@@ -2291,6 +2306,61 @@ def test_orientation_soft_minimum_is_normalized_for_equal_face_ratios():
         temperature,
     )
     assert duplicated == pytest.approx(reference, abs=1e-14)
+
+
+def test_orientation_global_barrier_uses_exact_min_without_face_dilution():
+    config = MultiviewNasalObjectiveConfig()
+    sparse_bad_face = np.r_[0.19, np.ones(1000)]
+    dense_bad_face = np.r_[0.19, np.ones(100_000)]
+
+    sparse_residuals, sparse_minimum = (
+        nasal_objective._surface_orientation_barrier_residuals(
+            sparse_bad_face,
+            config,
+        )
+    )
+    dense_residuals, dense_minimum = (
+        nasal_objective._surface_orientation_barrier_residuals(
+            dense_bad_face,
+            config,
+        )
+    )
+    sparse_diagnostic = (
+        nasal_objective._soft_minimum_orientation_ratio(
+            sparse_bad_face,
+            config.orientation_barrier_softmin_temperature,
+        )
+    )
+    dense_diagnostic = (
+        nasal_objective._soft_minimum_orientation_ratio(
+            dense_bad_face,
+            config.orientation_barrier_softmin_temperature,
+        )
+    )
+    expected_global = (
+        config.orientation_barrier_weight
+        * nasal_objective._stable_softplus(
+            np.asarray(
+                [
+                    (
+                        config.orientation_barrier_margin
+                        - 0.19
+                    )
+                    / config.orientation_barrier_scale
+                ]
+            )
+        )[0]
+    )
+
+    assert sparse_minimum == pytest.approx(0.19)
+    assert dense_minimum == pytest.approx(0.19)
+    assert sparse_minimum == min(sparse_bad_face)
+    assert dense_minimum == min(dense_bad_face)
+    assert sparse_residuals[-1] == pytest.approx(expected_global)
+    assert dense_residuals[-1] == pytest.approx(expected_global)
+    assert sparse_residuals[-1] == pytest.approx(dense_residuals[-1])
+    assert sparse_diagnostic > sparse_minimum
+    assert dense_diagnostic > dense_minimum
 
 
 def test_prior_scales_parameter_order_and_zero_theta_reproduce_baseline():

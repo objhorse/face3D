@@ -10,6 +10,7 @@ import html
 import io
 import json
 import math
+import os
 import shutil
 import struct
 import tempfile
@@ -1478,18 +1479,20 @@ def _publish_staging(
     staged_report = staging / "nasal_fit_report.json"
     published_report = output / "nasal_fit_report.json"
     report_backup = staging / ".nasal-fit-report.backup.json"
-    publications = candidate_publications + (
-        (staged_report, published_report),
-    )
     moved: list[tuple[Path, Path]] = []
     report_was_backed_up = False
+    report_was_replaced = False
     try:
         assert_file_tree_unchanged(source, source_hashes)
-        for staged_source, _destination in publications:
+        for staged_source, _destination in candidate_publications:
             if not staged_source.exists():
                 raise FileNotFoundError(
                     f"staged artifact is missing: {staged_source}"
                 )
+        if not staged_report.is_file():
+            raise FileNotFoundError(
+                f"staged artifact is missing: {staged_report}"
+            )
         for _staged_source, destination in candidate_publications:
             if destination.exists():
                 raise FileExistsError(
@@ -1501,23 +1504,29 @@ def _publish_staging(
                     "existing nasal fit report is not a regular file: "
                     f"{published_report}"
                 )
-            published_report.replace(report_backup)
+            shutil.copyfile(published_report, report_backup)
             report_was_backed_up = True
-        for staged_source, destination in publications:
+        for staged_source, destination in candidate_publications:
             destination.parent.mkdir(parents=True, exist_ok=True)
             staged_source.replace(destination)
             moved.append((staged_source, destination))
+        os.replace(staged_report, published_report)
+        report_was_replaced = True
         assert_file_tree_unchanged(source, source_hashes)
         if report_was_backed_up:
             report_backup.unlink()
     except Exception:
+        if report_was_replaced:
+            if report_was_backed_up and report_backup.exists():
+                os.replace(report_backup, published_report)
+            elif published_report.exists() and not staged_report.exists():
+                os.replace(published_report, staged_report)
         for rollback_source, destination in reversed(moved):
             if destination.exists() and not rollback_source.exists():
                 rollback_source.parent.mkdir(parents=True, exist_ok=True)
                 destination.replace(rollback_source)
-        if report_was_backed_up and report_backup.exists():
-            published_report.parent.mkdir(parents=True, exist_ok=True)
-            report_backup.replace(published_report)
+        if report_backup.exists():
+            report_backup.unlink()
         raise
 
 
