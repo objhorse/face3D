@@ -410,6 +410,18 @@ def _fake_write_viewer(**kwargs):
     return target
 
 
+def _fake_render_screenshots(**kwargs):
+    target = Path(kwargs["output_dir"])
+    target.mkdir(parents=True, exist_ok=True)
+    result = {"baseline": {}, "candidate": {}}
+    for role in result:
+        for view in ("front", "subject-left", "subject-right"):
+            path = target / f"{role}_{view}.png"
+            Image.new("RGB", (8, 8), (20, 30, 40)).save(path)
+            result[role][view] = path
+    return result
+
+
 def _write_textured_glb(
     path: Path,
     *,
@@ -755,19 +767,12 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
     computed = _computed(success=True)
     _patch_lightweight_pipeline(monkeypatch, computed)
 
-    def render(**kwargs):
-        target = Path(kwargs["output_dir"])
-        target.mkdir(parents=True, exist_ok=True)
-        result = {"baseline": {}, "candidate": {}}
-        for role in result:
-            for view in ("front", "subject-left", "subject-right"):
-                path = target / f"{role}_{view}.png"
-                Image.new("RGB", (8, 8), (20, 30, 40)).save(path)
-                result[role][view] = path
-        return result
-
     monkeypatch.setattr(runner, "_export_candidate", _fake_export_candidate)
-    monkeypatch.setattr(runner, "render_nasal_geometry_screenshots", render)
+    monkeypatch.setattr(
+        runner,
+        "render_nasal_geometry_screenshots",
+        _fake_render_screenshots,
+    )
 
     report_path = runner.run_multiview_nasal_shape_experiment(
         captures,
@@ -795,6 +800,94 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
         path.name.startswith(".nasal-shape-staging-")
         for path in output.iterdir()
     )
+    assert runner.file_tree_hashes(source) == before
+
+
+def test_runner_success_replaces_existing_failure_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures, source, output, rig = _inputs(tmp_path)
+    output.mkdir()
+    previous_report = output / "nasal_fit_report.json"
+    previous_report.write_text(
+        '{"status":"failed_minimal_validity","previous":true}',
+        encoding="utf-8",
+    )
+    before = runner.file_tree_hashes(source)
+    _patch_lightweight_pipeline(monkeypatch, _computed(success=True))
+    monkeypatch.setattr(runner, "_export_candidate", _fake_export_candidate)
+    monkeypatch.setattr(runner, "_write_viewer", _fake_write_viewer)
+    monkeypatch.setattr(
+        runner,
+        "render_nasal_geometry_screenshots",
+        _fake_render_screenshots,
+    )
+
+    report_path = runner.run_multiview_nasal_shape_experiment(
+        captures,
+        source,
+        output,
+        rig_calibration=rig,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "success"
+    assert "previous" not in report
+    assert (output / "meshes" / "face_same_texture.glb").is_file()
+    assert not any(
+        "backup" in path.name
+        for path in output.rglob("*")
+    )
+    assert runner.file_tree_hashes(source) == before
+
+
+def test_runner_publish_failure_restores_report_and_rolls_back_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures, source, output, rig = _inputs(tmp_path)
+    output.mkdir()
+    report_path = output / "nasal_fit_report.json"
+    previous_report = (
+        b'{"status":"failed_minimal_validity","previous":"keep exactly"}\n'
+    )
+    report_path.write_bytes(previous_report)
+    before = runner.file_tree_hashes(source)
+    _patch_lightweight_pipeline(monkeypatch, _computed(success=True))
+    monkeypatch.setattr(runner, "_export_candidate", _fake_export_candidate)
+    monkeypatch.setattr(runner, "_write_viewer", _fake_write_viewer)
+    monkeypatch.setattr(
+        runner,
+        "render_nasal_geometry_screenshots",
+        _fake_render_screenshots,
+    )
+    original_replace = Path.replace
+    failed = False
+
+    def fail_during_publish(self, target):
+        nonlocal failed
+        destination = Path(target)
+        if (
+            destination == output / "nasal_shape_compare.html"
+            and not failed
+        ):
+            failed = True
+            raise OSError("synthetic mid-publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_during_publish)
+
+    with pytest.raises(OSError, match="synthetic mid-publish failure"):
+        runner.run_multiview_nasal_shape_experiment(
+            captures,
+            source,
+            output,
+            rig_calibration=rig,
+        )
+
+    assert report_path.read_bytes() == previous_report
+    _assert_no_candidate_outputs(output)
     assert runner.file_tree_hashes(source) == before
 
 
