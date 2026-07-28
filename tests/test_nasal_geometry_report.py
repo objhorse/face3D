@@ -117,6 +117,45 @@ def test_minimal_validity_returns_failure_for_malformed_mesh_inputs(
     assert report["issues"]
 
 
+def test_minimal_validity_rejects_empty_mesh_and_uv_topology() -> None:
+    report = validate_minimal_nasal_candidate(
+        parameters=np.array([0.0]),
+        baseline_vertices=np.empty((0, 3)),
+        candidate_vertices=np.empty((0, 3)),
+        baseline_faces=np.empty((0, 3), dtype=np.int64),
+        candidate_faces=np.empty((0, 3), dtype=np.int64),
+        baseline_uv_vertices=np.empty((0, 2)),
+        candidate_uv_vertices=np.empty((0, 2)),
+        baseline_uv_faces=np.empty((0, 3), dtype=np.int64),
+        candidate_uv_faces=np.empty((0, 3), dtype=np.int64),
+    )
+
+    assert not report["passed"]
+    assert not report["checks"]["nonempty_vertices"]
+    assert not report["checks"]["nonempty_faces"]
+    assert not report["checks"]["nonempty_uv_vertices"]
+    assert not report["checks"]["nonempty_uv_faces"]
+
+
+def test_minimal_validity_rejects_out_of_range_uv_indices_without_crashing() -> None:
+    vertices, faces, uv, _uv_faces = _triangle()
+    invalid_uv_faces = np.array([[0, 1, 9]], dtype=np.int64)
+
+    report = _validity(
+        vertices,
+        baseline_uv_vertices=uv,
+        candidate_uv_vertices=uv,
+        baseline_uv_faces=invalid_uv_faces,
+        candidate_uv_faces=invalid_uv_faces.copy(),
+        baseline_faces=faces,
+        candidate_faces=faces.copy(),
+    )
+
+    assert not report["passed"]
+    assert not report["checks"]["valid_uv_face_indices"]
+    assert "uv_topology_or_coordinates_changed" in report["issues"]
+
+
 def test_geometry_renderer_replaces_source_material() -> None:
     source_mesh = type("SourceMesh", (), {"visual": object()})()
 

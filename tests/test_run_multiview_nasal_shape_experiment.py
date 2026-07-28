@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -405,6 +408,55 @@ def _fake_write_viewer(**kwargs):
     return target
 
 
+def _write_textured_glb(
+    path: Path,
+    *,
+    include_bin: bool = True,
+    texture_index: int = 0,
+    image_bytes: bytes | None = None,
+    buffer_view_length: int | None = None,
+) -> Path:
+    if image_bytes is None:
+        encoded = io.BytesIO()
+        Image.new("RGB", (2, 2), (20, 80, 140)).save(encoded, format="PNG")
+        image_bytes = encoded.getvalue()
+    payload = {
+        "asset": {"version": "2.0"},
+        "buffers": [{"byteLength": len(image_bytes)}],
+        "bufferViews": [
+            {
+                "buffer": 0,
+                "byteOffset": 0,
+                "byteLength": (
+                    len(image_bytes)
+                    if buffer_view_length is None
+                    else buffer_view_length
+                ),
+            }
+        ],
+        "images": [{"bufferView": 0, "mimeType": "image/png"}],
+        "textures": [{"source": 0}],
+        "materials": [
+            {
+                "pbrMetallicRoughness": {
+                    "baseColorTexture": {"index": texture_index}
+                }
+            }
+        ],
+    }
+    json_chunk = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    json_chunk += b" " * ((-len(json_chunk)) % 4)
+    chunks = [
+        struct.pack("<II", len(json_chunk), 0x4E4F534A) + json_chunk
+    ]
+    if include_bin:
+        binary = image_bytes + b"\0" * ((-len(image_bytes)) % 4)
+        chunks.append(struct.pack("<II", len(binary), 0x004E4942) + binary)
+    body = b"".join(chunks)
+    path.write_bytes(struct.pack("<4sII", b"glTF", 2, 12 + len(body)) + body)
+    return path
+
+
 def _assert_no_candidate_outputs(output: Path) -> None:
     assert not (output / "meshes").exists()
     assert not (output / "textures").exists()
@@ -414,6 +466,72 @@ def _assert_no_candidate_outputs(output: Path) -> None:
         path.name.startswith(".nasal-shape-staging-")
         for path in output.iterdir()
     )
+
+
+def test_embedded_textured_glb_validation_follows_texture_image_chain(
+    tmp_path: Path,
+) -> None:
+    path = _write_textured_glb(tmp_path / "valid.glb")
+
+    report = runner._validate_embedded_textured_glb(path)
+
+    assert report["embedded_image_count"] == 1
+    assert report["textured_material_count"] == 1
+    assert report["buffer_view_count"] == 1
+
+
+def test_embedded_textured_glb_validation_rejects_missing_bin(
+    tmp_path: Path,
+) -> None:
+    path = _write_textured_glb(tmp_path / "missing-bin.glb", include_bin=False)
+
+    with pytest.raises(RuntimeError, match="BIN chunk"):
+        runner._validate_embedded_textured_glb(path)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"texture_index": 3}, "texture index"),
+        ({"buffer_view_length": 100000}, "BIN bounds"),
+        ({"image_bytes": b"not-a-png"}, "cannot be decoded"),
+    ],
+)
+def test_embedded_textured_glb_validation_rejects_broken_references_and_images(
+    tmp_path: Path,
+    kwargs: dict,
+    message: str,
+) -> None:
+    path = _write_textured_glb(tmp_path / "invalid.glb", **kwargs)
+
+    with pytest.raises(RuntimeError, match=message):
+        runner._validate_embedded_textured_glb(path)
+
+
+def test_default_viewer_is_self_contained_without_historical_template(
+    tmp_path: Path,
+) -> None:
+    baseline = tmp_path / "baseline.glb"
+    candidate = tmp_path / "candidate.glb"
+    baseline.write_bytes(b"baseline-model")
+    candidate.write_bytes(b"candidate-model")
+
+    viewer = runner._write_viewer(
+        template=None,
+        baseline_glb=baseline,
+        candidate_glb=candidate,
+        output=tmp_path / "nasal_shape_compare.html",
+        dataset_label="captures_fixture",
+    )
+
+    text = viewer.read_text(encoding="utf-8")
+    assert base64.b64encode(b"baseline-model").decode("ascii") in text
+    assert base64.b64encode(b"candidate-model").decode("ascii") in text
+    assert "embeddedGlbs" in text
+    assert "https://" not in text
+    assert 'data-view="front"' in text
+    assert 'data-view="left"' in text
+    assert 'data-view="right"' in text
 
 
 def test_runner_happy_path_writes_outputs_and_preserves_source(
@@ -437,7 +555,6 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
         return result
 
     monkeypatch.setattr(runner, "_export_candidate", _fake_export_candidate)
-    monkeypatch.setattr(runner, "_write_viewer", _fake_write_viewer)
     monkeypatch.setattr(runner, "render_nasal_geometry_screenshots", render)
 
     report_path = runner.run_multiview_nasal_shape_experiment(
@@ -445,7 +562,6 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
         source,
         output,
         rig_calibration=rig,
-        viewer_template=tmp_path / "template.html",
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -459,6 +575,9 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
     ]["representation_note"]
     assert (output / "meshes" / "face_same_texture.glb").is_file()
     assert (output / "nasal_shape_compare.html").is_file()
+    assert "embeddedGlbs" in (
+        output / "nasal_shape_compare.html"
+    ).read_text(encoding="utf-8")
     assert (output / "debug" / "nasal_geometry" / "index.html").is_file()
     assert not any(
         path.name.startswith(".nasal-shape-staging-")
@@ -529,6 +648,162 @@ def test_runner_export_failure_cleans_staging_and_candidate_outputs(
     assert "candidate_same_texture_glb" not in report["paths"]
     _assert_no_candidate_outputs(output)
     assert runner.file_tree_hashes(source) == before
+
+
+def test_publish_failure_rolls_back_all_published_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    staging = tmp_path / "output" / ".nasal-shape-staging-fixture"
+    output = tmp_path / "output"
+    source.mkdir()
+    (source / "locked.txt").write_text("locked", encoding="utf-8")
+    (staging / "meshes").mkdir(parents=True)
+    (staging / "textures").mkdir()
+    (staging / "debug" / "nasal_geometry").mkdir(parents=True)
+    (staging / "meshes" / "face_same_texture.glb").write_bytes(b"candidate")
+    (staging / "textures" / "albedo_baseline_locked.png").write_bytes(b"texture")
+    (staging / "nasal_shape_compare.html").write_text("viewer", encoding="utf-8")
+    (staging / "debug" / "nasal_geometry" / "index.html").write_text(
+        "geometry",
+        encoding="utf-8",
+    )
+    (staging / "nasal_fit_report.json").write_text(
+        '{"status":"success"}',
+        encoding="utf-8",
+    )
+    original_replace = Path.replace
+    failed = False
+
+    def flaky_replace(self, target):
+        nonlocal failed
+        destination = Path(target)
+        if destination.name == "nasal_shape_compare.html" and not failed:
+            failed = True
+            raise OSError("synthetic publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+
+    with pytest.raises(OSError, match="synthetic publish failure"):
+        runner._publish_staging(
+            staging,
+            output,
+            source=source,
+            source_hashes=runner.file_tree_hashes(source),
+        )
+
+    assert not (output / "meshes").exists()
+    assert not (output / "textures").exists()
+    assert not (output / "nasal_shape_compare.html").exists()
+    assert not (output / "debug" / "nasal_geometry").exists()
+    assert not (output / "nasal_fit_report.json").exists()
+    assert (staging / "meshes" / "face_same_texture.glb").is_file()
+    assert (staging / "textures" / "albedo_baseline_locked.png").is_file()
+    assert (staging / "nasal_shape_compare.html").is_file()
+    assert (staging / "debug" / "nasal_geometry" / "index.html").is_file()
+    assert (staging / "nasal_fit_report.json").is_file()
+
+
+def test_post_publish_source_check_rolls_back_success_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    staging = output / ".nasal-shape-staging-fixture"
+    source.mkdir()
+    (source / "locked.txt").write_text("locked", encoding="utf-8")
+    (staging / "meshes").mkdir(parents=True)
+    (staging / "textures").mkdir()
+    (staging / "debug" / "nasal_geometry").mkdir(parents=True)
+    (staging / "meshes" / "face_same_texture.glb").write_bytes(b"candidate")
+    (staging / "textures" / "albedo_baseline_locked.png").write_bytes(b"texture")
+    (staging / "nasal_shape_compare.html").write_text("viewer", encoding="utf-8")
+    (staging / "debug" / "nasal_geometry" / "index.html").write_text(
+        "geometry",
+        encoding="utf-8",
+    )
+    (staging / "nasal_fit_report.json").write_text(
+        '{"status":"success"}',
+        encoding="utf-8",
+    )
+    expected_hashes = runner.file_tree_hashes(source)
+    original_replace = Path.replace
+
+    def replace_and_mutate_source(self, target):
+        result = original_replace(self, target)
+        if Path(target) == output / "nasal_fit_report.json":
+            (source / "locked.txt").write_text("changed", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "replace", replace_and_mutate_source)
+
+    with pytest.raises(RuntimeError, match="source files changed"):
+        runner._publish_staging(
+            staging,
+            output,
+            source=source,
+            source_hashes=expected_hashes,
+        )
+
+    assert not (output / "meshes").exists()
+    assert not (output / "textures").exists()
+    assert not (output / "nasal_shape_compare.html").exists()
+    assert not (output / "debug" / "nasal_geometry").exists()
+    assert not (output / "nasal_fit_report.json").exists()
+    assert (staging / "meshes" / "face_same_texture.glb").is_file()
+    assert (staging / "textures" / "albedo_baseline_locked.png").is_file()
+    assert (staging / "nasal_shape_compare.html").is_file()
+    assert (staging / "debug" / "nasal_geometry" / "index.html").is_file()
+    assert (staging / "nasal_fit_report.json").is_file()
+
+
+def test_runner_source_mutation_before_publish_leaves_only_failure_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures, source, output, rig = _inputs(tmp_path)
+    _patch_lightweight_pipeline(monkeypatch, _computed(success=True))
+    monkeypatch.setattr(runner, "_export_candidate", _fake_export_candidate)
+    monkeypatch.setattr(runner, "_write_viewer", _fake_write_viewer)
+
+    def render_and_mutate_source(**kwargs):
+        target = Path(kwargs["output_dir"])
+        target.mkdir(parents=True, exist_ok=True)
+        result = {"baseline": {}, "candidate": {}}
+        for role in result:
+            for view in ("front", "subject-left", "subject-right"):
+                path = target / f"{role}_{view}.png"
+                Image.new("RGB", (8, 8), (20, 30, 40)).save(path)
+                result[role][view] = path
+        (source / "meshes" / "stable_fit_meta.json").write_text(
+            '{"mutated": true}',
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr(
+        runner,
+        "render_nasal_geometry_screenshots",
+        render_and_mutate_source,
+    )
+
+    with pytest.raises(RuntimeError, match="source files changed"):
+        runner.run_multiview_nasal_shape_experiment(
+            captures,
+            source,
+            output,
+            rig_calibration=rig,
+        )
+
+    report = json.loads(
+        (output / "nasal_fit_report.json").read_text(encoding="utf-8")
+    )
+    assert report["status"] == "failed_rendering"
+    assert report["error"]["type"] == "RuntimeError"
+    _assert_no_candidate_outputs(output)
 
 
 def test_runner_render_failure_cleans_staging_and_candidate_outputs(

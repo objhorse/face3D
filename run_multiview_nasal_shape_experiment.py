@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import hashlib
+import html
+import io
 import json
 import shutil
 import struct
@@ -16,9 +19,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from run_expression_depth_experiment import (
-    _default_viewer_template,
     _export_with_baseline_texture,
-    _write_embedded_compare_viewer,
 )
 from run_nasal_observation_audit import (
     assert_file_tree_unchanged,
@@ -564,42 +565,168 @@ def _subdivide_candidate(
 
 
 def _validate_embedded_textured_glb(path: Path) -> dict[str, Any]:
-    if not path.is_file() or path.stat().st_size <= 20:
+    from PIL import Image
+
+    if not path.is_file() or path.stat().st_size < 20:
         raise RuntimeError(f"candidate textured GLB is missing or empty: {path}")
     data = path.read_bytes()
-    if data[:4] != b"glTF":
+    if len(data) < 12 or data[:4] != b"glTF":
         raise RuntimeError(f"candidate output is not a binary GLB: {path}")
     _magic, version, total_length = struct.unpack_from("<4sII", data, 0)
     if version != 2 or total_length != len(data):
         raise RuntimeError(f"candidate GLB header is invalid: {path}")
     offset = 12
-    json_payload = None
-    while offset + 8 <= len(data):
+    chunks: list[tuple[int, bytes]] = []
+    while offset < len(data):
+        if offset + 8 > len(data):
+            raise RuntimeError("candidate GLB has a truncated chunk header")
         chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+        if chunk_length % 4:
+            raise RuntimeError("candidate GLB chunk length is not 4-byte aligned")
         offset += 8
+        if offset + chunk_length > len(data):
+            raise RuntimeError("candidate GLB chunk exceeds the declared file bounds")
         chunk = data[offset : offset + chunk_length]
         offset += chunk_length
-        if chunk_type == 0x4E4F534A:
-            json_payload = json.loads(chunk.rstrip(b" \0").decode("utf-8"))
+        chunks.append((chunk_type, chunk))
+    if offset != len(data):
+        raise RuntimeError("candidate GLB chunk table does not consume the file")
+    json_chunks = [chunk for kind, chunk in chunks if kind == 0x4E4F534A]
+    bin_chunks = [chunk for kind, chunk in chunks if kind == 0x004E4942]
+    if len(json_chunks) != 1 or not chunks or chunks[0][0] != 0x4E4F534A:
+        raise RuntimeError("candidate GLB must contain one leading JSON chunk")
+    if len(bin_chunks) != 1:
+        raise RuntimeError("candidate GLB must contain exactly one BIN chunk")
+    try:
+        json_payload = json.loads(
+            json_chunks[0].rstrip(b" \0").decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("candidate GLB JSON chunk is invalid") from exc
     if not isinstance(json_payload, Mapping):
-        raise RuntimeError("candidate GLB has no JSON chunk")
-    images = json_payload.get("images", [])
-    materials = json_payload.get("materials", [])
-    embedded_images = [
-        item
-        for item in images
-        if isinstance(item, Mapping)
-        and "bufferView" in item
-        and "uri" not in item
-    ]
-    textured_materials = [
-        item
-        for item in materials
-        if isinstance(item, Mapping)
-        and isinstance(item.get("pbrMetallicRoughness"), Mapping)
-        and "baseColorTexture" in item["pbrMetallicRoughness"]
-    ]
-    if not embedded_images or not textured_materials:
+        raise RuntimeError("candidate GLB JSON root must be an object")
+    asset = json_payload.get("asset")
+    if not isinstance(asset, Mapping) or asset.get("version") != "2.0":
+        raise RuntimeError("candidate GLB JSON asset.version must be 2.0")
+
+    binary = bin_chunks[0]
+    buffers = json_payload.get("buffers")
+    if (
+        not isinstance(buffers, list)
+        or len(buffers) != 1
+        or not isinstance(buffers[0], Mapping)
+        or "uri" in buffers[0]
+    ):
+        raise RuntimeError("candidate GLB must use one embedded binary buffer")
+    declared_buffer_length = buffers[0].get("byteLength")
+    if (
+        not isinstance(declared_buffer_length, int)
+        or isinstance(declared_buffer_length, bool)
+        or declared_buffer_length < 1
+        or declared_buffer_length > len(binary)
+        or len(binary) - declared_buffer_length > 3
+    ):
+        raise RuntimeError("candidate GLB BIN length is inconsistent with buffers[0]")
+
+    buffer_views = json_payload.get("bufferViews")
+    if not isinstance(buffer_views, list) or not buffer_views:
+        raise RuntimeError("candidate GLB has no bufferViews")
+    validated_views: list[tuple[int, int]] = []
+    for index, view in enumerate(buffer_views):
+        if not isinstance(view, Mapping):
+            raise RuntimeError(f"candidate GLB bufferViews[{index}] is invalid")
+        buffer_index = view.get("buffer")
+        byte_offset = view.get("byteOffset", 0)
+        byte_length = view.get("byteLength")
+        if (
+            buffer_index != 0
+            or not isinstance(byte_offset, int)
+            or isinstance(byte_offset, bool)
+            or byte_offset < 0
+            or not isinstance(byte_length, int)
+            or isinstance(byte_length, bool)
+            or byte_length < 1
+            or byte_offset + byte_length > declared_buffer_length
+        ):
+            raise RuntimeError(
+                f"candidate GLB bufferViews[{index}] exceeds BIN bounds"
+            )
+        validated_views.append((byte_offset, byte_length))
+
+    images = json_payload.get("images")
+    textures = json_payload.get("textures")
+    materials = json_payload.get("materials")
+    if not all(isinstance(value, list) for value in (images, textures, materials)):
+        raise RuntimeError("candidate GLB image/texture/material tables are invalid")
+    decoded_images: set[int] = set()
+    textured_material_count = 0
+    for material_index, material in enumerate(materials):
+        if not isinstance(material, Mapping):
+            raise RuntimeError(
+                f"candidate GLB materials[{material_index}] is invalid"
+            )
+        pbr = material.get("pbrMetallicRoughness")
+        if not isinstance(pbr, Mapping) or "baseColorTexture" not in pbr:
+            continue
+        texture_info = pbr["baseColorTexture"]
+        texture_index = (
+            texture_info.get("index")
+            if isinstance(texture_info, Mapping)
+            else None
+        )
+        if (
+            not isinstance(texture_index, int)
+            or isinstance(texture_index, bool)
+            or texture_index < 0
+            or texture_index >= len(textures)
+            or not isinstance(textures[texture_index], Mapping)
+        ):
+            raise RuntimeError(
+                f"candidate GLB material {material_index} has an invalid texture index"
+            )
+        image_index = textures[texture_index].get("source")
+        if (
+            not isinstance(image_index, int)
+            or isinstance(image_index, bool)
+            or image_index < 0
+            or image_index >= len(images)
+            or not isinstance(images[image_index], Mapping)
+        ):
+            raise RuntimeError(
+                f"candidate GLB texture {texture_index} has an invalid image index"
+            )
+        image = images[image_index]
+        view_index = image.get("bufferView")
+        mime_type = image.get("mimeType")
+        if (
+            "uri" in image
+            or not isinstance(view_index, int)
+            or isinstance(view_index, bool)
+            or view_index < 0
+            or view_index >= len(validated_views)
+            or mime_type not in {"image/png", "image/jpeg"}
+        ):
+            raise RuntimeError(
+                f"candidate GLB image {image_index} is not an embedded PNG/JPEG"
+            )
+        byte_offset, byte_length = validated_views[view_index]
+        image_bytes = binary[byte_offset : byte_offset + byte_length]
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as embedded:
+                embedded.verify()
+                decoded_format = str(embedded.format).upper()
+        except Exception as exc:
+            raise RuntimeError(
+                f"candidate GLB image {image_index} cannot be decoded"
+            ) from exc
+        expected_format = "PNG" if mime_type == "image/png" else "JPEG"
+        if decoded_format != expected_format:
+            raise RuntimeError(
+                f"candidate GLB image {image_index} MIME type disagrees with data"
+            )
+        decoded_images.add(image_index)
+        textured_material_count += 1
+    if not decoded_images or not textured_material_count:
         raise RuntimeError(
             "candidate GLB must contain embedded images and textured materials"
         )
@@ -607,8 +734,10 @@ def _validate_embedded_textured_glb(path: Path) -> dict[str, Any]:
         "path": str(path),
         "sha256": _sha256_file(path),
         "byte_count": path.stat().st_size,
-        "embedded_image_count": len(embedded_images),
-        "textured_material_count": len(textured_materials),
+        "embedded_image_count": len(decoded_images),
+        "textured_material_count": textured_material_count,
+        "buffer_view_count": len(validated_views),
+        "declared_binary_byte_count": declared_buffer_length,
     }
 
 
@@ -763,36 +892,249 @@ def _load_observation_work_images(
     return result
 
 
-def _write_viewer(
+def _write_lightweight_compare_viewer(
     *,
-    template: Path,
     baseline_glb: Path,
     candidate_glb: Path,
     output: Path,
     dataset_label: str,
 ) -> Path:
-    viewer = _write_embedded_compare_viewer(
-        template,
-        baseline_glb,
-        candidate_glb,
-        output,
-        baseline_label=(
-            f"{dataset_label} | Baseline: protected expression depth v3"
-        ),
-        candidate_label=(
-            f"{dataset_label} | New: unified multiview nasal shape"
-        ),
-        title=f"{dataset_label} | Baseline vs unified nasal shape",
+    encoded = {
+        "baseline": base64.b64encode(baseline_glb.read_bytes()).decode("ascii"),
+        "candidate": base64.b64encode(candidate_glb.read_bytes()).decode("ascii"),
+    }
+    title = html.escape(
+        f"{dataset_label} | Baseline vs unified nasal shape",
+        quote=True,
     )
+    dataset = html.escape(dataset_label, quote=True)
+    payload = json.dumps(encoded, separators=(",", ":")).replace("</", "<\\/")
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    html, body {{ margin: 0; min-height: 100%; background: #10151b; color: #eef2f5; font: 14px Arial, sans-serif; }}
+    header {{ padding: 14px 18px; border-bottom: 1px solid #34404b; }}
+    h1 {{ margin: 0 0 10px; font-size: 19px; }}
+    .controls {{ display: flex; gap: 7px; }}
+    button {{ color: #eef2f5; background: #26313b; border: 1px solid #4b5b68; padding: 7px 11px; cursor: pointer; }}
+    button:focus {{ outline: 2px solid #74b9e6; outline-offset: 1px; }}
+    main {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); min-height: calc(100vh - 92px); }}
+    section {{ min-width: 0; border-right: 1px solid #34404b; }}
+    section:last-child {{ border-right: 0; }}
+    h2 {{ box-sizing: border-box; height: 43px; margin: 0; padding: 12px 14px; font-size: 14px; }}
+    canvas {{ display: block; width: 100%; height: calc(100vh - 135px); min-height: 360px; touch-action: none; }}
+    .error {{ padding: 16px; color: #ff9c9c; }}
+    @media (max-width: 760px) {{
+      main {{ grid-template-columns: 1fr; }}
+      canvas {{ height: 52vh; min-height: 300px; }}
+      section {{ border-right: 0; border-bottom: 1px solid #34404b; }}
+    }}
+  </style>
+</head>
+<body>
+<header>
+  <h1>{dataset}: unified multiview nasal shape A/B</h1>
+  <div class="controls">
+    <button type="button" data-view="front">Front</button>
+    <button type="button" data-view="left">Subject-left</button>
+    <button type="button" data-view="right">Subject-right</button>
+  </div>
+</header>
+<main>
+  <section><h2>{dataset} | Baseline: protected expression depth v3</h2><canvas id="baseline"></canvas></section>
+  <section><h2>{dataset} | New: unified multiview nasal shape</h2><canvas id="candidate"></canvas></section>
+</main>
+<script>
+const embeddedGlbs = {payload};
+const state = {{yaw: 0, pitch: 0, zoom: 1}};
+const renderers = [];
+
+function decodeBase64(value) {{
+  const raw = atob(value), bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  return bytes;
+}}
+function parseGlb(bytes) {{
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint32(0, true) !== 0x46546c67 || view.getUint32(4, true) !== 2) throw new Error("Invalid GLB");
+  let offset = 12, jsonChunk = null, binChunk = null;
+  while (offset < bytes.byteLength) {{
+    const length = view.getUint32(offset, true), type = view.getUint32(offset + 4, true);
+    offset += 8;
+    const chunk = bytes.slice(offset, offset + length);
+    offset += length;
+    if (type === 0x4e4f534a) jsonChunk = chunk;
+    if (type === 0x004e4942) binChunk = chunk;
+  }}
+  if (!jsonChunk || !binChunk) throw new Error("GLB JSON/BIN chunks are required");
+  const gltf = JSON.parse(new TextDecoder().decode(jsonChunk).replace(/[\\u0000 ]+$/, ""));
+  return {{gltf, bin: binChunk}};
+}}
+const componentReaders = {{
+  5120: ["getInt8", 1], 5121: ["getUint8", 1], 5122: ["getInt16", 2],
+  5123: ["getUint16", 2], 5125: ["getUint32", 4], 5126: ["getFloat32", 4]
+}};
+const componentCounts = {{SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16}};
+function accessorData(model, index) {{
+  const accessor = model.gltf.accessors[index], bufferView = model.gltf.bufferViews[accessor.bufferView];
+  const [reader, bytes] = componentReaders[accessor.componentType];
+  const count = componentCounts[accessor.type], stride = bufferView.byteStride || count * bytes;
+  const start = (bufferView.byteOffset || 0) + (accessor.byteOffset || 0);
+  const dataView = new DataView(model.bin.buffer, model.bin.byteOffset, model.bin.byteLength);
+  const values = new Float32Array(accessor.count * count);
+  for (let row = 0; row < accessor.count; row++) {{
+    for (let column = 0; column < count; column++) {{
+      values[row * count + column] = dataView[reader](start + row * stride + column * bytes, true);
+    }}
+  }}
+  return {{values, count: accessor.count, components: count}};
+}}
+async function textureFor(model, materialIndex, gl) {{
+  const material = model.gltf.materials?.[materialIndex], info = material?.pbrMetallicRoughness?.baseColorTexture;
+  if (!info) return null;
+  const texture = model.gltf.textures[info.index], image = model.gltf.images[texture.source];
+  const bufferView = model.gltf.bufferViews[image.bufferView], start = bufferView.byteOffset || 0;
+  const blob = new Blob([model.bin.slice(start, start + bufferView.byteLength)], {{type: image.mimeType}});
+  const bitmap = await createImageBitmap(blob);
+  const handle = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, handle);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  bitmap.close();
+  return handle;
+}}
+function shader(gl, type, source) {{
+  const value = gl.createShader(type); gl.shaderSource(value, source); gl.compileShader(value);
+  if (!gl.getShaderParameter(value, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(value));
+  return value;
+}}
+async function makeRenderer(canvas, encoded) {{
+  const gl = canvas.getContext("webgl2", {{antialias: true, alpha: false}});
+  if (!gl) throw new Error("WebGL2 is unavailable");
+  const program = gl.createProgram();
+  gl.attachShader(program, shader(gl, gl.VERTEX_SHADER, `#version 300 es
+    in vec3 aPosition; in vec2 aUv; out vec2 vUv;
+    uniform vec3 uCenter; uniform float uScale, uAspect, uYaw, uPitch;
+    void main() {{
+      vec3 p = aPosition - uCenter;
+      float cy=cos(uYaw), sy=sin(uYaw), cp=cos(uPitch), sp=sin(uPitch);
+      p = vec3(cy*p.x+sy*p.z, p.y, -sy*p.x+cy*p.z);
+      p = vec3(p.x, cp*p.y-sp*p.z, sp*p.y+cp*p.z);
+      gl_Position = vec4(p.x/(uScale*uAspect), p.y/uScale, -p.z/uScale, 1.0);
+      vUv = aUv;
+    }}`));
+  gl.attachShader(program, shader(gl, gl.FRAGMENT_SHADER, `#version 300 es
+    precision highp float; in vec2 vUv; out vec4 color;
+    uniform sampler2D uTexture; uniform bool uHasTexture;
+    void main() {{ color = uHasTexture ? texture(uTexture, vUv) : vec4(.72,.76,.80,1.); }}
+  `));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  const model = parseGlb(decodeBase64(encoded)), drawables = [], bounds = [[Infinity,Infinity,Infinity],[-Infinity,-Infinity,-Infinity]];
+  for (const mesh of model.gltf.meshes || []) for (const primitive of mesh.primitives || []) {{
+    if (primitive.mode !== undefined && primitive.mode !== 4) continue;
+    const positions = accessorData(model, primitive.attributes.POSITION), uv = primitive.attributes.TEXCOORD_0 === undefined ? null : accessorData(model, primitive.attributes.TEXCOORD_0);
+    for (let i=0; i<positions.values.length; i+=3) for (let axis=0; axis<3; axis++) {{
+      bounds[0][axis] = Math.min(bounds[0][axis], positions.values[i+axis]);
+      bounds[1][axis] = Math.max(bounds[1][axis], positions.values[i+axis]);
+    }}
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    const positionBuffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer); gl.bufferData(gl.ARRAY_BUFFER, positions.values, gl.STATIC_DRAW);
+    const positionLocation = gl.getAttribLocation(program, "aPosition"); gl.enableVertexAttribArray(positionLocation); gl.vertexAttribPointer(positionLocation, 3, gl.FLOAT, false, 0, 0);
+    const uvLocation = gl.getAttribLocation(program, "aUv");
+    if (uv) {{ const uvBuffer=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer); gl.bufferData(gl.ARRAY_BUFFER, uv.values, gl.STATIC_DRAW); gl.enableVertexAttribArray(uvLocation); gl.vertexAttribPointer(uvLocation,2,gl.FLOAT,false,0,0); }}
+    else {{ gl.disableVertexAttribArray(uvLocation); gl.vertexAttrib2f(uvLocation,0,0); }}
+    let count=positions.count, indexed=false;
+    if (primitive.indices !== undefined) {{ const source=accessorData(model, primitive.indices).values, indices=new Uint32Array(source); const indexBuffer=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,indexBuffer); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,indices,gl.STATIC_DRAW); count=indices.length; indexed=true; }}
+    drawables.push({{vao, count, indexed, texture: await textureFor(model, primitive.material, gl)}});
+  }}
+  const center=bounds[0].map((value,index)=>(value+bounds[1][index])/2), extent=bounds[0].map((value,index)=>bounds[1][index]-value), scale=Math.max(...extent)*0.62 || 1;
+  return {{canvas, gl, program, drawables, center, scale}};
+}}
+function draw() {{
+  for (const renderer of renderers) {{
+    const {{canvas, gl, program}}=renderer, width=Math.max(1,Math.floor(canvas.clientWidth*devicePixelRatio)), height=Math.max(1,Math.floor(canvas.clientHeight*devicePixelRatio));
+    if (canvas.width!==width || canvas.height!==height) {{canvas.width=width;canvas.height=height;}}
+    gl.viewport(0,0,width,height); gl.clearColor(.06,.08,.11,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT); gl.enable(gl.DEPTH_TEST); gl.useProgram(program);
+    gl.uniform3fv(gl.getUniformLocation(program,"uCenter"), renderer.sharedCenter || renderer.center);
+    gl.uniform1f(gl.getUniformLocation(program,"uScale"), (renderer.sharedScale || renderer.scale)*state.zoom);
+    gl.uniform1f(gl.getUniformLocation(program,"uAspect"), width/height);
+    gl.uniform1f(gl.getUniformLocation(program,"uYaw"), state.yaw); gl.uniform1f(gl.getUniformLocation(program,"uPitch"), state.pitch);
+    for (const item of renderer.drawables) {{gl.bindVertexArray(item.vao); gl.uniform1i(gl.getUniformLocation(program,"uHasTexture"),!!item.texture); if(item.texture)gl.bindTexture(gl.TEXTURE_2D,item.texture); item.indexed?gl.drawElements(gl.TRIANGLES,item.count,gl.UNSIGNED_INT,0):gl.drawArrays(gl.TRIANGLES,0,item.count);}}
+  }}
+  requestAnimationFrame(draw);
+}}
+async function start() {{
+  const baseline=await makeRenderer(document.getElementById("baseline"),embeddedGlbs.baseline), candidate=await makeRenderer(document.getElementById("candidate"),embeddedGlbs.candidate);
+  candidate.sharedCenter=baseline.center; candidate.sharedScale=baseline.scale; renderers.push(baseline,candidate);
+  for (const canvas of document.querySelectorAll("canvas")) {{
+    let dragging=false,lastX=0,lastY=0; canvas.addEventListener("pointerdown",event=>{{dragging=true;lastX=event.clientX;lastY=event.clientY;canvas.setPointerCapture(event.pointerId);}});
+    canvas.addEventListener("pointermove",event=>{{if(!dragging)return;state.yaw+=(event.clientX-lastX)*.01;state.pitch=Math.max(-1.2,Math.min(1.2,state.pitch+(event.clientY-lastY)*.01));lastX=event.clientX;lastY=event.clientY;}});
+    canvas.addEventListener("pointerup",()=>dragging=false); canvas.addEventListener("wheel",event=>{{event.preventDefault();state.zoom=Math.max(.55,Math.min(2.2,state.zoom*Math.exp(event.deltaY*.001)));}},{{passive:false}});
+  }}
+  document.querySelectorAll("[data-view]").forEach(button=>button.addEventListener("click",()=>{{state.pitch=0;state.yaw={{front:0,left:.73,right:-.73}}[button.dataset.view];}}));
+  draw();
+}}
+start().catch(error=>{{document.querySelector("main").insertAdjacentHTML("afterbegin",`<p class="error">${{String(error)}}</p>`);}});
+</script>
+</body>
+</html>
+"""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(page, encoding="utf-8")
+    return output
+
+
+def _write_viewer(
+    *,
+    template: Path | None,
+    baseline_glb: Path,
+    candidate_glb: Path,
+    output: Path,
+    dataset_label: str,
+) -> Path:
+    if template is None:
+        viewer = _write_lightweight_compare_viewer(
+            baseline_glb=baseline_glb,
+            candidate_glb=candidate_glb,
+            output=output,
+            dataset_label=dataset_label,
+        )
+    else:
+        from run_expression_depth_experiment import _write_embedded_compare_viewer
+
+        viewer = _write_embedded_compare_viewer(
+            template,
+            baseline_glb,
+            candidate_glb,
+            output,
+            baseline_label=(
+                f"{dataset_label} | Baseline: protected expression depth v3"
+            ),
+            candidate_label=(
+                f"{dataset_label} | New: unified multiview nasal shape"
+            ),
+            title=f"{dataset_label} | Baseline vs unified nasal shape",
+        )
     text = viewer.read_text(encoding="utf-8")
     required = (
-        "baseline: '",
-        "candidate: '",
         'data-view="front"',
         'data-view="left"',
         'data-view="right"',
         dataset_label,
     )
+    if template is None:
+        required += ("embeddedGlbs", '"baseline":"', '"candidate":"')
+    else:
+        required += ("baseline: '", "candidate: '")
     missing = [token for token in required if token not in text]
     if missing:
         raise RuntimeError(
@@ -855,7 +1197,13 @@ def _remap_staging_paths(value: Any, staging: Path, output: Path) -> Any:
     return value
 
 
-def _publish_staging(staging: Path, output: Path) -> None:
+def _publish_staging(
+    staging: Path,
+    output: Path,
+    *,
+    source: Path,
+    source_hashes: Mapping[str, str],
+) -> None:
     publications = (
         (staging / "meshes", output / "meshes"),
         (staging / "textures", output / "textures"),
@@ -874,21 +1222,25 @@ def _publish_staging(staging: Path, output: Path) -> None:
     )
     moved: list[tuple[Path, Path]] = []
     try:
-        for source, destination in publications:
-            if not source.exists():
-                raise FileNotFoundError(f"staged artifact is missing: {source}")
+        assert_file_tree_unchanged(source, source_hashes)
+        for staged_source, destination in publications:
+            if not staged_source.exists():
+                raise FileNotFoundError(
+                    f"staged artifact is missing: {staged_source}"
+                )
             if destination.exists():
                 raise FileExistsError(
                     f"refusing to overwrite candidate artifact: {destination}"
                 )
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source.replace(destination)
-            moved.append((source, destination))
+            staged_source.replace(destination)
+            moved.append((staged_source, destination))
+        assert_file_tree_unchanged(source, source_hashes)
     except Exception:
-        for source, destination in reversed(moved):
-            if destination.exists() and not source.exists():
-                source.parent.mkdir(parents=True, exist_ok=True)
-                destination.replace(source)
+        for rollback_source, destination in reversed(moved):
+            if destination.exists() and not rollback_source.exists():
+                rollback_source.parent.mkdir(parents=True, exist_ok=True)
+                destination.replace(rollback_source)
         raise
 
 
@@ -943,6 +1295,7 @@ def run_multiview_nasal_shape_experiment(
     }
     target.mkdir(parents=True, exist_ok=True)
     staging: Path | None = None
+    publish_completed = False
     try:
         report["status"] = "building_observations"
         _run_nasal_observation_audit(
@@ -1005,7 +1358,7 @@ def run_multiview_nasal_shape_experiment(
         template = (
             Path(viewer_template).resolve()
             if viewer_template is not None
-            else _default_viewer_template().resolve()
+            else None
         )
         viewer = _write_viewer(
             template=template,
@@ -1086,7 +1439,13 @@ def run_multiview_nasal_shape_experiment(
         )
         success_report["status"] = "success"
         _write_report(staging / "nasal_fit_report.json", success_report)
-        _publish_staging(staging, target)
+        _publish_staging(
+            staging,
+            target,
+            source=source,
+            source_hashes=source_hashes,
+        )
+        publish_completed = True
     except Exception as exc:
         if staging is not None and staging.exists():
             shutil.rmtree(staging)
@@ -1105,7 +1464,8 @@ def run_multiview_nasal_shape_experiment(
     finally:
         if staging is not None and staging.exists():
             shutil.rmtree(staging)
-        assert_file_tree_unchanged(source, source_hashes)
+        if not publish_completed:
+            assert_file_tree_unchanged(source, source_hashes)
     return report_path
 
 

@@ -48,17 +48,26 @@ def _mesh_input_is_safe(vertices: np.ndarray, faces: np.ndarray) -> bool:
     return bool(
         vertices.ndim == 2
         and vertices.shape[1:] == (3,)
+        and len(vertices) > 0
         and np.isfinite(vertices).all()
         and faces.ndim == 2
         and faces.shape[1:] == (3,)
+        and len(faces) > 0
         and np.issubdtype(faces.dtype, np.integer)
-        and (
-            faces.size == 0
-            or (
-                int(faces.min()) >= 0
-                and int(faces.max()) < len(vertices)
-            )
-        )
+        and int(faces.min()) >= 0
+        and int(faces.max()) < len(vertices)
+    )
+
+
+def _index_array_is_valid(indices: np.ndarray, vertex_count: int) -> bool:
+    return bool(
+        vertex_count > 0
+        and indices.ndim == 2
+        and indices.shape[1:] == (3,)
+        and len(indices) > 0
+        and np.issubdtype(indices.dtype, np.integer)
+        and int(indices.min()) >= 0
+        and int(indices.max()) < vertex_count
     )
 
 
@@ -68,19 +77,9 @@ def _invalid_mesh_quality(
     *,
     label: str,
 ) -> dict[str, Any]:
-    valid_indices = bool(
-        faces.ndim == 2
-        and faces.shape[1:] == (3,)
-        and np.issubdtype(faces.dtype, np.integer)
-        and (
-            faces.size == 0
-            or (
-                vertices.ndim == 2
-                and vertices.shape[1:] == (3,)
-                and int(faces.min()) >= 0
-                and int(faces.max()) < len(vertices)
-            )
-        )
+    valid_indices = _index_array_is_valid(
+        faces,
+        len(vertices) if vertices.ndim == 2 else 0,
     )
     face_count = int(len(faces)) if faces.ndim >= 1 else 0
     return {
@@ -90,11 +89,13 @@ def _invalid_mesh_quality(
         "finite_vertices": bool(
             vertices.ndim == 2
             and vertices.shape[1:] == (3,)
+            and len(vertices) > 0
             and np.isfinite(vertices).all()
         ),
         "finite_faces": bool(
             faces.ndim == 2
             and faces.shape[1:] == (3,)
+            and len(faces) > 0
             and np.issubdtype(faces.dtype, np.integer)
         ),
         "valid_face_indices": valid_indices,
@@ -168,6 +169,26 @@ def validate_minimal_nasal_candidate(
         dtype=np.float64,
         empty_shape=(0,),
     )
+    baseline_vertex_count = (
+        len(baseline)
+        if baseline.ndim == 2 and baseline.shape[1:] == (3,)
+        else 0
+    )
+    candidate_vertex_count = (
+        len(candidate)
+        if candidate.ndim == 2 and candidate.shape[1:] == (3,)
+        else 0
+    )
+    baseline_uv_vertex_count = (
+        len(baseline_uv)
+        if baseline_uv.ndim == 2 and baseline_uv.shape[1:] == (2,)
+        else 0
+    )
+    candidate_uv_vertex_count = (
+        len(candidate_uv)
+        if candidate_uv.ndim == 2 and candidate_uv.shape[1:] == (2,)
+        else 0
+    )
 
     issues: list[str] = []
     finite_parameters = bool(
@@ -180,6 +201,7 @@ def validate_minimal_nasal_candidate(
         and candidate_converted
         and baseline.ndim == 2
         and baseline.shape[1:] == (3,)
+        and len(baseline) > 0
         and candidate.shape == baseline.shape
         and np.isfinite(baseline).all()
         and np.isfinite(candidate).all()
@@ -198,12 +220,18 @@ def validate_minimal_nasal_candidate(
         and np.issubdtype(candidate_face_values.dtype, np.integer)
         and candidate_face_values.shape == faces.shape
         and np.array_equal(candidate_face_values, faces)
+        and _index_array_is_valid(faces, baseline_vertex_count)
+        and _index_array_is_valid(
+            candidate_face_values,
+            candidate_vertex_count,
+        )
     )
     same_uv_vertices = bool(
         baseline_uv_converted
         and candidate_uv_converted
         and baseline_uv.ndim == 2
         and baseline_uv.shape[1:] == (2,)
+        and len(baseline_uv) > 0
         and candidate_uv.shape == baseline_uv.shape
         and np.isfinite(baseline_uv).all()
         and np.isfinite(candidate_uv).all()
@@ -218,6 +246,11 @@ def validate_minimal_nasal_candidate(
         and np.issubdtype(candidate_uv_face_values.dtype, np.integer)
         and candidate_uv_face_values.shape == uv_faces.shape
         and np.array_equal(candidate_uv_face_values, uv_faces)
+        and _index_array_is_valid(uv_faces, baseline_uv_vertex_count)
+        and _index_array_is_valid(
+            candidate_uv_face_values,
+            candidate_uv_vertex_count,
+        )
     )
     if not same_faces:
         issues.append("face_topology_changed")
@@ -314,6 +347,47 @@ def validate_minimal_nasal_candidate(
             "same_faces": same_faces,
             "same_uv_vertices": same_uv_vertices,
             "same_uv_faces": same_uv_faces,
+            "nonempty_vertices": bool(
+                baseline.ndim == 2
+                and candidate.ndim == 2
+                and len(baseline) > 0
+                and len(candidate) > 0
+            ),
+            "nonempty_faces": bool(
+                faces.ndim == 2
+                and candidate_face_values.ndim == 2
+                and len(faces) > 0
+                and len(candidate_face_values) > 0
+            ),
+            "valid_face_indices": bool(
+                _index_array_is_valid(faces, baseline_vertex_count)
+                and _index_array_is_valid(
+                    candidate_face_values,
+                    candidate_vertex_count,
+                )
+            ),
+            "nonempty_uv_vertices": bool(
+                baseline_uv.ndim == 2
+                and candidate_uv.ndim == 2
+                and len(baseline_uv) > 0
+                and len(candidate_uv) > 0
+            ),
+            "nonempty_uv_faces": bool(
+                uv_faces.ndim == 2
+                and candidate_uv_face_values.ndim == 2
+                and len(uv_faces) > 0
+                and len(candidate_uv_face_values) > 0
+            ),
+            "valid_uv_face_indices": bool(
+                _index_array_is_valid(
+                    uv_faces,
+                    baseline_uv_vertex_count,
+                )
+                and _index_array_is_valid(
+                    candidate_uv_face_values,
+                    candidate_uv_vertex_count,
+                )
+            ),
         },
         "quality": {
             "baseline": quality_baseline,
