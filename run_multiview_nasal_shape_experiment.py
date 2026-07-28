@@ -1149,8 +1149,15 @@ def _write_lightweight_compare_viewer(
     section {{ min-width: 0; border-right: 1px solid #34404b; }}
     section:last-child {{ border-right: 0; }}
     h2 {{ box-sizing: border-box; height: 43px; margin: 0; padding: 12px 14px; font-size: 14px; }}
+    .viewer-frame {{ position: relative; }}
     canvas {{ display: block; width: 100%; height: calc(100vh - 135px); min-height: 360px; touch-action: none; }}
-    .error {{ padding: 16px; color: #ff9c9c; }}
+    .viewer-status {{
+      position: absolute; inset: 0; display: grid; place-items: center;
+      box-sizing: border-box; padding: 20px; pointer-events: none;
+      color: #d9e1e7; background: #0f141c; text-align: center;
+    }}
+    .viewer-status.error {{ color: #ffb0b0; }}
+    .viewer-status[hidden] {{ display: none; }}
     @media (max-width: 760px) {{
       main {{ grid-template-columns: 1fr; }}
       canvas {{ height: 52vh; min-height: 300px; }}
@@ -1168,13 +1175,46 @@ def _write_lightweight_compare_viewer(
   </div>
 </header>
 <main>
-  <section><h2>{dataset} | Baseline: protected expression depth v3</h2><canvas id="baseline"></canvas></section>
-  <section><h2>{dataset} | New: unified multiview nasal shape</h2><canvas id="candidate"></canvas></section>
+  <section>
+    <h2>{dataset} | Baseline: protected expression depth v3</h2>
+    <div class="viewer-frame">
+      <canvas id="baseline"></canvas>
+      <div class="viewer-status" id="baseline-status" role="status" aria-live="polite">Loading embedded model...</div>
+    </div>
+  </section>
+  <section>
+    <h2>{dataset} | New: unified multiview nasal shape</h2>
+    <div class="viewer-frame">
+      <canvas id="candidate"></canvas>
+      <div class="viewer-status" id="candidate-status" role="status" aria-live="polite">Loading embedded model...</div>
+    </div>
+  </section>
 </main>
 <script>
 const embeddedGlbs = {payload};
 const state = {{yaw: 0, pitch: 0, zoom: 1}};
 const renderers = [];
+window.viewerReady = false;
+window.viewerError = null;
+
+function setCanvasStatus(id, message, isError = false) {{
+  const status = document.getElementById(`${{id}}-status`);
+  status.hidden = false;
+  status.textContent = message;
+  status.classList.toggle("error", isError);
+  status.dataset.error = isError ? "true" : "false";
+}}
+function hideCanvasStatus(id) {{
+  const status = document.getElementById(`${{id}}-status`);
+  status.hidden = true;
+  status.classList.remove("error");
+  status.dataset.error = "false";
+}}
+function errorDetail(error) {{
+  return error instanceof Error && error.message
+    ? error.message
+    : String(error);
+}}
 
 function decodeBase64(value) {{
   const raw = atob(value), bytes = new Uint8Array(raw.length);
@@ -1303,6 +1343,15 @@ async function makeRenderer(canvas, encoded) {{
   const center=bounds[0].map((value,index)=>(value+bounds[1][index])/2), extent=bounds[0].map((value,index)=>bounds[1][index]-value), scale=Math.max(...extent)*0.62 || 1;
   return {{canvas, gl, program, drawables, center, scale}};
 }}
+async function initializeRenderer(id, encoded) {{
+  try {{
+    return await makeRenderer(document.getElementById(id), encoded);
+  }} catch (error) {{
+    const detail = `${{id}}: ${{errorDetail(error)}}`;
+    setCanvasStatus(id, `Error: ${{detail}}`, true);
+    throw new Error(detail);
+  }}
+}}
 function draw() {{
   for (const renderer of renderers) {{
     const {{canvas, gl, program}}=renderer, width=Math.max(1,Math.floor(canvas.clientWidth*devicePixelRatio)), height=Math.max(1,Math.floor(canvas.clientHeight*devicePixelRatio));
@@ -1333,7 +1382,10 @@ function draw() {{
   requestAnimationFrame(draw);
 }}
 async function start() {{
-  const baseline=await makeRenderer(document.getElementById("baseline"),embeddedGlbs.baseline), candidate=await makeRenderer(document.getElementById("candidate"),embeddedGlbs.candidate);
+  const [baseline, candidate] = await Promise.all([
+    initializeRenderer("baseline", embeddedGlbs.baseline),
+    initializeRenderer("candidate", embeddedGlbs.candidate)
+  ]);
   candidate.sharedCenter=baseline.center; candidate.sharedScale=baseline.scale; renderers.push(baseline,candidate);
   for (const canvas of document.querySelectorAll("canvas")) {{
     let dragging=false,lastX=0,lastY=0; canvas.addEventListener("pointerdown",event=>{{dragging=true;lastX=event.clientX;lastY=event.clientY;canvas.setPointerCapture(event.pointerId);}});
@@ -1342,8 +1394,22 @@ async function start() {{
   }}
   document.querySelectorAll("[data-view]").forEach(button=>button.addEventListener("click",()=>{{state.pitch=0;state.yaw={{front:0,left:.73,right:-.73}}[button.dataset.view];}}));
   draw();
+  hideCanvasStatus("baseline");
+  hideCanvasStatus("candidate");
+  window.viewerError = null;
+  window.viewerReady = true;
 }}
-start().catch(error=>{{document.querySelector("main").insertAdjacentHTML("afterbegin",`<p class="error">${{String(error)}}</p>`);}});
+start().catch(error=>{{
+  const message = errorDetail(error);
+  window.viewerReady = false;
+  window.viewerError = message;
+  for (const id of ["baseline", "candidate"]) {{
+    const status = document.getElementById(`${{id}}-status`);
+    if (status.dataset.error !== "true") {{
+      setCanvasStatus(id, `Error: ${{message}}`, true);
+    }}
+  }}
+}});
 </script>
 </body>
 </html>
@@ -1392,7 +1458,15 @@ def _write_viewer(
         dataset_label,
     )
     if template is None:
-        required += ("embeddedGlbs", '"baseline":"', '"candidate":"')
+        required += (
+            "embeddedGlbs",
+            '"baseline":"',
+            '"candidate":"',
+            'role="status"',
+            "window.viewerReady",
+            "window.viewerError",
+            "Promise.all",
+        )
     else:
         required += ("baseline: '", "candidate: '")
     missing = [token for token in required if token not in text]

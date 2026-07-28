@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
 import os
+import socket
 import shutil
 import struct
 import subprocess
+import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -652,6 +656,18 @@ def test_default_viewer_is_self_contained_without_historical_template(
     assert 'data-view="front"' in text
     assert 'data-view="left"' in text
     assert 'data-view="right"' in text
+    assert text.count('role="status"') == 2
+    assert 'id="baseline-status"' in text
+    assert 'id="candidate-status"' in text
+    assert text.count("Loading embedded model...") >= 2
+    assert ".viewer-status[hidden]" in text
+    assert "window.viewerReady = false" in text
+    assert "window.viewerReady = true" in text
+    assert "window.viewerError = null" in text
+    assert "window.viewerError = message" in text
+    assert "await Promise.all([" in text
+    assert "setCanvasStatus(id, `Error: ${detail}`, true)" in text
+    assert "hideCanvasStatus" in text
 
 
 def test_default_viewer_parses_gltf_alpha_modes_and_configures_blending(
@@ -695,6 +711,143 @@ def test_default_viewer_parses_gltf_alpha_modes_and_configures_blending(
     assert "gl.depthMask(true)" in text
 
 
+def _unused_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+async def _capture_viewer_when_ready(
+    chrome: Path,
+    viewer: Path,
+    profile: Path,
+) -> bytes:
+    websockets = pytest.importorskip("websockets")
+    port = _unused_local_port()
+    process = subprocess.Popen(
+        [
+            str(chrome),
+            "--headless=new",
+            "--no-sandbox",
+            "--enable-unsafe-swiftshader",
+            "--use-angle=swiftshader",
+            "--remote-allow-origins=*",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--window-size=1200,800",
+            viewer.resolve().as_uri(),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        endpoint = f"http://127.0.0.1:{port}/json/list"
+        deadline = time.monotonic() + 15.0
+        page = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise AssertionError(
+                    f"headless Chrome exited with {process.returncode}"
+                )
+            try:
+                with urllib.request.urlopen(endpoint, timeout=0.5) as response:
+                    pages = json.loads(response.read().decode("utf-8"))
+                page = next(
+                    (
+                        item
+                        for item in pages
+                        if item.get("type") == "page"
+                        and item.get("webSocketDebuggerUrl")
+                    ),
+                    None,
+                )
+                if page is not None:
+                    break
+            except (OSError, ValueError):
+                pass
+            await asyncio.sleep(0.05)
+        if page is None:
+            raise AssertionError("Chrome DevTools page was not available")
+
+        async with websockets.connect(
+            page["webSocketDebuggerUrl"],
+            open_timeout=5,
+            max_size=20 * 1024 * 1024,
+        ) as websocket:
+            command_id = 0
+
+            async def command(method, params=None):
+                nonlocal command_id
+                command_id += 1
+                expected_id = command_id
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": expected_id,
+                            "method": method,
+                            "params": {} if params is None else params,
+                        }
+                    )
+                )
+                while True:
+                    message = json.loads(
+                        await asyncio.wait_for(
+                            websocket.recv(),
+                            timeout=10,
+                        )
+                    )
+                    if message.get("id") != expected_id:
+                        continue
+                    if "error" in message:
+                        raise AssertionError(message["error"])
+                    return message.get("result", {})
+
+            await command(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": 1200,
+                    "height": 800,
+                    "deviceScaleFactor": 1,
+                    "mobile": False,
+                },
+            )
+            ready_deadline = time.monotonic() + 30.0
+            while time.monotonic() < ready_deadline:
+                evaluation = await command(
+                    "Runtime.evaluate",
+                    {
+                        "expression": (
+                            "({ready: window.viewerReady === true, "
+                            "error: window.viewerError || null})"
+                        ),
+                        "returnByValue": True,
+                    },
+                )
+                state = evaluation["result"].get("value", {})
+                if state.get("error"):
+                    raise AssertionError(
+                        f"viewer initialization failed: {state['error']}"
+                    )
+                if state.get("ready"):
+                    screenshot = await command(
+                        "Page.captureScreenshot",
+                        {
+                            "format": "png",
+                            "captureBeyondViewport": False,
+                        },
+                    )
+                    return base64.b64decode(screenshot["data"])
+                await asyncio.sleep(0.05)
+            raise AssertionError("viewerReady was not set within 30 seconds")
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_default_viewer_discards_transparent_blend_pixels_in_headless_chrome(
     tmp_path: Path,
 ) -> None:
@@ -731,25 +884,15 @@ def test_default_viewer_discards_transparent_blend_pixels_in_headless_chrome(
         dataset_label="alpha_fixture",
     )
     screenshot = tmp_path / "alpha-viewer.png"
-    completed = subprocess.run(
-        [
-            str(chrome),
-            "--headless=new",
-            "--no-sandbox",
-            "--enable-unsafe-swiftshader",
-            "--use-angle=swiftshader",
-            f"--user-data-dir={tmp_path / 'chrome-profile'}",
-            "--window-size=1200,800",
-            "--virtual-time-budget=4000",
-            f"--screenshot={screenshot}",
-            viewer.resolve().as_uri(),
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=30,
+    screenshot.write_bytes(
+        asyncio.run(
+            _capture_viewer_when_ready(
+                Path(chrome),
+                viewer,
+                tmp_path / "chrome-profile",
+            )
+        )
     )
-    assert completed.returncode == 0, completed.stderr
     assert screenshot.is_file() and screenshot.stat().st_size > 0
     rendered = Image.open(screenshot).convert("RGB")
     background = (15, 20, 28)
