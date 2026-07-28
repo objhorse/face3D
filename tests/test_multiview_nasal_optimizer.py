@@ -47,6 +47,23 @@ def _synthetic_evaluator(context, residual_function):
     return evaluate
 
 
+def _solver_result(context, **overrides):
+    count = context.parameter_count
+    values = {
+        "x": np.zeros(count, dtype=np.float64),
+        "success": True,
+        "status": 1,
+        "message": "synthetic solver result",
+        "nfev": 1,
+        "njev": 1,
+        "optimality": 0.0,
+        "active_mask": np.zeros(count, dtype=np.int64),
+        "jac": np.eye(count, dtype=np.float64),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_default_zero_initialization_keeps_exact_zero_solution(monkeypatch):
     context, _ = _objective_problem()
     baseline = np.array(context.baseline_vertices, copy=True)
@@ -239,7 +256,46 @@ def test_no_positive_confidence_evidence_returns_failure():
     assert result.objective_evaluation_count == 0
 
 
-def test_singular_nonzero_problem_returns_failure(monkeypatch):
+def test_zero_image_weights_disable_all_effective_evidence(monkeypatch):
+    context, _ = _objective_problem()
+
+    def forbidden_solver(*_args, **_kwargs):
+        raise AssertionError("solver must not run without enabled evidence")
+
+    monkeypatch.setattr(nasal_optimizer, "least_squares", forbidden_solver)
+    result = fit_multiview_nasal_shape(
+        context,
+        objective_config=MultiviewNasalObjectiveConfig(
+            front_image_weight=0.0,
+            side_image_weight=0.0,
+        ),
+    )
+
+    assert not result.success
+    assert result.failure_reason == "no_effective_observations"
+    assert all(
+        value > 0
+        for value in result.report[
+            "raw_effective_observation_counts"
+        ].values()
+    )
+    assert all(
+        value == 0.0
+        for value in result.report[
+            "weighted_effective_observation_counts"
+        ].values()
+    )
+    assert all(
+        value == 0.0
+        for value in result.report[
+            "weighted_effective_confidence_sums"
+        ].values()
+    )
+
+
+def test_solver_success_is_not_overridden_by_nonzero_low_rank_problem(
+    monkeypatch,
+):
     context, _ = _objective_problem()
     monkeypatch.setattr(
         nasal_optimizer,
@@ -252,11 +308,40 @@ def test_singular_nonzero_problem_returns_failure(monkeypatch):
 
     result = fit_multiview_nasal_shape(context)
 
-    assert not result.success
-    assert result.failure_reason == "singular_jacobian"
+    assert result.success
+    assert result.failure_reason is None
     assert result.jacobian_rank == 0
     assert result.final_objective is not None
     assert result.baseline_unchanged is True
+
+
+def test_unsuccessful_rank_deficient_solver_is_classified_singular(
+    monkeypatch,
+):
+    context, _ = _objective_problem()
+
+    def unsuccessful(fun, x0, **_kwargs):
+        fun(x0)
+        return _solver_result(
+            context,
+            x=np.asarray(x0),
+            success=False,
+            status=0,
+            message="maximum evaluations exceeded",
+            jac=np.zeros(
+                (context.parameter_count, context.parameter_count),
+                dtype=np.float64,
+            ),
+        )
+
+    monkeypatch.setattr(nasal_optimizer, "least_squares", unsuccessful)
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert not result.success
+    assert result.failure_reason == "singular_jacobian"
+    assert result.jacobian_rank == 0
+    assert result.report["selected_coefficients_source"] == "solver_final"
 
 
 def test_solver_exception_returns_failure_with_available_trace(monkeypatch):
@@ -277,6 +362,177 @@ def test_solver_exception_returns_failure_with_available_trace(monkeypatch):
     assert len(result.iteration_trace) == 1
     assert result.final_objective is not None
     assert "synthetic solver failure" in result.solver_message
+
+
+def test_solver_endpoint_wins_over_lower_cost_finite_difference_probe(
+    monkeypatch,
+):
+    context, _ = _objective_problem()
+    probe = np.full(context.parameter_count, 0.2)
+    solved_x = np.zeros(context.parameter_count)
+    synthetic = _synthetic_evaluator(
+        context,
+        lambda coefficients: coefficients - probe,
+    )
+    full_coefficients = []
+    real_full = evaluate_multiview_nasal_objective
+
+    def solver(fun, _x0, **_kwargs):
+        fun(probe)
+        return _solver_result(
+            context,
+            x=solved_x,
+            nfev=1,
+            njev=1,
+        )
+
+    def captured_full(coefficients, *args):
+        full_coefficients.append(np.array(coefficients, copy=True))
+        return real_full(coefficients, *args)
+
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        synthetic,
+    )
+    monkeypatch.setattr(nasal_optimizer, "least_squares", solver)
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective",
+        captured_full,
+    )
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert result.success
+    np.testing.assert_array_equal(result.coefficients, solved_x)
+    np.testing.assert_array_equal(full_coefficients, [solved_x])
+    np.testing.assert_array_equal(
+        result.final_objective.candidate.vertices,
+        context.baseline_vertices,
+    )
+    np.testing.assert_array_equal(
+        result.iteration_trace[0].coefficients,
+        probe,
+    )
+    assert result.report["selected_coefficients_source"] == "solver_final"
+    assert result.report["final_objective_role"] == "solver_endpoint"
+    assert result.objective_evaluation_count == 1
+    assert result.nfev == 1
+
+
+def test_active_bound_low_rank_scipy_success_remains_success(monkeypatch):
+    context, _ = _objective_problem()
+    endpoint = np.zeros(context.parameter_count)
+    endpoint[0] = context.parameter_lower_bounds[0]
+    active_mask = np.zeros(context.parameter_count, dtype=np.int64)
+    active_mask[0] = -1
+    jacobian = np.eye(context.parameter_count, dtype=np.float64)
+    jacobian[-1] = 0.0
+
+    def solver(fun, x0, **_kwargs):
+        fun(x0)
+        return _solver_result(
+            context,
+            x=endpoint,
+            active_mask=active_mask,
+            jac=jacobian,
+        )
+
+    monkeypatch.setattr(nasal_optimizer, "least_squares", solver)
+    result = fit_multiview_nasal_shape(context)
+
+    assert result.success
+    np.testing.assert_array_equal(result.coefficients, endpoint)
+    np.testing.assert_array_equal(result.active_mask, active_mask)
+    assert result.jacobian_rank == context.parameter_count - 1
+    assert result.failure_reason is None
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "error_fragment"),
+    [
+        (
+            "x",
+            lambda context: np.full(context.parameter_count, np.nan),
+            "x:",
+        ),
+        ("optimality", lambda _context: np.nan, "optimality:"),
+        (
+            "active_mask",
+            lambda context: np.full(context.parameter_count, 7),
+            "active_mask:",
+        ),
+        ("nfev", lambda _context: "many", "nfev:"),
+        ("njev", lambda _context: -1, "njev:"),
+    ],
+)
+def test_malformed_solver_result_returns_failure_without_raising(
+    monkeypatch,
+    field,
+    bad_value,
+    error_fragment,
+):
+    context, _ = _objective_problem()
+
+    def malformed(fun, x0, **_kwargs):
+        fun(x0)
+        return _solver_result(
+            context,
+            **{field: bad_value(context)},
+        )
+
+    monkeypatch.setattr(nasal_optimizer, "least_squares", malformed)
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert not result.success
+    assert result.failure_reason == "solver_failed"
+    assert result.baseline_unchanged is True
+    assert any(
+        error_fragment in error
+        for error in result.report["diagnostic_parse_errors"]
+    )
+    assert "invalid solver result" in result.solver_message
+    if field == "x":
+        np.testing.assert_array_equal(
+            result.coefficients,
+            np.zeros(context.parameter_count),
+        )
+        assert (
+            result.report["selected_coefficients_source"]
+            == "initial_diagnostic_fallback"
+        )
+    else:
+        assert result.report["selected_coefficients_source"] == "solver_final"
+
+
+def test_solver_endpoint_full_evaluation_failure_is_captured(monkeypatch):
+    context, _ = _objective_problem()
+    endpoint = np.full(context.parameter_count, 0.1)
+
+    def solver(fun, x0, **_kwargs):
+        fun(x0)
+        return _solver_result(context, x=endpoint)
+
+    def broken_full(*_args, **_kwargs):
+        raise RuntimeError("synthetic full evaluation failure")
+
+    monkeypatch.setattr(nasal_optimizer, "least_squares", solver)
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective",
+        broken_full,
+    )
+
+    result = fit_multiview_nasal_shape(context)
+
+    assert not result.success
+    assert result.failure_reason == "objective_evaluation_failed"
+    np.testing.assert_array_equal(result.coefficients, endpoint)
+    assert result.final_objective is None
+    assert result.report["selected_coefficients_source"] == "solver_final"
+    assert "synthetic full evaluation failure" in result.solver_message
 
 
 def test_scipy_receives_fixed_numerical_contract(monkeypatch):
@@ -300,16 +556,10 @@ def test_scipy_receives_fixed_numerical_contract(monkeypatch):
         captured.update(kwargs)
         residuals = fun(x0)
         count = len(x0)
-        return SimpleNamespace(
+        return _solver_result(
+            context,
             x=np.asarray(x0),
-            fun=residuals,
-            success=True,
-            status=1,
             message="spy converged",
-            nfev=1,
-            njev=1,
-            optimality=0.0,
-            active_mask=np.zeros(count, dtype=np.int64),
             jac=np.eye(count, dtype=np.float64),
         )
 

@@ -348,15 +348,206 @@ def _objective_term_trace(
     }
 
 
-def _jacobian_rank(jacobian) -> Optional[int]:
-    if jacobian is None:
+@dataclass(frozen=True)
+class _ParsedSolverResult:
+    x: Optional[np.ndarray]
+    success: bool
+    status: int
+    message: str
+    nfev: int
+    njev: Optional[int]
+    optimality: Optional[float]
+    active_mask: np.ndarray
+    jacobian_rank: Optional[int]
+    errors: Tuple[str, ...]
+
+
+_MISSING = object()
+
+
+def _solver_field(solved, name: str, errors) -> object:
+    try:
+        return getattr(solved, name)
+    except Exception as exc:
+        errors.append(
+            f"{name}: unavailable ({type(exc).__name__}: {exc})"
+        )
+        return _MISSING
+
+
+def _solver_integer(
+    solved,
+    name: str,
+    errors,
+    *,
+    optional: bool = False,
+) -> Optional[int]:
+    value = _solver_field(solved, name, errors)
+    if optional and value is None:
         return None
-    if hasattr(jacobian, "toarray"):
-        jacobian = jacobian.toarray()
-    array = np.asarray(jacobian, dtype=np.float64)
-    if array.ndim != 2 or not np.isfinite(array).all():
-        return None
-    return int(np.linalg.matrix_rank(array))
+    if (
+        value is _MISSING
+        or isinstance(value, (bool, np.bool_))
+        or not isinstance(value, Integral)
+        or int(value) < 0
+    ):
+        if value is not _MISSING:
+            errors.append(f"{name}: expected a non-negative integer")
+        return None if optional else 0
+    return int(value)
+
+
+def _parse_solver_result(
+    solved,
+    context: MultiviewNasalObjectiveContext,
+) -> _ParsedSolverResult:
+    errors = []
+    parameter_count = context.parameter_count
+
+    raw_x = _solver_field(solved, "x", errors)
+    x = None
+    if raw_x is not _MISSING:
+        try:
+            candidate_x = np.asarray(raw_x, dtype=np.float64)
+        except Exception as exc:
+            errors.append(
+                f"x: not numeric ({type(exc).__name__}: {exc})"
+            )
+        else:
+            if (
+                candidate_x.shape != (parameter_count,)
+                or not np.isfinite(candidate_x).all()
+                or np.any(candidate_x < context.parameter_lower_bounds)
+                or np.any(candidate_x > context.parameter_upper_bounds)
+            ):
+                errors.append(
+                    "x: expected a finite in-bounds parameter vector"
+                )
+            else:
+                x = np.array(candidate_x, dtype=np.float64, copy=True)
+
+    raw_success = _solver_field(solved, "success", errors)
+    success = False
+    if isinstance(raw_success, (bool, np.bool_)):
+        success = bool(raw_success)
+    elif raw_success is not _MISSING:
+        errors.append("success: expected a boolean")
+
+    raw_status = _solver_field(solved, "status", errors)
+    if (
+        raw_status is _MISSING
+        or isinstance(raw_status, (bool, np.bool_))
+        or not isinstance(raw_status, Integral)
+    ):
+        if raw_status is not _MISSING:
+            errors.append("status: expected an integer")
+        status = 0
+    else:
+        status = int(raw_status)
+
+    raw_message = _solver_field(solved, "message", errors)
+    if raw_message is _MISSING:
+        message = "invalid solver result"
+    else:
+        try:
+            message = str(raw_message)
+        except Exception as exc:
+            errors.append(
+                f"message: cannot convert to text "
+                f"({type(exc).__name__}: {exc})"
+            )
+            message = "invalid solver result"
+
+    nfev = _solver_integer(solved, "nfev", errors)
+    njev = _solver_integer(solved, "njev", errors, optional=True)
+
+    raw_optimality = _solver_field(solved, "optimality", errors)
+    optimality = None
+    if raw_optimality is not _MISSING:
+        try:
+            optimality_value = float(raw_optimality)
+        except Exception as exc:
+            errors.append(
+                f"optimality: not numeric ({type(exc).__name__}: {exc})"
+            )
+        else:
+            if (
+                not np.isfinite(optimality_value)
+                or optimality_value < 0.0
+            ):
+                errors.append(
+                    "optimality: expected a finite non-negative value"
+                )
+            else:
+                optimality = optimality_value
+
+    raw_active_mask = _solver_field(solved, "active_mask", errors)
+    active_mask = np.zeros(parameter_count, dtype=np.int64)
+    if raw_active_mask is not _MISSING:
+        try:
+            candidate_mask = np.asarray(raw_active_mask)
+        except Exception as exc:
+            errors.append(
+                f"active_mask: cannot convert "
+                f"({type(exc).__name__}: {exc})"
+            )
+        else:
+            if (
+                candidate_mask.shape != (parameter_count,)
+                or not np.issubdtype(candidate_mask.dtype, np.integer)
+                or np.any(~np.isin(candidate_mask, (-1, 0, 1)))
+            ):
+                errors.append(
+                    "active_mask: expected -1, 0, or 1 per parameter"
+                )
+            else:
+                active_mask = candidate_mask.astype(
+                    np.int64,
+                    copy=True,
+                )
+
+    raw_jacobian = _solver_field(solved, "jac", errors)
+    jacobian_rank = None
+    if raw_jacobian is not _MISSING:
+        try:
+            if hasattr(raw_jacobian, "toarray"):
+                raw_jacobian = raw_jacobian.toarray()
+            jacobian = np.asarray(raw_jacobian, dtype=np.float64)
+        except Exception as exc:
+            errors.append(
+                f"jac: cannot convert ({type(exc).__name__}: {exc})"
+            )
+        else:
+            if (
+                jacobian.ndim != 2
+                or jacobian.shape[1] != parameter_count
+                or not np.isfinite(jacobian).all()
+            ):
+                errors.append(
+                    "jac: expected a finite matrix with one column "
+                    "per parameter"
+                )
+            else:
+                try:
+                    jacobian_rank = int(np.linalg.matrix_rank(jacobian))
+                except Exception as exc:
+                    errors.append(
+                        f"jac: rank failed "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+
+    return _ParsedSolverResult(
+        x=x,
+        success=success,
+        status=status,
+        message=message,
+        nfev=int(nfev),
+        njev=njev,
+        optimality=optimality,
+        active_mask=active_mask,
+        jacobian_rank=jacobian_rank,
+        errors=tuple(errors),
+    )
 
 
 def _safe_full_evaluation(
@@ -372,6 +563,10 @@ def _safe_full_evaluation(
         )
     except Exception as exc:  # Diagnostics must never obscure solver failure.
         return None, f"{type(exc).__name__}: {exc}"
+    if not isinstance(result, MultiviewNasalObjectiveResult):
+        return None, (
+            "TypeError: full objective returned an invalid result type"
+        )
     return result, None
 
 
@@ -492,22 +687,51 @@ def fit_multiview_nasal_shape(
         )
     initial = np.array(initial, dtype=np.float64, copy=True)
 
-    evidence_counts = {
+    raw_evidence_counts = {
         term.name: int(np.count_nonzero(term.confidence > 0.0))
         for term in context.image_terms
     }
-    evidence_sums = {
+    raw_evidence_sums = {
         term.name: float(np.sum(term.confidence))
         for term in context.image_terms
     }
-    if sum(evidence_counts.values()) == 0:
+    image_weights = {
+        term.name: (
+            float(objective_limits.front_image_weight)
+            if term.semantic_view == "front"
+            else float(objective_limits.side_image_weight)
+        )
+        for term in context.image_terms
+    }
+    weighted_evidence_counts = {
+        name: float(raw_evidence_counts[name]) * image_weights[name]
+        for name in raw_evidence_counts
+    }
+    weighted_evidence_sums = {
+        name: raw_evidence_sums[name] * image_weights[name]
+        for name in raw_evidence_sums
+    }
+    evidence_report = {
+        "effective_observation_counts": raw_evidence_counts,
+        "effective_confidence_sums": raw_evidence_sums,
+        "raw_effective_observation_counts": raw_evidence_counts,
+        "raw_effective_confidence_sums": raw_evidence_sums,
+        "image_term_weights": image_weights,
+        "weighted_effective_observation_counts": (
+            weighted_evidence_counts
+        ),
+        "weighted_effective_confidence_sums": weighted_evidence_sums,
+    }
+    if sum(weighted_evidence_counts.values()) <= 0.0:
         return _result(
             success=False,
             coefficients=initial,
             final_objective=None,
             failure_reason="no_effective_observations",
             solver_status=0,
-            solver_message="no image term has positive-confidence evidence",
+            solver_message=(
+                "no enabled image term has positive-confidence evidence"
+            ),
             nfev=0,
             njev=None,
             evaluation_count=0,
@@ -516,8 +740,7 @@ def fit_multiview_nasal_shape(
             jacobian_rank=None,
             trace=(),
             report={
-                "effective_observation_counts": evidence_counts,
-                "effective_confidence_sums": evidence_sums,
+                **evidence_report,
                 "selected_coefficients_source": "initial",
             },
         )
@@ -533,13 +756,11 @@ def fit_multiview_nasal_shape(
     evaluation_count = 0
     best_coefficients = initial.copy()
     best_total_cost = np.inf
-    best_residuals = None
 
     def residual(coefficients):
         nonlocal evaluation_count
         nonlocal best_coefficients
         nonlocal best_total_cost
-        nonlocal best_residuals
         evaluation_count += 1
         try:
             evaluated = evaluate_multiview_nasal_objective_residuals(
@@ -574,7 +795,6 @@ def fit_multiview_nasal_shape(
                 copy=True,
             )
             best_total_cost = total_cost
-            best_residuals = np.array(residuals, copy=True)
         trace_improved = (
             not trace
             or total_cost
@@ -585,7 +805,7 @@ def fit_multiview_nasal_shape(
             trace.append(
                 NasalOptimizationIteration(
                     function_evaluation=evaluation_count,
-                    coefficients=best_coefficients,
+                    coefficients=coefficients,
                     total_robust_cost=total_cost,
                     robust_term_costs=term_costs,
                 )
@@ -602,8 +822,7 @@ def fit_multiview_nasal_shape(
         "loss": objective_limits.robust_loss,
         "f_scale": float(objective_limits.robust_f_scale),
         "x_scale": tuple(float(value) for value in x_scale),
-        "effective_observation_counts": evidence_counts,
-        "effective_confidence_sums": evidence_sums,
+        **evidence_report,
     }
     try:
         solved = least_squares(
@@ -624,7 +843,6 @@ def fit_multiview_nasal_shape(
             diff_step=solver_limits.diff_step,
             max_nfev=solver_limits.max_nfev,
         )
-        residual(np.asarray(solved.x, dtype=np.float64))
     except _ObjectiveEvaluationError as exc:
         diagnostic, diagnostic_error = _safe_full_evaluation(
             best_coefficients,
@@ -690,108 +908,118 @@ def fit_multiview_nasal_shape(
             report=report,
         )
 
-    selected = best_coefficients
-    solver_x = np.asarray(solved.x, dtype=np.float64)
+    parsed = _parse_solver_result(solved, context)
+    endpoint_is_valid = parsed.x is not None
+    selected = parsed.x if endpoint_is_valid else initial
     selected_source = (
         "solver_final"
-        if np.array_equal(selected, solver_x)
-        else "best_observed"
+        if endpoint_is_valid
+        else "initial_diagnostic_fallback"
     )
     final_objective, diagnostic_error = _safe_full_evaluation(
         selected,
         context,
         objective_limits,
     )
-    status = int(getattr(solved, "status", 0))
-    message = str(getattr(solved, "message", ""))
-    nfev = int(getattr(solved, "nfev", 0))
-    raw_njev = getattr(solved, "njev", None)
-    njev = None if raw_njev is None else int(raw_njev)
-    raw_optimality = getattr(solved, "optimality", None)
-    optimality = (
-        None if raw_optimality is None else float(raw_optimality)
-    )
-    active_mask = np.asarray(
-        getattr(
-            solved,
-            "active_mask",
-            np.zeros(context.parameter_count, dtype=np.int64),
-        ),
-        dtype=np.int64,
-    )
-    rank = _jacobian_rank(getattr(solved, "jac", None))
     report = dict(common_report)
     report.update(
         {
             "selected_coefficients_source": selected_source,
-            "solver_success": bool(getattr(solved, "success", False)),
-            "solver_final_coefficients": tuple(float(value) for value in solver_x),
-            "best_observed_robust_cost": float(best_total_cost),
+            "solver_success": parsed.success,
+            "solver_final_coefficients": (
+                None
+                if parsed.x is None
+                else tuple(float(value) for value in parsed.x)
+            ),
+            "best_observed_robust_cost": (
+                None
+                if not np.isfinite(best_total_cost)
+                else float(best_total_cost)
+            ),
+            "best_observed_coefficients": (
+                None
+                if not trace
+                else tuple(float(value) for value in best_coefficients)
+            ),
             "diagnostic_error": diagnostic_error,
-            "jacobian_rank": rank,
+            "diagnostic_parse_errors": parsed.errors,
+            "jacobian_rank": parsed.jacobian_rank,
             "parameter_count": context.parameter_count,
+            "final_objective_role": (
+                "solver_endpoint"
+                if endpoint_is_valid
+                else "initial_diagnostic_fallback"
+            ),
         }
     )
-    if final_objective is None:
+    if endpoint_is_valid and final_objective is None:
         return _result(
             success=False,
             coefficients=selected,
             final_objective=None,
             failure_reason="objective_evaluation_failed",
-            solver_status=status,
+            solver_status=parsed.status,
             solver_message=(
                 "final objective evaluation failed: "
                 f"{diagnostic_error}"
             ),
-            nfev=nfev,
-            njev=njev,
+            nfev=parsed.nfev,
+            njev=parsed.njev,
             evaluation_count=evaluation_count,
-            optimality=optimality,
-            active_mask=active_mask,
-            jacobian_rank=rank,
+            optimality=parsed.optimality,
+            active_mask=parsed.active_mask,
+            jacobian_rank=parsed.jacobian_rank,
             trace=trace,
             report=report,
         )
-    if not bool(getattr(solved, "success", False)):
+    if parsed.errors:
+        parse_message = "; ".join(parsed.errors)
         return _result(
             success=False,
             coefficients=selected,
             final_objective=final_objective,
             failure_reason="solver_failed",
-            solver_status=status,
-            solver_message=message,
-            nfev=nfev,
-            njev=njev,
+            solver_status=parsed.status,
+            solver_message=(
+                f"{parsed.message} | invalid solver result: {parse_message}"
+            ),
+            nfev=parsed.nfev,
+            njev=parsed.njev,
             evaluation_count=evaluation_count,
-            optimality=optimality,
-            active_mask=active_mask,
-            jacobian_rank=rank,
+            optimality=parsed.optimality,
+            active_mask=parsed.active_mask,
+            jacobian_rank=parsed.jacobian_rank,
             trace=trace,
             report=report,
         )
-    exact_zero_residual = (
-        best_residuals is not None
-        and np.count_nonzero(best_residuals) == 0
-    )
-    if rank is None or (
-        rank < context.parameter_count and not exact_zero_residual
-    ):
+    if not parsed.success:
+        rank_deficient = (
+            parsed.jacobian_rank is not None
+            and parsed.jacobian_rank < context.parameter_count
+        )
+        failure_reason = (
+            "singular_jacobian" if rank_deficient else "solver_failed"
+        )
+        solver_message = parsed.message
+        if rank_deficient:
+            solver_message = (
+                f"{parsed.message} | finite-difference Jacobian rank "
+                f"{parsed.jacobian_rank} for "
+                f"{context.parameter_count} parameters"
+            )
         return _result(
             success=False,
             coefficients=selected,
             final_objective=final_objective,
-            failure_reason="singular_jacobian",
-            solver_status=status,
-            solver_message=(
-                "solver converged but the finite-difference Jacobian "
-                f"rank is {rank!r} for {context.parameter_count} parameters"
-            ),
-            nfev=nfev,
-            njev=njev,
+            failure_reason=failure_reason,
+            solver_status=parsed.status,
+            solver_message=solver_message,
+            nfev=parsed.nfev,
+            njev=parsed.njev,
             evaluation_count=evaluation_count,
-            optimality=optimality,
-            active_mask=active_mask,
-            jacobian_rank=rank,
+            optimality=parsed.optimality,
+            active_mask=parsed.active_mask,
+            jacobian_rank=parsed.jacobian_rank,
             trace=trace,
             report=report,
         )
@@ -800,14 +1028,14 @@ def fit_multiview_nasal_shape(
         coefficients=selected,
         final_objective=final_objective,
         failure_reason=None,
-        solver_status=status,
-        solver_message=message,
-        nfev=nfev,
-        njev=njev,
+        solver_status=parsed.status,
+        solver_message=parsed.message,
+        nfev=parsed.nfev,
+        njev=parsed.njev,
         evaluation_count=evaluation_count,
-        optimality=optimality,
-        active_mask=active_mask,
-        jacobian_rank=rank,
+        optimality=parsed.optimality,
+        active_mask=parsed.active_mask,
+        jacobian_rank=parsed.jacobian_rank,
         trace=trace,
         report=report,
     )
