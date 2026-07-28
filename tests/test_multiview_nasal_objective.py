@@ -2522,6 +2522,30 @@ def test_soft_z_buffer_suppresses_deep_rear_point_at_extreme_x(rear_x):
     assert weights[0, 1] / weights[0, 0] < 1e-8
 
 
+@pytest.mark.parametrize("direction_sign", [-1, 1])
+def test_direction_score_cannot_capture_locality_anchor_at_work_width(
+    direction_sign,
+):
+    config = MultiviewNasalObjectiveConfig()
+    rear_x = 5000.0 if direction_sign > 0 else -4361.0
+
+    pixels, _depth, weights, front_depth, _visibility = (
+        nasal_objective._soft_profile_slots(
+            np.array([[320.0, 240.0], [rear_x, 240.0]]),
+            np.array([1.0, 20.0]),
+            np.array([240.0]),
+            direction_sign,
+            config,
+            1e-4,
+            work_size=(640, 480),
+        )
+    )
+
+    assert weights[0, 1] / weights[0, 0] < 1e-8
+    assert abs(pixels[0, 0] - 320.0) < 1e-6
+    assert 1.0 <= front_depth[0] < 1.1
+
+
 def test_soft_profile_keeps_near_depth_exterior_point_observable():
     config = MultiviewNasalObjectiveConfig()
     projected = np.array([[50.0, 50.0], [80.0, 50.0]])

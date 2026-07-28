@@ -3690,17 +3690,13 @@ def _soft_profile_slots(
             / float(config.profile_depth_visibility_scale)
         )
     )
-    preliminary_logits = (
-        vertical_logits
-        + directional_logits
-        + visibility_logits
-    )
+    anchor_logits = vertical_logits + visibility_logits
     preliminary_max = np.max(
-        preliminary_logits,
+        anchor_logits,
         axis=1,
         keepdims=True,
     )
-    preliminary_exp = np.exp(preliminary_logits - preliminary_max)
+    preliminary_exp = np.exp(anchor_logits - preliminary_max)
     preliminary_weights = preliminary_exp / np.sum(
         preliminary_exp,
         axis=1,
@@ -3721,7 +3717,7 @@ def _soft_profile_slots(
         * squared_spatial_distance
         / float(config.profile_visibility_spatial_sigma_px) ** 2
     )
-    final_logits = preliminary_logits + local_logits
+    final_logits = anchor_logits + local_logits + directional_logits
     row_max = np.max(final_logits, axis=1, keepdims=True)
     stabilized = np.exp(final_logits - row_max)
     sums = np.sum(stabilized, axis=1, keepdims=True)
