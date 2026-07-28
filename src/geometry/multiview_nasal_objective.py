@@ -1956,6 +1956,12 @@ _ASYMMETRY_MODE_NAMES = (
     "alar_width_asymmetry",
     "alar_depth_asymmetry",
 )
+_MIN_DEPTH_BARRIER_WEIGHT = 100.0
+_FIXED_DEPTH_BARRIER_SCALE = 0.02
+_FIXED_DEPTH_BARRIER_SOFTMIN_TEMPERATURE = 1e-4
+_MIN_ROBUST_F_SCALE = 1.0
+_FIXED_OBSERVABLE_COEFFICIENT_BOUND = 3.0
+_FIXED_SEMANTIC_COEFFICIENT_BOUND = 3.0
 
 
 def _positive_tuple(
@@ -1982,7 +1988,12 @@ def _positive_tuple(
 
 @dataclass(frozen=True)
 class MultiviewNasalObjectiveConfig:
-    """Frozen subject-independent residual weights and robust-loss scales."""
+    """Frozen subject-independent residual, visibility, and solver scales.
+
+    Profile spatial scales use work pixels; all depth scales use fixed camera
+    depth units. Coefficient bounds and feasibility transition scales cannot
+    be varied per dataset.
+    """
 
     front_image_weight: float = 1.0
     side_image_weight: float = 1.0
@@ -2005,9 +2016,20 @@ class MultiviewNasalObjectiveConfig:
     symmetry_evidence_ceiling: float = 1.0
     profile_vertical_sigma_px: float = 6.0
     profile_softmax_temperature_px: float = 20.0
+    profile_visibility_spatial_sigma_px: float = 64.0
+    profile_front_depth_temperature: float = 0.05
+    profile_depth_visibility_scale: float = 2.0
+    profile_depth_validity_scale: float = 0.02
     depth_softplus_scale: float = 0.02
-    depth_barrier_weight: float = 0.10
-    depth_barrier_scale: float = 0.02
+    depth_barrier_weight: float = _MIN_DEPTH_BARRIER_WEIGHT
+    depth_barrier_scale: float = _FIXED_DEPTH_BARRIER_SCALE
+    depth_barrier_softmin_temperature: float = (
+        _FIXED_DEPTH_BARRIER_SOFTMIN_TEMPERATURE
+    )
+    observable_coefficient_bound: float = (
+        _FIXED_OBSERVABLE_COEFFICIENT_BOUND
+    )
+    semantic_coefficient_bound: float = _FIXED_SEMANTIC_COEFFICIENT_BOUND
     robust_loss: str = "soft_l1"
     robust_f_scale: float = 1.0
 
@@ -2022,15 +2044,63 @@ class MultiviewNasalObjectiveConfig:
             "depth_barrier_weight",
         ):
             _finite_real(name, getattr(self, name))
+        if float(self.depth_barrier_weight) < _MIN_DEPTH_BARRIER_WEIGHT:
+            raise ValueError(
+                "depth_barrier_weight must be at least "
+                f"{_MIN_DEPTH_BARRIER_WEIGHT:g}"
+            )
         for name in (
             "smoothness_scale",
             "profile_vertical_sigma_px",
             "profile_softmax_temperature_px",
+            "profile_visibility_spatial_sigma_px",
+            "profile_front_depth_temperature",
+            "profile_depth_visibility_scale",
+            "profile_depth_validity_scale",
             "depth_softplus_scale",
             "depth_barrier_scale",
+            "depth_barrier_softmin_temperature",
             "robust_f_scale",
         ):
             _finite_real(name, getattr(self, name), strictly_positive=True)
+        if float(self.depth_barrier_scale) != _FIXED_DEPTH_BARRIER_SCALE:
+            raise ValueError(
+                "depth_barrier_scale is the fixed feasibility value "
+                f"{_FIXED_DEPTH_BARRIER_SCALE:g}"
+            )
+        if (
+            float(self.depth_barrier_softmin_temperature)
+            != _FIXED_DEPTH_BARRIER_SOFTMIN_TEMPERATURE
+        ):
+            raise ValueError(
+                "depth_barrier_softmin_temperature is the fixed "
+                "feasibility value "
+                f"{_FIXED_DEPTH_BARRIER_SOFTMIN_TEMPERATURE:g}"
+            )
+        if float(self.robust_f_scale) < _MIN_ROBUST_F_SCALE:
+            raise ValueError(
+                f"robust_f_scale must be at least {_MIN_ROBUST_F_SCALE:g}"
+            )
+        for name, expected in (
+            (
+                "observable_coefficient_bound",
+                _FIXED_OBSERVABLE_COEFFICIENT_BOUND,
+            ),
+            (
+                "semantic_coefficient_bound",
+                _FIXED_SEMANTIC_COEFFICIENT_BOUND,
+            ),
+        ):
+            value = _finite_real(
+                name,
+                getattr(self, name),
+                strictly_positive=True,
+            )
+            if value != expected:
+                raise ValueError(
+                    f"{name} is the fixed subject-independent value "
+                    f"{expected:g}"
+                )
         floor = _finite_real(
             "symmetry_evidence_floor",
             self.symmetry_evidence_floor,
@@ -2278,6 +2348,8 @@ class MultiviewNasalObjectiveContext:
     smoothness_neighbor_offsets: np.ndarray
     smoothness_edge_count: int
     parameter_ordering: Tuple[str, ...]
+    parameter_lower_bounds: np.ndarray
+    parameter_upper_bounds: np.ndarray
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -2460,6 +2532,33 @@ class MultiviewNasalObjectiveContext:
                 "parameter_ordering must list observable modes then "
                 "canonical semantic modes"
             )
+        lower_bounds = np.asarray(
+            self.parameter_lower_bounds,
+            dtype=np.float64,
+        )
+        upper_bounds = np.asarray(
+            self.parameter_upper_bounds,
+            dtype=np.float64,
+        )
+        expected_bounds = np.r_[
+            np.full(rank, _FIXED_OBSERVABLE_COEFFICIENT_BOUND),
+            np.full(
+                len(NASAL_SEMANTIC_MODE_NAMES),
+                _FIXED_SEMANTIC_COEFFICIENT_BOUND,
+            ),
+        ]
+        if (
+            lower_bounds.shape != (len(expected_ordering),)
+            or upper_bounds.shape != (len(expected_ordering),)
+            or not np.isfinite(lower_bounds).all()
+            or not np.isfinite(upper_bounds).all()
+            or not np.array_equal(lower_bounds, -expected_bounds)
+            or not np.array_equal(upper_bounds, expected_bounds)
+        ):
+            raise ValueError(
+                "parameter bounds must use the fixed subject-independent "
+                "observable and semantic limits"
+            )
         object.__setattr__(
             self,
             "baseline_vertices",
@@ -2498,6 +2597,16 @@ class MultiviewNasalObjectiveContext:
         )
         object.__setattr__(self, "smoothness_edge_count", edge_count)
         object.__setattr__(self, "parameter_ordering", ordering)
+        object.__setattr__(
+            self,
+            "parameter_lower_bounds",
+            _readonly_array(lower_bounds, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "parameter_upper_bounds",
+            _readonly_array(upper_bounds, np.float64),
+        )
 
     @property
     def observable_rank(self) -> int:
@@ -2542,6 +2651,8 @@ class SoftProfileNasalSlots:
     target_slot_y: np.ndarray
     support_vertex_indices: np.ndarray
     soft_weights: np.ndarray
+    front_depth: np.ndarray
+    soft_visibility: np.ndarray
     direction_sign: int
 
     def __post_init__(self) -> None:
@@ -2564,6 +2675,8 @@ class SoftProfileNasalSlots:
         slot_y = np.asarray(self.target_slot_y, dtype=np.float64)
         support = np.asarray(self.support_vertex_indices)
         weights = np.asarray(self.soft_weights, dtype=np.float64)
+        front_depth = np.asarray(self.front_depth, dtype=np.float64)
+        visibility = np.asarray(self.soft_visibility, dtype=np.float64)
         count = len(pixels)
         if (
             pixels.ndim != 2
@@ -2572,12 +2685,23 @@ class SoftProfileNasalSlots:
             or confidence.shape != (count,)
             or slot_y.shape != (count,)
             or weights.shape != (count, len(support))
+            or front_depth.shape != (count,)
+            or visibility.shape != weights.shape
             or not all(
                 np.isfinite(value).all()
-                for value in (pixels, depth, confidence, slot_y, weights)
+                for value in (
+                    pixels,
+                    depth,
+                    confidence,
+                    slot_y,
+                    weights,
+                    front_depth,
+                    visibility,
+                )
             )
             or np.any((confidence < 0.0) | (confidence > 1.0))
             or np.any(weights < 0.0)
+            or np.any((visibility < 0.0) | (visibility > 1.0))
             or not np.allclose(
                 np.sum(weights, axis=1),
                 np.ones(count),
@@ -2624,6 +2748,16 @@ class SoftProfileNasalSlots:
             self,
             "soft_weights",
             _readonly_array(weights, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "front_depth",
+            _readonly_array(front_depth, np.float64),
+        )
+        object.__setattr__(
+            self,
+            "soft_visibility",
+            _readonly_array(visibility, np.float64),
         )
         object.__setattr__(self, "direction_sign", direction)
 
@@ -3372,6 +3506,13 @@ def prepare_multiview_nasal_objective_context(
     ordering = tuple(
         f"observable_flame_{index}" for index in range(rank)
     ) + tuple(NASAL_SEMANTIC_MODE_NAMES)
+    upper_bounds = np.r_[
+        np.full(rank, _FIXED_OBSERVABLE_COEFFICIENT_BOUND),
+        np.full(
+            len(NASAL_SEMANTIC_MODE_NAMES),
+            _FIXED_SEMANTIC_COEFFICIENT_BOUND,
+        ),
+    ]
     return MultiviewNasalObjectiveContext(
         baseline_vertices=baseline,
         observable_vertex_basis=observable_basis,
@@ -3384,6 +3525,8 @@ def prepare_multiview_nasal_objective_context(
         smoothness_neighbor_offsets=offsets,
         smoothness_edge_count=edge_count,
         parameter_ordering=ordering,
+        parameter_lower_bounds=-upper_bounds,
+        parameter_upper_bounds=upper_bounds,
     )
 
 
@@ -3429,6 +3572,15 @@ def _stable_softplus(values: np.ndarray) -> np.ndarray:
     return np.maximum(source, 0.0) + np.log1p(np.exp(-np.abs(source)))
 
 
+def _stable_logsumexp(values: np.ndarray, axis: int) -> np.ndarray:
+    source = np.asarray(values, dtype=np.float64)
+    maximum = np.max(source, axis=axis, keepdims=True)
+    result = maximum + np.log(
+        np.sum(np.exp(source - maximum), axis=axis, keepdims=True)
+    )
+    return np.squeeze(result, axis=axis)
+
+
 def _smooth_project_support(
     points: np.ndarray,
     view: ProjectionView,
@@ -3468,31 +3620,103 @@ def _soft_profile_slots(
     raw_depth: np.ndarray,
     slot_y: np.ndarray,
     direction_sign: int,
-    sigma_y: float,
-    temperature: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    config: MultiviewNasalObjectiveConfig,
+    min_depth: float,
+    *,
+    include_diagnostics: bool = True,
+) -> Tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    np.ndarray,
+    Optional[np.ndarray],
+]:
+    """Select continuous exterior slots with a local soft z-buffer."""
     pixels = np.asarray(projected_support, dtype=np.float64)
+    depths = np.asarray(raw_depth, dtype=np.float64)
     target_y = np.asarray(slot_y, dtype=np.float64)
     vertical = (
         pixels[None, :, 1] - target_y[:, None]
-    ) / float(sigma_y)
-    log_weights = (
+    ) / float(config.profile_vertical_sigma_px)
+    preliminary_logits = (
         -0.5 * vertical * vertical
-        + float(direction_sign) * pixels[None, :, 0] / float(temperature)
+        + float(direction_sign)
+        * pixels[None, :, 0]
+        / float(config.profile_softmax_temperature_px)
     )
-    row_max = np.max(log_weights, axis=1, keepdims=True)
-    stabilized = np.exp(log_weights - row_max)
+    preliminary_max = np.max(
+        preliminary_logits,
+        axis=1,
+        keepdims=True,
+    )
+    preliminary_exp = np.exp(preliminary_logits - preliminary_max)
+    preliminary_weights = preliminary_exp / np.sum(
+        preliminary_exp,
+        axis=1,
+        keepdims=True,
+    )
+    preliminary_points = preliminary_weights @ pixels
+    squared_spatial_distance = (
+        np.sum(preliminary_points * preliminary_points, axis=1)[:, None]
+        + np.sum(pixels * pixels, axis=1)[None, :]
+        - 2.0 * (preliminary_points @ pixels.T)
+    )
+    squared_spatial_distance = np.maximum(
+        squared_spatial_distance,
+        0.0,
+    )
+    local_logits = (
+        -0.5
+        * squared_spatial_distance
+        / float(config.profile_visibility_spatial_sigma_px) ** 2
+    )
+    validity_logits = -_stable_softplus(
+        (float(min_depth) - depths)
+        / float(config.profile_depth_validity_scale)
+    )
+    local_valid_logits = local_logits + validity_logits[None, :]
+    local_normalizer = _stable_logsumexp(local_valid_logits, axis=1)
+    front_depth = -float(config.profile_front_depth_temperature) * (
+        _stable_logsumexp(
+            local_valid_logits
+            - depths[None, :]
+            / float(config.profile_front_depth_temperature),
+            axis=1,
+        )
+        - local_normalizer
+    )
+    visibility_logits = (
+        validity_logits[None, :]
+        - _stable_softplus(
+            (depths[None, :] - front_depth[:, None])
+            / float(config.profile_depth_visibility_scale)
+        )
+    )
+    final_logits = preliminary_logits + local_logits + visibility_logits
+    row_max = np.max(final_logits, axis=1, keepdims=True)
+    stabilized = np.exp(final_logits - row_max)
     sums = np.sum(stabilized, axis=1, keepdims=True)
     if (
-        not np.isfinite(stabilized).all()
+        not np.isfinite(front_depth).all()
+        or not np.isfinite(stabilized).all()
         or not np.isfinite(sums).all()
         or np.any(sums <= 0.0)
     ):
         raise ValueError("soft profile weights are numerically invalid")
     weights = stabilized / sums
     slot_pixels = weights @ pixels
-    slot_depth = weights @ np.asarray(raw_depth, dtype=np.float64)
-    return slot_pixels, slot_depth, weights
+    slot_depth = weights @ depths if include_diagnostics else None
+    diagnostic_weights = weights if include_diagnostics else None
+    soft_visibility = (
+        np.exp(visibility_logits) if include_diagnostics else None
+    )
+    return (
+        slot_pixels,
+        slot_depth,
+        diagnostic_weights,
+        front_depth,
+        soft_visibility,
+    )
 
 
 def _point_to_polyline_distance(
@@ -3533,11 +3757,30 @@ def _normalized_image_residual(
     )
 
 
+def _soft_minimum_depth(
+    depths: np.ndarray,
+    temperature: float,
+) -> float:
+    values = np.asarray(depths, dtype=np.float64)
+    return float(
+        -float(temperature)
+        * (
+            _stable_logsumexp(
+                -values / float(temperature),
+                axis=0,
+            )
+            - np.log(float(len(values)))
+        )
+    )
+
+
 @dataclass(frozen=True)
 class _SoftTermEvaluation:
     pixel_xy: np.ndarray
     depth: np.ndarray
     soft_weights: np.ndarray
+    front_depth: np.ndarray
+    soft_visibility: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -3554,6 +3797,7 @@ class _ObjectiveCoreEvaluation:
     per_view_sample_counts: Mapping[str, int]
     per_view_confidence_sums: Mapping[str, float]
     symmetry_factors: Mapping[str, float]
+    soft_minimum_depths: np.ndarray
 
 
 def _soft_l1_cost(residuals: np.ndarray, f_scale: float) -> float:
@@ -3592,6 +3836,8 @@ def _evaluate_multiview_nasal_objective_core(
     theta: np.ndarray,
     context: MultiviewNasalObjectiveContext,
     config: Optional[MultiviewNasalObjectiveConfig],
+    *,
+    include_diagnostics: bool,
 ) -> _ObjectiveCoreEvaluation:
     if not isinstance(context, MultiviewNasalObjectiveContext):
         raise ValueError(
@@ -3700,13 +3946,20 @@ def _evaluate_multiview_nasal_objective_core(
         support_raw_depth = raw_depth_by_view[
             term.semantic_view
         ][local_indices]
-        slot_pixels, slot_depth, weights = _soft_profile_slots(
+        (
+            slot_pixels,
+            slot_depth,
+            weights,
+            front_depth,
+            soft_visibility,
+        ) = _soft_profile_slots(
             support_pixels,
             support_raw_depth,
             term.slot_y,
             term.direction_sign,
-            float(limits.profile_vertical_sigma_px),
-            float(limits.profile_softmax_temperature_px),
+            limits,
+            float(prepared.config.min_depth),
+            include_diagnostics=include_diagnostics,
         )
         distances = _point_to_polyline_distance(slot_pixels, term)
         term_weight = (
@@ -3724,11 +3977,14 @@ def _evaluate_multiview_nasal_objective_core(
             term_weight,
         )
         image_residuals[term.name] = residual
-        soft_terms[term.name] = _SoftTermEvaluation(
-            pixel_xy=slot_pixels,
-            depth=slot_depth,
-            soft_weights=weights,
-        )
+        if include_diagnostics:
+            soft_terms[term.name] = _SoftTermEvaluation(
+                pixel_xy=slot_pixels,
+                depth=slot_depth,
+                soft_weights=weights,
+                front_depth=front_depth,
+                soft_visibility=soft_visibility,
+            )
         reliability[term.name] = (
             confidence_sums[term.name] / float(term.sample_count)
         )
@@ -3736,7 +3992,7 @@ def _evaluate_multiview_nasal_objective_core(
     raw_depths = np.concatenate(
         [raw_depth_by_view[view] for view in NASAL_VIEWS]
     )
-    depth_barrier = (
+    normalized_vertex_barrier = (
         float(limits.depth_barrier_weight)
         * _stable_softplus(
             (
@@ -3745,6 +4001,28 @@ def _evaluate_multiview_nasal_objective_core(
             / float(limits.depth_barrier_scale)
         )
         / np.sqrt(float(len(raw_depths)))
+    )
+    soft_minimum_depths = np.asarray(
+        [
+            _soft_minimum_depth(
+                raw_depth_by_view[view],
+                float(limits.depth_barrier_softmin_temperature),
+            )
+            for view in NASAL_VIEWS
+        ],
+        dtype=np.float64,
+    )
+    global_depth_barrier = (
+        float(limits.depth_barrier_weight)
+        * _stable_softplus(
+            (
+                float(prepared.config.min_depth) - soft_minimum_depths
+            )
+            / float(limits.depth_barrier_scale)
+        )
+    )
+    depth_barrier = np.concatenate(
+        (normalized_vertex_barrier, global_depth_barrier)
     )
 
     flame_prior = (
@@ -3836,6 +4114,7 @@ def _evaluate_multiview_nasal_objective_core(
             per_view_confidence_sums
         ),
         symmetry_factors=MappingProxyType(symmetry_factors),
+        soft_minimum_depths=soft_minimum_depths,
     )
 
 
@@ -3845,7 +4124,12 @@ def evaluate_multiview_nasal_objective_residuals(
     config: Optional[MultiviewNasalObjectiveConfig] = None,
 ) -> MultiviewNasalResidualEvaluation:
     """Return the minimal immutable residual output for iterative solvers."""
-    core = _evaluate_multiview_nasal_objective_core(theta, context, config)
+    core = _evaluate_multiview_nasal_objective_core(
+        theta,
+        context,
+        config,
+        include_diagnostics=False,
+    )
     return MultiviewNasalResidualEvaluation(
         residuals=core.residuals,
         term_slices=core.term_slices,
@@ -3860,7 +4144,12 @@ def evaluate_multiview_nasal_objective(
 ) -> MultiviewNasalObjectiveResult:
     """Evaluate unified residuals and construct immutable diagnostics."""
     limits = _objective_config(config)
-    core = _evaluate_multiview_nasal_objective_core(theta, context, limits)
+    core = _evaluate_multiview_nasal_objective_core(
+        theta,
+        context,
+        limits,
+        include_diagnostics=True,
+    )
     candidate = CandidateNasalMesh._from_validated(
         core.candidate_vertices,
         context.projection_context.faces,
@@ -3877,6 +4166,8 @@ def evaluate_multiview_nasal_objective(
             target_slot_y=term.slot_y,
             support_vertex_indices=term.support_vertex_indices,
             soft_weights=core.soft_terms[term.name].soft_weights,
+            front_depth=core.soft_terms[term.name].front_depth,
+            soft_visibility=core.soft_terms[term.name].soft_visibility,
             direction_sign=term.direction_sign,
         )
         for term in context.image_terms
@@ -3917,6 +4208,15 @@ def evaluate_multiview_nasal_objective(
         ),
         "symmetry_evidence_factors": core.symmetry_factors,
         "parameter_ordering": context.parameter_ordering,
+        "parameter_bounds": {
+            "lower": tuple(
+                float(value) for value in context.parameter_lower_bounds
+            ),
+            "upper": tuple(
+                float(value) for value in context.parameter_upper_bounds
+            ),
+            "solver_requirement": "C3 must enforce these fixed bounds",
+        },
         "term_slices": {
             name: (value.start, value.stop)
             for name, value in term_slices.items()
@@ -3944,9 +4244,54 @@ def evaluate_multiview_nasal_objective(
         "profile_softmax_temperature_px": float(
             limits.profile_softmax_temperature_px
         ),
+        "profile_visibility_spatial_sigma_px": float(
+            limits.profile_visibility_spatial_sigma_px
+        ),
+        "profile_front_depth_temperature": float(
+            limits.profile_front_depth_temperature
+        ),
+        "profile_depth_visibility_scale": float(
+            limits.profile_depth_visibility_scale
+        ),
+        "profile_depth_validity_scale": float(
+            limits.profile_depth_validity_scale
+        ),
+        "soft_profile_summaries": {
+            term.name: {
+                "front_depth_min": float(
+                    np.min(core.soft_terms[term.name].front_depth)
+                ),
+                "front_depth_max": float(
+                    np.max(core.soft_terms[term.name].front_depth)
+                ),
+                "front_depth_mean": float(
+                    np.mean(core.soft_terms[term.name].front_depth)
+                ),
+                "visibility_min": float(
+                    np.min(core.soft_terms[term.name].soft_visibility)
+                ),
+                "visibility_max": float(
+                    np.max(core.soft_terms[term.name].soft_visibility)
+                ),
+                "visibility_mean": float(
+                    np.mean(core.soft_terms[term.name].soft_visibility)
+                ),
+            }
+            for term in context.image_terms
+        },
         "depth_softplus_scale": float(limits.depth_softplus_scale),
         "depth_barrier_weight": float(limits.depth_barrier_weight),
         "depth_barrier_scale": float(limits.depth_barrier_scale),
+        "depth_barrier_softmin_temperature": float(
+            limits.depth_barrier_softmin_temperature
+        ),
+        "soft_minimum_depths": {
+            view: float(value)
+            for view, value in zip(
+                NASAL_VIEWS,
+                core.soft_minimum_depths,
+            )
+        },
         "fixed_sampling_provenance": (
             "continuous_soft_semantic_profile_midpoint_quantile_slots"
         ),

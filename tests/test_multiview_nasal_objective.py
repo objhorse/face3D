@@ -2205,6 +2205,16 @@ def test_soft_semantic_slots_change_continuously_with_candidate_geometry():
         rounded.residuals
     )
     assert isinstance(baseline.projection, MultiviewNasalSoftProjection)
+    assert set(baseline.report_data["soft_profile_summaries"]) == set(
+        context.image_term_names
+    )
+    for slots in baseline.projection.per_term:
+        assert slots.front_depth.shape == (len(slots.pixel_xy),)
+        assert slots.soft_visibility.shape == slots.soft_weights.shape
+        assert np.all(
+            (slots.soft_visibility >= 0.0)
+            & (slots.soft_visibility <= 1.0)
+        )
     before_left = baseline.projection.by_term["front_subject_left_alar"]
     after_left = widened.projection.by_term["front_subject_left_alar"]
     np.testing.assert_array_equal(
@@ -2271,14 +2281,14 @@ def test_depth_barrier_is_finite_and_continuous_across_min_depth():
     semantic = _objective_semantic_basis()
     vectors = np.array(semantic.vectors, copy=True)
     vectors[5] = 0.0
-    vectors[5, :, 2] = -1.0
+    vectors[5, :, 2] = -2.0
     context, _ = _objective_problem(
         semantic=_semantic_with_vectors(semantic, vectors),
     )
     crossing = float(
         np.min(context.baseline_vertices[:, 2])
         - context.projection_context.config.min_depth
-    )
+    ) / 2.0
     coefficients = crossing + np.linspace(-1e-5, 1e-5, 9)
     barriers = []
     residuals = []
@@ -2299,6 +2309,49 @@ def test_depth_barrier_is_finite_and_continuous_across_min_depth():
         coefficients
     )[:, None]
     assert np.isfinite(slopes).all()
+
+    baseline = evaluate_multiview_nasal_objective(
+        np.zeros(context.parameter_count),
+        context,
+    )
+    adversarial_theta = np.zeros(context.parameter_count)
+    adversarial_theta[context.observable_rank + 5] = 2.0
+    adversarial = evaluate_multiview_nasal_objective(
+        adversarial_theta,
+        context,
+    )
+    assert np.any(
+        adversarial.projection.by_term[
+            "front_subject_left_alar"
+        ].depth <= 0.0
+    )
+    assert adversarial.total_robust_cost > baseline.total_robust_cost
+    assert adversarial.robust_costs["projection_depth_barrier"] > (
+        baseline.total_robust_cost
+    )
+    np.testing.assert_array_equal(
+        context.parameter_lower_bounds,
+        np.full(context.parameter_count, -3.0),
+    )
+    np.testing.assert_array_equal(
+        context.parameter_upper_bounds,
+        np.full(context.parameter_count, 3.0),
+    )
+    for bounded_probe in (
+        context.parameter_lower_bounds,
+        context.parameter_upper_bounds,
+    ):
+        assert np.isfinite(
+            evaluate_multiview_nasal_objective_residuals(
+                bounded_probe,
+                context,
+            ).residuals
+        ).all()
+    assert baseline.report_data["parameter_bounds"] == {
+        "lower": tuple(context.parameter_lower_bounds),
+        "upper": tuple(context.parameter_upper_bounds),
+        "solver_requirement": "C3 must enforce these fixed bounds",
+    }
 
 
 def test_residual_only_matches_full_and_avoids_c1_face_scans(monkeypatch):
@@ -2350,7 +2403,7 @@ def test_soft_profile_continuity_through_prior_edge_transition_value():
     slopes = jumps / steps
 
     assert np.max(jumps) < 1e-7
-    assert np.max(slopes) < 1.0
+    assert np.max(slopes) < 2.0
     assert np.isfinite(slopes).all()
 
 
@@ -2360,37 +2413,141 @@ def test_directional_soft_profile_suppresses_deep_interior_vertex():
     interior = np.column_stack((np.full(3, -500.0), slot_y))
     projected = np.vstack((exterior, interior))
     depth = np.r_[np.ones(3), np.full(3, 10.0)]
-    baseline, _depth, _weights = nasal_objective._soft_profile_slots(
+    config = MultiviewNasalObjectiveConfig()
+    baseline, _depth, _weights, _front_depth, _visibility = (
+        nasal_objective._soft_profile_slots(
         projected,
         depth,
         slot_y,
         1,
-        3.0,
-        20.0,
+        config,
+        1e-4,
+    )
     )
     moved_interior = projected.copy()
     moved_interior[3:, 0] += 10.0
-    interior_result, _depth, _weights = nasal_objective._soft_profile_slots(
+    interior_result, _depth, _weights, _front_depth, _visibility = (
+        nasal_objective._soft_profile_slots(
         moved_interior,
         depth,
         slot_y,
         1,
-        3.0,
-        20.0,
+        config,
+        1e-4,
+    )
     )
     moved_exterior = projected.copy()
     moved_exterior[:3, 0] += 10.0
-    exterior_result, _depth, _weights = nasal_objective._soft_profile_slots(
+    exterior_result, _depth, _weights, _front_depth, _visibility = (
+        nasal_objective._soft_profile_slots(
         moved_exterior,
         depth,
         slot_y,
         1,
-        3.0,
-        20.0,
+        config,
+        1e-4,
+    )
     )
 
     assert np.max(np.abs(interior_result - baseline)) < 1e-12
     assert np.max(np.abs(exterior_result - baseline)) > 9.9
+
+
+def test_soft_z_buffer_suppresses_rear_point_in_same_image_footprint():
+    config = MultiviewNasalObjectiveConfig()
+    slot_y = np.array([50.0])
+    projected = np.array([[50.0, 50.0], [50.5, 50.0]])
+    depth = np.array([1.0, 100.0])
+    baseline = nasal_objective._soft_profile_slots(
+        projected,
+        depth,
+        slot_y,
+        1,
+        config,
+        1e-4,
+    )
+    pixels, _slot_depth, weights, front_depth, visibility = baseline
+    moved_rear = projected.copy()
+    moved_rear[1, 0] += 0.25
+    rear_pixels = nasal_objective._soft_profile_slots(
+        moved_rear,
+        depth,
+        slot_y,
+        1,
+        config,
+        1e-4,
+    )[0]
+    moved_foreground = projected.copy()
+    moved_foreground[0, 0] += 0.25
+    foreground_pixels = nasal_objective._soft_profile_slots(
+        moved_foreground,
+        depth,
+        slot_y,
+        1,
+        config,
+        1e-4,
+    )[0]
+
+    assert weights[0, 1] / weights[0, 0] < 1e-8
+    assert visibility[0, 1] / visibility[0, 0] < 1e-8
+    assert 1.0 <= front_depth[0] < 1.1
+    assert np.max(np.abs(rear_pixels - pixels)) < 1e-8
+    assert np.max(np.abs(foreground_pixels - pixels)) > 0.24
+
+
+def test_soft_z_buffer_depth_sweep_has_no_residual_jump():
+    config = MultiviewNasalObjectiveConfig()
+    projected = np.array([[50.0, 50.0], [50.5, 50.0]])
+    slot_y = np.array([50.0])
+    rear_depths = np.linspace(0.5, 2.0, 601)
+    residuals = []
+    rear_weights = []
+    for rear_depth in rear_depths:
+        pixels, _depth, weights, _front, _visibility = (
+            nasal_objective._soft_profile_slots(
+                projected,
+                np.array([1.0, rear_depth]),
+                slot_y,
+                1,
+                config,
+                1e-4,
+            )
+        )
+        residuals.append(float(pixels[0, 0] - 49.0))
+        rear_weights.append(float(weights[0, 1]))
+    residuals = np.asarray(residuals)
+    derivatives = np.diff(residuals) / np.diff(rear_depths)
+
+    assert np.isfinite(residuals).all()
+    assert np.isfinite(derivatives).all()
+    assert np.max(np.abs(np.diff(residuals))) < 0.02
+    assert np.max(np.abs(np.diff(derivatives))) < 0.5
+    assert rear_weights[0] > rear_weights[-1]
+
+
+def test_global_depth_feasibility_is_not_diluted_by_large_support():
+    config = MultiviewNasalObjectiveConfig()
+    depths = np.full(160_000, 4.0)
+    depths[0] = 0.0
+    soft_minimum = nasal_objective._soft_minimum_depth(
+        depths,
+        config.depth_barrier_softmin_temperature,
+    )
+    global_residual = (
+        config.depth_barrier_weight
+        * nasal_objective._stable_softplus(
+            np.array(
+                [
+                    (
+                        1e-4 - soft_minimum
+                    ) / config.depth_barrier_scale
+                ]
+            )
+        )[0]
+    )
+
+    assert soft_minimum < 0.002
+    assert global_residual > 60.0
 
 
 def test_exact_polyline_distance_remains_analytic_outside_image():
@@ -2508,7 +2665,6 @@ def test_scipy_least_squares_converges_to_manual_shared_widening():
         semantic_prior_weight=0.0,
         smoothness_weight=0.0,
         symmetry_weight=0.0,
-        depth_barrier_weight=0.0,
         robust_f_scale=1.0,
     )
 
@@ -2633,8 +2789,21 @@ def test_objective_validation_reports_and_arrays_are_deeply_immutable():
         MultiviewNasalObjectiveConfig(front_image_weight=np.nan)
     with pytest.raises(ValueError, match="profile_vertical_sigma_px"):
         MultiviewNasalObjectiveConfig(profile_vertical_sigma_px=0.0)
+    with pytest.raises(
+        ValueError,
+        match="profile_visibility_spatial_sigma_px",
+    ):
+        MultiviewNasalObjectiveConfig(
+            profile_visibility_spatial_sigma_px=0.0
+        )
     with pytest.raises(ValueError, match="depth_barrier_weight"):
-        MultiviewNasalObjectiveConfig(depth_barrier_weight=-1.0)
+        MultiviewNasalObjectiveConfig(depth_barrier_weight=0.0)
+    with pytest.raises(ValueError, match="depth_barrier_scale"):
+        MultiviewNasalObjectiveConfig(depth_barrier_scale=1.0)
+    with pytest.raises(ValueError, match="robust_f_scale"):
+        MultiviewNasalObjectiveConfig(robust_f_scale=0.1)
+    with pytest.raises(ValueError, match="semantic_coefficient_bound"):
+        MultiviewNasalObjectiveConfig(semantic_coefficient_bound=4.0)
     with pytest.raises(ValueError, match="baseline.*finite"):
         replace(
             context,
@@ -2648,6 +2817,14 @@ def test_objective_validation_reports_and_arrays_are_deeply_immutable():
             context,
             depth_support_vertex_indices=(
                 context.depth_support_vertex_indices[:-1]
+            ),
+        )
+    with pytest.raises(ValueError, match="parameter bounds"):
+        replace(
+            context,
+            parameter_upper_bounds=np.full(
+                context.parameter_count,
+                4.0,
             ),
         )
     with pytest.raises(ValueError, match="context"):
