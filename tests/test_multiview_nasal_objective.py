@@ -1018,6 +1018,155 @@ def test_prepared_context_performs_static_work_once_for_multiple_evaluations(
             array.setflags(write=True)
 
 
+def test_fractional_roi_matches_one_shot_and_prepared_near_sample_boundary():
+    vertices, faces = _mesh()
+    observable, semantic = _bases(len(vertices))
+    K = np.array(
+        [[40.0, 0.0, 50.0], [0.0, 42.0, 50.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    observations = _observations(K)
+    fractional_roi = (52.8, 0.25, 99.75, 99.5)
+    observations = NasalObservationBundle(
+        front=observations.front,
+        subject_left=replace(
+            observations.subject_left,
+            roi_work_xyxy=fractional_roi,
+        ),
+        subject_right=observations.subject_right,
+    )
+    views = _views(K)
+    candidate = build_candidate_nasal_mesh(
+        vertices,
+        faces,
+        observable,
+        semantic,
+        np.zeros(2, dtype=np.float64),
+        np.zeros(8, dtype=np.float64),
+    )
+    one_shot = project_multiview_nasal_boundaries(
+        candidate,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    prepared = prepare_nasal_projection_context(
+        faces,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    prepared_candidate = build_candidate_nasal_mesh_prepared(
+        vertices,
+        observable,
+        prepared,
+        np.zeros(2, dtype=np.float64),
+        np.zeros(8, dtype=np.float64),
+    )
+    repeated = project_multiview_nasal_boundaries_prepared(
+        prepared_candidate,
+        prepared,
+    )
+
+    assert prepared.view_contracts[1].roi_work_xyxy == fractional_roi
+    assert np.all(repeated.per_view[1].pixel_xy[:, 0] >= fractional_roi[0])
+    assert not np.any(
+        np.isclose(repeated.per_view[1].pixel_xy[:, 0], 52.77164841)
+    )
+    for expected, actual in zip(one_shot.per_view, repeated.per_view):
+        assert expected.semantic_view == actual.semantic_view
+        assert expected.source_labels == actual.source_labels
+        assert expected.boundary_names == actual.boundary_names
+        for name in (
+            "pixel_xy",
+            "model_points",
+            "source_vertex_indices",
+            "source_weights",
+            "confidence",
+            "visible",
+            "depth",
+        ):
+            np.testing.assert_array_equal(
+                getattr(expected, name),
+                getattr(actual, name),
+            )
+
+
+def _reconstruct_prepared_context(prepared, **overrides):
+    values = {
+        "vertex_count": prepared.vertex_count,
+        "faces": prepared.faces,
+        "semantic_vectors": prepared.semantic_vectors,
+        "support_mask": prepared.support_mask,
+        "protected_mask": prepared.protected_mask,
+        "region_masks": prepared.region_masks,
+        "views": prepared.views,
+        "view_contracts": prepared.view_contracts,
+        "config": prepared.config,
+    }
+    values.update(overrides)
+    return PreparedNasalProjectionContext(**values)
+
+
+def test_direct_prepared_context_rejects_regions_outside_support():
+    candidate, semantic, observations, views = _problem()
+    prepared = prepare_nasal_projection_context(
+        candidate.faces,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    support = prepared.support_mask.copy()
+    support[0] = False
+
+    with pytest.raises(ValueError, match="region.*outside.*support"):
+        _reconstruct_prepared_context(prepared, support_mask=support)
+
+
+def test_direct_prepared_context_rejects_regions_on_protected_vertices():
+    candidate, semantic, observations, views = _problem()
+    prepared = prepare_nasal_projection_context(
+        candidate.faces,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    support = prepared.support_mask.copy()
+    protected = prepared.protected_mask.copy()
+    support[0] = False
+    protected[0] = True
+
+    with pytest.raises(ValueError, match="region.*protected"):
+        _reconstruct_prepared_context(
+            prepared,
+            support_mask=support,
+            protected_mask=protected,
+        )
+
+
+def test_direct_prepared_context_rejects_support_protected_overlap():
+    candidate, semantic, observations, views = _problem()
+    prepared = prepare_nasal_projection_context(
+        candidate.faces,
+        semantic,
+        observations,
+        views,
+        config=_config(),
+    )
+    protected = prepared.protected_mask.copy()
+    protected[0] = True
+
+    with pytest.raises(ValueError, match="support.*protected.*disjoint"):
+        _reconstruct_prepared_context(
+            prepared,
+            protected_mask=protected,
+        )
+
+
 def test_perspective_correct_slanted_edge_has_uniform_projected_samples():
     vertices = np.array(
         [

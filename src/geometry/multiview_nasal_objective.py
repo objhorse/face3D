@@ -112,7 +112,7 @@ class MultiviewNasalSamplingConfig:
 class _PreparedViewTargetContract:
     semantic_view: str
     work_size: Tuple[int, int]
-    roi_work_xyxy: Tuple[int, int, int, int]
+    roi_work_xyxy: Tuple[float, float, float, float]
     confidence: np.ndarray
     target_names: Tuple[str, ...]
 
@@ -120,14 +120,19 @@ class _PreparedViewTargetContract:
         if self.semantic_view not in NASAL_VIEWS:
             raise ValueError("prepared view semantic name is not canonical")
         work_size = tuple(int(value) for value in self.work_size)
-        roi = tuple(int(value) for value in self.roi_work_xyxy)
+        try:
+            roi_array = np.asarray(self.roi_work_xyxy, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("prepared ROI must contain finite coordinates") from exc
+        roi = tuple(float(value) for value in roi_array.reshape(-1))
         if (
             len(work_size) != 2
             or min(work_size) < 1
-            or len(roi) != 4
+            or roi_array.shape != (4,)
+            or not np.isfinite(roi_array).all()
             or not (
-                0 <= roi[0] < roi[2] <= work_size[0]
-                and 0 <= roi[1] < roi[3] <= work_size[1]
+                0.0 <= roi[0] < roi[2] <= float(work_size[0])
+                and 0.0 <= roi[1] < roi[3] <= float(work_size[1])
             )
         ):
             raise ValueError("prepared work size or ROI is invalid")
@@ -192,6 +197,15 @@ class PreparedNasalProjectionContext:
         if np.any(support & protected):
             raise ValueError("prepared support and protected masks must be disjoint")
         regions = _snapshot_region_masks(self.region_masks, vertex_count)
+        for name, mask in regions.items():
+            if np.any(mask & protected):
+                raise ValueError(
+                    f"prepared semantic region {name} intersects protected_mask"
+                )
+            if np.any(mask & ~support):
+                raise ValueError(
+                    f"prepared semantic region {name} extends outside support_mask"
+                )
         canonical_views = _canonical_views(self.views)
         contracts = tuple(self.view_contracts)
         if (
