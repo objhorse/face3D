@@ -3623,6 +3623,7 @@ def _soft_profile_slots(
     config: MultiviewNasalObjectiveConfig,
     min_depth: float,
     *,
+    work_size: Tuple[int, int],
     include_diagnostics: bool = True,
 ) -> Tuple[
     np.ndarray,
@@ -3635,14 +3636,64 @@ def _soft_profile_slots(
     pixels = np.asarray(projected_support, dtype=np.float64)
     depths = np.asarray(raw_depth, dtype=np.float64)
     target_y = np.asarray(slot_y, dtype=np.float64)
+    if (
+        len(work_size) != 2
+        or any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or int(value) < 1
+            for value in work_size
+        )
+    ):
+        raise ValueError("work_size must contain two positive integers")
+    work_width = float(work_size[0])
+    horizontal_center = 0.5 * (work_width - 1.0)
+    horizontal_scale = max(horizontal_center, 0.5)
     vertical = (
         pixels[None, :, 1] - target_y[:, None]
     ) / float(config.profile_vertical_sigma_px)
-    preliminary_logits = (
-        -0.5 * vertical * vertical
-        + float(direction_sign)
-        * pixels[None, :, 0]
+    vertical_logits = -0.5 * vertical * vertical
+    bounded_horizontal = (
+        horizontal_center
+        + horizontal_scale
+        * np.tanh(
+            (pixels[:, 0] - horizontal_center) / horizontal_scale
+        )
+    )
+    directional_logits = (
+        float(direction_sign)
+        * bounded_horizontal[None, :]
         / float(config.profile_softmax_temperature_px)
+    )
+    validity_logits = -_stable_softplus(
+        (float(min_depth) - depths)
+        / float(config.profile_depth_validity_scale)
+    )
+    foreground_logits = vertical_logits + validity_logits[None, :]
+    foreground_normalizer = _stable_logsumexp(
+        foreground_logits,
+        axis=1,
+    )
+    front_depth = -float(config.profile_front_depth_temperature) * (
+        _stable_logsumexp(
+            foreground_logits
+            - depths[None, :]
+            / float(config.profile_front_depth_temperature),
+            axis=1,
+        )
+        - foreground_normalizer
+    )
+    visibility_logits = (
+        validity_logits[None, :]
+        - _stable_softplus(
+            (depths[None, :] - front_depth[:, None])
+            / float(config.profile_depth_visibility_scale)
+        )
+    )
+    preliminary_logits = (
+        vertical_logits
+        + directional_logits
+        + visibility_logits
     )
     preliminary_max = np.max(
         preliminary_logits,
@@ -3670,29 +3721,7 @@ def _soft_profile_slots(
         * squared_spatial_distance
         / float(config.profile_visibility_spatial_sigma_px) ** 2
     )
-    validity_logits = -_stable_softplus(
-        (float(min_depth) - depths)
-        / float(config.profile_depth_validity_scale)
-    )
-    local_valid_logits = local_logits + validity_logits[None, :]
-    local_normalizer = _stable_logsumexp(local_valid_logits, axis=1)
-    front_depth = -float(config.profile_front_depth_temperature) * (
-        _stable_logsumexp(
-            local_valid_logits
-            - depths[None, :]
-            / float(config.profile_front_depth_temperature),
-            axis=1,
-        )
-        - local_normalizer
-    )
-    visibility_logits = (
-        validity_logits[None, :]
-        - _stable_softplus(
-            (depths[None, :] - front_depth[:, None])
-            / float(config.profile_depth_visibility_scale)
-        )
-    )
-    final_logits = preliminary_logits + local_logits + visibility_logits
+    final_logits = preliminary_logits + local_logits
     row_max = np.max(final_logits, axis=1, keepdims=True)
     stabilized = np.exp(final_logits - row_max)
     sums = np.sum(stabilized, axis=1, keepdims=True)
@@ -3959,6 +3988,7 @@ def _evaluate_multiview_nasal_objective_core(
             term.direction_sign,
             limits,
             float(prepared.config.min_depth),
+            work_size=term.work_size,
             include_diagnostics=include_diagnostics,
         )
         distances = _point_to_polyline_distance(slot_pixels, term)

@@ -2422,6 +2422,7 @@ def test_directional_soft_profile_suppresses_deep_interior_vertex():
         1,
         config,
         1e-4,
+        work_size=(100, 100),
     )
     )
     moved_interior = projected.copy()
@@ -2434,6 +2435,7 @@ def test_directional_soft_profile_suppresses_deep_interior_vertex():
         1,
         config,
         1e-4,
+        work_size=(100, 100),
     )
     )
     moved_exterior = projected.copy()
@@ -2446,6 +2448,7 @@ def test_directional_soft_profile_suppresses_deep_interior_vertex():
         1,
         config,
         1e-4,
+        work_size=(100, 100),
     )
     )
 
@@ -2465,6 +2468,7 @@ def test_soft_z_buffer_suppresses_rear_point_in_same_image_footprint():
         1,
         config,
         1e-4,
+        work_size=(100, 100),
     )
     pixels, _slot_depth, weights, front_depth, visibility = baseline
     moved_rear = projected.copy()
@@ -2476,6 +2480,7 @@ def test_soft_z_buffer_suppresses_rear_point_in_same_image_footprint():
         1,
         config,
         1e-4,
+        work_size=(100, 100),
     )[0]
     moved_foreground = projected.copy()
     moved_foreground[0, 0] += 0.25
@@ -2486,6 +2491,7 @@ def test_soft_z_buffer_suppresses_rear_point_in_same_image_footprint():
         1,
         config,
         1e-4,
+        work_size=(100, 100),
     )[0]
 
     assert weights[0, 1] / weights[0, 0] < 1e-8
@@ -2493,6 +2499,72 @@ def test_soft_z_buffer_suppresses_rear_point_in_same_image_footprint():
     assert 1.0 <= front_depth[0] < 1.1
     assert np.max(np.abs(rear_pixels - pixels)) < 1e-8
     assert np.max(np.abs(foreground_pixels - pixels)) > 0.24
+
+
+@pytest.mark.parametrize("rear_x", [50.5, 500.0, 1000.0, 5000.0])
+def test_soft_z_buffer_suppresses_deep_rear_point_at_extreme_x(rear_x):
+    config = MultiviewNasalObjectiveConfig()
+    projected = np.array([[50.0, 50.0], [rear_x, 50.0]])
+    depth = np.array([1.0, 100.0])
+
+    _pixels, _depth, weights, _front, _visibility = (
+        nasal_objective._soft_profile_slots(
+            projected,
+            depth,
+            np.array([50.0]),
+            1,
+            config,
+            1e-4,
+            work_size=(100, 100),
+        )
+    )
+
+    assert weights[0, 1] / weights[0, 0] < 1e-8
+
+
+def test_soft_profile_keeps_near_depth_exterior_point_observable():
+    config = MultiviewNasalObjectiveConfig()
+    projected = np.array([[50.0, 50.0], [80.0, 50.0]])
+
+    pixels, _depth, weights, _front, _visibility = (
+        nasal_objective._soft_profile_slots(
+            projected,
+            np.array([1.0, 1.0]),
+            np.array([50.0]),
+            1,
+            config,
+            1e-4,
+            work_size=(100, 100),
+        )
+    )
+
+    assert weights[0, 1] > weights[0, 0]
+    assert 65.0 < pixels[0, 0] < 80.0
+
+
+def test_bounded_directional_score_is_continuous_through_saturation():
+    config = MultiviewNasalObjectiveConfig()
+    moving_x = np.linspace(450.0, 550.0, 1001)
+    slot_x = []
+    for x_value in moving_x:
+        pixels = nasal_objective._soft_profile_slots(
+            np.array([[50.0, 50.0], [x_value, 50.0]]),
+            np.array([1.0, 1.0]),
+            np.array([50.0]),
+            1,
+            config,
+            1e-4,
+            work_size=(100, 100),
+        )[0]
+        slot_x.append(float(pixels[0, 0]))
+    slot_x = np.asarray(slot_x)
+    first_derivative = np.diff(slot_x) / np.diff(moving_x)
+    derivative_change = np.diff(first_derivative)
+
+    assert np.isfinite(slot_x).all()
+    assert np.isfinite(first_derivative).all()
+    assert np.max(np.abs(np.diff(slot_x))) < 0.11
+    assert np.max(np.abs(derivative_change)) < 1e-6
 
 
 def test_soft_z_buffer_depth_sweep_has_no_residual_jump():
@@ -2511,6 +2583,7 @@ def test_soft_z_buffer_depth_sweep_has_no_residual_jump():
                 1,
                 config,
                 1e-4,
+                work_size=(100, 100),
             )
         )
         residuals.append(float(pixels[0, 0] - 49.0))
