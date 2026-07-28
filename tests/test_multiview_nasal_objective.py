@@ -2194,6 +2194,105 @@ def test_orientation_context_selects_basis_or_support_faces_and_is_immutable():
         assert _is_bytes_backed(array)
 
 
+def test_orientation_active_faces_and_ratios_are_uniform_scale_invariant():
+    context, _ = _objective_problem()
+    baseline = context.baseline_vertices
+    displacement = (
+        0.25 * context.projection_context.semantic_vectors[0]
+    )
+    expected_indices = None
+    expected_ratios = None
+
+    for scale in (1e-6, 1.0, 1e6):
+        (
+            face_indices,
+            face_vertices,
+            reference_cross,
+            inverse_squared_norm,
+        ) = nasal_objective._orientation_reference_data(
+            baseline * scale,
+            context.projection_context,
+            context.observable_vertex_basis * scale,
+        )
+        ratio_context = SimpleNamespace(
+            orientation_face_vertices=face_vertices,
+            orientation_reference_cross=reference_cross,
+            orientation_reference_inverse_squared_norm=(
+                inverse_squared_norm
+            ),
+            orientation_active_face_count=len(face_indices),
+        )
+        ratios = nasal_objective._orientation_signed_area_ratios(
+            (baseline + displacement) * scale,
+            ratio_context,
+        )
+        if expected_indices is None:
+            expected_indices = face_indices
+            expected_ratios = ratios
+        else:
+            np.testing.assert_array_equal(
+                face_indices,
+                expected_indices,
+            )
+            np.testing.assert_allclose(
+                ratios,
+                expected_ratios,
+                rtol=1e-13,
+                atol=1e-13,
+            )
+
+
+def test_orientation_context_rejects_degenerate_movable_baseline_faces():
+    semantic = _single_face_flip_semantic()
+    observable = _objective_observable(len(_mesh()[0]))
+    context, _, observations = _objective_problem(
+        semantic=semantic,
+        observable=observable,
+        return_observations=True,
+    )
+    face_index = int(context.orientation_face_indices[0])
+    face = context.projection_context.faces[face_index]
+    degenerate = np.array(context.baseline_vertices, copy=True)
+    degenerate[face[2]] = degenerate[face[0]]
+
+    with pytest.raises(
+        ValueError,
+        match="degenerate.*potentially deformable.*total=",
+    ) as caught:
+        prepare_multiview_nasal_objective_context(
+            degenerate,
+            observable,
+            semantic,
+            observations,
+            projection_context=context.projection_context,
+        )
+
+    assert f"indices=[{face_index}" in str(caught.value)
+
+
+def test_orientation_soft_minimum_is_normalized_for_equal_face_ratios():
+    temperature = 0.01
+    expected = 0.37
+
+    for count in (1, 1000):
+        result = nasal_objective._soft_minimum_orientation_ratio(
+            np.full(count, expected, dtype=np.float64),
+            temperature,
+        )
+        assert result == pytest.approx(expected, abs=1e-14)
+
+    varied = np.array([0.11, 0.43, 0.82], dtype=np.float64)
+    reference = nasal_objective._soft_minimum_orientation_ratio(
+        varied,
+        temperature,
+    )
+    duplicated = nasal_objective._soft_minimum_orientation_ratio(
+        np.tile(varied, 1000),
+        temperature,
+    )
+    assert duplicated == pytest.approx(reference, abs=1e-14)
+
+
 def test_prior_scales_parameter_order_and_zero_theta_reproduce_baseline():
     context, _ = _objective_problem(
         flame_standard_deviations=(2.0, 4.0),
@@ -3087,6 +3186,14 @@ def test_objective_validation_reports_and_arrays_are_deeply_immutable():
         "p95",
         "p99",
     }
+    assert (
+        orientation_report[
+            "baseline_local_triangle_quality_threshold"
+        ]
+        == pytest.approx(
+            nasal_objective._ORIENTATION_BASELINE_LOCAL_QUALITY_THRESHOLD
+        )
+    )
 
 
 def test_real_semantic_and_observable_results_prepare_and_evaluate_objective():

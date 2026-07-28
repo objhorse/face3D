@@ -1964,7 +1964,8 @@ _FIXED_ORIENTATION_BARRIER_WEIGHT = 25.0
 _FIXED_ORIENTATION_BARRIER_MARGIN = 0.20
 _FIXED_ORIENTATION_BARRIER_SCALE = 0.05
 _FIXED_ORIENTATION_BARRIER_SOFTMIN_TEMPERATURE = 0.01
-_ORIENTATION_BASELINE_CROSS_SQUARED_EPSILON = 1e-20
+_ORIENTATION_BASELINE_LOCAL_QUALITY_THRESHOLD = 1e-6
+_ORIENTATION_DEGENERATE_FACE_PREVIEW_COUNT = 20
 _MIN_ROBUST_F_SCALE = 1.0
 _FIXED_OBSERVABLE_COEFFICIENT_BOUND = 3.0
 _FIXED_SEMANTIC_COEFFICIENT_BOUND = 3.0
@@ -3394,6 +3395,11 @@ def _orientation_reference_data(
     candidate_indices = np.flatnonzero(
         np.any(movable_vertices[prepared.faces], axis=1)
     )
+    if not len(candidate_indices):
+        raise ValueError(
+            "orientation barrier requires at least one potentially "
+            "deformable baseline face"
+        )
     candidate_faces = prepared.faces[candidate_indices]
     triangles = np.asarray(
         baseline[candidate_faces],
@@ -3409,28 +3415,68 @@ def _orientation_reference_data(
         reference_cross,
         optimize=True,
     )
-    nondegenerate = (
-        np.isfinite(squared_norm)
-        & (
-            squared_norm
-            > _ORIENTATION_BASELINE_CROSS_SQUARED_EPSILON
+    edge_vectors = np.stack(
+        (
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 1],
+            triangles[:, 0] - triangles[:, 2],
+        ),
+        axis=1,
+    )
+    max_edge_squared = np.max(
+        np.einsum(
+            "fei,fei->fe",
+            edge_vectors,
+            edge_vectors,
+            optimize=True,
+        ),
+        axis=1,
+    )
+    local_quality = np.divide(
+        np.sqrt(squared_norm),
+        max_edge_squared,
+        out=np.full_like(squared_norm, np.nan),
+        where=max_edge_squared > 0.0,
+    )
+    degenerate = (
+        ~np.isfinite(local_quality)
+        | (
+            local_quality
+            <= _ORIENTATION_BASELINE_LOCAL_QUALITY_THRESHOLD
         )
     )
-    active_indices = candidate_indices[nondegenerate].astype(
-        np.int64,
-        copy=False,
-    )
-    active_faces = candidate_faces[nondegenerate].astype(
-        np.int64,
-        copy=False,
-    )
-    active_cross = reference_cross[nondegenerate]
-    if not len(active_indices):
+    if np.any(degenerate):
+        degenerate_indices = candidate_indices[degenerate]
+        preview = ", ".join(
+            str(int(index))
+            for index in degenerate_indices[
+                :_ORIENTATION_DEGENERATE_FACE_PREVIEW_COUNT
+            ]
+        )
+        suffix = (
+            ", ..."
+            if len(degenerate_indices)
+            > _ORIENTATION_DEGENERATE_FACE_PREVIEW_COUNT
+            else ""
+        )
         raise ValueError(
-            "orientation barrier requires at least one movable "
-            "nondegenerate baseline face"
+            "orientation barrier found degenerate potentially "
+            "deformable baseline faces: "
+            f"total={len(degenerate_indices)}, "
+            f"indices=[{preview}{suffix}], "
+            "local_quality_threshold="
+            f"{_ORIENTATION_BASELINE_LOCAL_QUALITY_THRESHOLD:g}"
         )
-    inverse_squared_norm = 1.0 / squared_norm[nondegenerate]
+    active_indices = candidate_indices.astype(
+        np.int64,
+        copy=False,
+    )
+    active_faces = candidate_faces.astype(
+        np.int64,
+        copy=False,
+    )
+    active_cross = reference_cross
+    inverse_squared_norm = 1.0 / squared_norm
     return (
         active_indices,
         active_faces,
@@ -4048,11 +4094,26 @@ def _soft_minimum_orientation_ratio(
     temperature: float,
 ) -> float:
     values = np.asarray(signed_area_ratios, dtype=np.float64)
+    scale = float(temperature)
+    if (
+        values.ndim != 1
+        or not len(values)
+        or not np.isfinite(values).all()
+        or not np.isfinite(scale)
+        or scale <= 0.0
+    ):
+        raise ValueError(
+            "orientation soft minimum requires finite nonempty ratios "
+            "and positive temperature"
+        )
     return float(
-        -float(temperature)
-        * _stable_logsumexp(
-            -values / float(temperature),
-            axis=0,
+        -scale
+        * (
+            _stable_logsumexp(
+                -values / scale,
+                axis=0,
+            )
+            - np.log(float(len(values)))
         )
     )
 
@@ -4610,8 +4671,8 @@ def evaluate_multiview_nasal_objective(
             "softmin_temperature": float(
                 limits.orientation_barrier_softmin_temperature
             ),
-            "baseline_cross_squared_epsilon": (
-                _ORIENTATION_BASELINE_CROSS_SQUARED_EPSILON
+            "baseline_local_triangle_quality_threshold": (
+                _ORIENTATION_BASELINE_LOCAL_QUALITY_THRESHOLD
             ),
         },
         "depth_support_vertex_count": len(
