@@ -148,6 +148,44 @@ def test_two_small_initializations_converge_to_same_synthetic_solution(
     )
 
 
+def test_active_parameter_subset_keeps_all_other_coefficients_fixed(
+    monkeypatch,
+):
+    context, _ = _objective_problem()
+    target = np.linspace(-0.35, 0.35, context.parameter_count)
+    initial = np.linspace(0.12, -0.12, context.parameter_count)
+    active = np.asarray((1, 4, 7), dtype=np.int64)
+    monkeypatch.setattr(
+        nasal_optimizer,
+        "evaluate_multiview_nasal_objective_residuals",
+        _synthetic_evaluator(
+            context,
+            lambda coefficients: coefficients - target,
+        ),
+    )
+
+    result = fit_multiview_nasal_shape(
+        context,
+        initial_coefficients=initial,
+        active_parameter_indices=active,
+    )
+
+    assert result.success
+    expected = initial.copy()
+    expected[active] = target[active]
+    np.testing.assert_allclose(result.coefficients, expected, atol=1e-8)
+    inactive = np.setdiff1d(np.arange(context.parameter_count), active)
+    np.testing.assert_array_equal(
+        result.coefficients[inactive],
+        initial[inactive],
+    )
+    assert result.jacobian_rank == len(active)
+    assert result.report["active_parameter_indices"] == tuple(active)
+    assert result.report["active_parameter_names"] == tuple(
+        context.parameter_ordering[index] for index in active
+    )
+
+
 def test_real_image_target_converges_without_flipping_an_active_face():
     target = np.zeros(8, dtype=np.float64)
     target[0] = 1.0

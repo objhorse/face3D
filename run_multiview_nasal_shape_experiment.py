@@ -16,6 +16,7 @@ import struct
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -76,6 +77,8 @@ class ComputedCandidate:
     optimization_config: Any
     baseline_objective: Any
     optimization_result: Any
+    optimization_strategy: str = "unified_v3"
+    staged_optimization: Any = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -368,6 +371,99 @@ def _compute_candidate(
         optimization_config=optimization_config,
         baseline_objective=baseline_objective,
         optimization_result=result,
+        optimization_strategy="unified_v3",
+    )
+
+
+def _compute_balanced_candidate(
+    source_output: Path,
+    observations: NasalObservationBundle,
+) -> ComputedCandidate:
+    from src.geometry.balanced_nasal_optimizer import (
+        fit_balanced_multiview_nasal_shape,
+    )
+    from src.geometry.multiview_nasal_objective import (
+        MultiviewNasalObjectiveConfig,
+        evaluate_multiview_nasal_objective,
+        prepare_multiview_nasal_objective_context,
+        prepare_nasal_projection_context,
+    )
+    from src.geometry.multiview_nasal_optimizer import (
+        NasalOptimizationConfig,
+    )
+    from src.geometry.nasal_semantic_basis import build_nasal_semantic_basis
+
+    baseline = _load_baseline_state(source_output)
+    views = build_model_projection_views(
+        observations,
+        baseline.front_rotation,
+        baseline.front_translation,
+    )
+    semantic_basis = build_nasal_semantic_basis(
+        baseline.vertices,
+        baseline.faces,
+        baseline.landmark_triangles,
+        baseline.landmark_barycentric,
+        baseline.front_rotation,
+    )
+    shape_mode_count = int(baseline.shape_basis.shape[2])
+    semantic_only = SimpleNamespace(
+        vertex_basis=np.zeros(
+            (len(baseline.vertices), 3, 0),
+            dtype=np.float64,
+        ),
+        coefficient_basis=np.zeros(
+            (shape_mode_count, 0),
+            dtype=np.float64,
+        ),
+        retained_rank=0,
+        report_data={
+            "status": "disabled_for_balanced_semantic_v4",
+            "retained_rank": 0,
+            "reason": (
+                "Stage A optimizes only the eight semantic nasal modes"
+            ),
+        },
+    )
+    projection_context = prepare_nasal_projection_context(
+        baseline.faces,
+        semantic_basis,
+        observations,
+        views,
+    )
+    objective_context = prepare_multiview_nasal_objective_context(
+        baseline.vertices,
+        semantic_only,
+        semantic_basis,
+        observations,
+        projection_context=projection_context,
+    )
+    objective_config = MultiviewNasalObjectiveConfig()
+    optimization_config = NasalOptimizationConfig()
+    zero = np.zeros(objective_context.parameter_count, dtype=np.float64)
+    baseline_objective = evaluate_multiview_nasal_objective(
+        zero,
+        objective_context,
+        objective_config,
+    )
+    staged = fit_balanced_multiview_nasal_shape(
+        objective_context,
+        objective_config,
+        optimization_config,
+        initial_coefficients=zero,
+    )
+    return ComputedCandidate(
+        baseline=baseline,
+        views=views,
+        semantic_basis=semantic_basis,
+        observable_subspace=semantic_only,
+        objective_context=objective_context,
+        objective_config=objective_config,
+        optimization_config=optimization_config,
+        baseline_objective=baseline_objective,
+        optimization_result=staged.final_result,
+        optimization_strategy="balanced_semantic_v4",
+        staged_optimization=staged,
     )
 
 
@@ -465,7 +561,8 @@ def _fit_report(computed: ComputedCandidate) -> dict[str, Any]:
     result = computed.optimization_result
     final = result.final_objective
     context = computed.objective_context
-    return {
+    report = {
+        "optimization_strategy": computed.optimization_strategy,
         "parameterization": {
             "ordering": list(context.parameter_ordering),
             "coefficients": result.coefficients.tolist(),
@@ -475,7 +572,7 @@ def _fit_report(computed: ComputedCandidate) -> dict[str, Any]:
             ),
             "representation_note": (
                 "Candidate vertices are the frozen-expression baseline plus "
-                "observable FLAME and semantic low-dimensional displacement. "
+                "the enabled low-dimensional displacement basis. "
                 "These coefficients are not standalone FLAME shape_params."
             ),
         },
@@ -544,6 +641,11 @@ def _fit_report(computed: ComputedCandidate) -> dict[str, Any]:
             for view in computed.views
         ],
     }
+    if computed.staged_optimization is not None:
+        report["balanced_stages"] = _jsonable(
+            computed.staged_optimization.to_report_data()
+        )
+    return report
 
 
 def _subdivide_candidate(
@@ -1688,6 +1790,8 @@ def run_multiview_nasal_shape_experiment(
     *,
     rig_calibration: str | Path,
     viewer_template: str | Path | None = None,
+    optimization_strategy: str = "unified_v3",
+    expected_baseline_glb_sha256: str | None = None,
 ) -> Path:
     """Run Batch D for one dataset and return nasal_fit_report.json."""
     captures = Path(capture_dir).resolve()
@@ -1700,6 +1804,28 @@ def run_multiview_nasal_shape_experiment(
         raise FileNotFoundError(f"source output does not exist: {source}")
     if not rig.is_file():
         raise FileNotFoundError(f"rig calibration does not exist: {rig}")
+    strategy = str(optimization_strategy)
+    if strategy not in ("unified_v3", "balanced_semantic_v4"):
+        raise ValueError(
+            "optimization_strategy must be 'unified_v3' or "
+            "'balanced_semantic_v4'"
+        )
+    baseline_glb = _baseline_textured_glb(source)
+    baseline_glb_sha256 = _sha256_file(baseline_glb)
+    if expected_baseline_glb_sha256 is not None:
+        expected_hash = str(expected_baseline_glb_sha256).lower()
+        if (
+            len(expected_hash) != 64
+            or any(character not in "0123456789abcdef" for character in expected_hash)
+        ):
+            raise ValueError(
+                "expected_baseline_glb_sha256 must be 64 lowercase hex digits"
+            )
+        if baseline_glb_sha256.lower() != expected_hash:
+            raise RuntimeError(
+                "baseline GLB hash mismatch: expected "
+                f"{expected_hash}, got {baseline_glb_sha256}"
+            )
     validate_separate_output(target, source, captures)
     _ensure_no_candidate_collision(target)
     source_hashes = file_tree_hashes(source)
@@ -1709,6 +1835,7 @@ def run_multiview_nasal_shape_experiment(
         "schema": "multiview-nasal-shape-experiment-v1",
         "status": "initializing",
         "dataset": dataset_label,
+        "optimization_strategy": strategy,
         "default_pipeline_modified": False,
         "texture_scoring_in_objective": False,
         "paths": {
@@ -1724,6 +1851,16 @@ def run_multiview_nasal_shape_experiment(
             "file_count": len(source_hashes),
             "tree_sha256": _tree_digest(source_hashes),
             "files": dict(source_hashes),
+        },
+        "canonical_baseline_glb": {
+            "path": str(baseline_glb),
+            "sha256": baseline_glb_sha256,
+            "expected_sha256": expected_baseline_glb_sha256,
+            "verified": (
+                expected_baseline_glb_sha256 is None
+                or baseline_glb_sha256.lower()
+                == str(expected_baseline_glb_sha256).lower()
+            ),
         },
         "rig": {
             "sha256": _sha256_file(rig),
@@ -1751,7 +1888,11 @@ def run_multiview_nasal_shape_experiment(
         ]
 
         report["status"] = "optimizing"
-        computed = _compute_candidate(source, observations)
+        computed = (
+            _compute_balanced_candidate(source, observations)
+            if strategy == "balanced_semantic_v4"
+            else _compute_candidate(source, observations)
+        )
         report["fit"] = _fit_report(computed)
         result = computed.optimization_result
         if not result.success or result.final_objective is None:
@@ -1792,7 +1933,6 @@ def run_multiview_nasal_shape_experiment(
             baseline=baseline,
             candidate_vertices=candidate_vertices,
         )
-        baseline_glb = _baseline_textured_glb(source)
         template = (
             Path(viewer_template).resolve()
             if viewer_template is not None

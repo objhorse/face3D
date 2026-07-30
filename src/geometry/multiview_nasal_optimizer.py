@@ -399,10 +399,21 @@ def _solver_integer(
 
 def _parse_solver_result(
     solved,
-    context: MultiviewNasalObjectiveContext,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
 ) -> _ParsedSolverResult:
     errors = []
-    parameter_count = context.parameter_count
+    lower = np.asarray(lower_bounds, dtype=np.float64)
+    upper = np.asarray(upper_bounds, dtype=np.float64)
+    if (
+        lower.ndim != 1
+        or upper.shape != lower.shape
+        or not np.isfinite(lower).all()
+        or not np.isfinite(upper).all()
+        or np.any(lower >= upper)
+    ):
+        raise ValueError("solver bounds must be finite ordered vectors")
+    parameter_count = len(lower)
 
     raw_x = _solver_field(solved, "x", errors)
     x = None
@@ -417,8 +428,8 @@ def _parse_solver_result(
             if (
                 candidate_x.shape != (parameter_count,)
                 or not np.isfinite(candidate_x).all()
-                or np.any(candidate_x < context.parameter_lower_bounds)
-                or np.any(candidate_x > context.parameter_upper_bounds)
+                or np.any(candidate_x < lower)
+                or np.any(candidate_x > upper)
             ):
                 errors.append(
                     "x: expected a finite in-bounds parameter vector"
@@ -613,6 +624,8 @@ def fit_multiview_nasal_shape(
     objective_config: Optional[MultiviewNasalObjectiveConfig] = None,
     optimization_config: Optional[NasalOptimizationConfig] = None,
     initial_coefficients: Optional[np.ndarray] = None,
+    *,
+    active_parameter_indices: Optional[np.ndarray] = None,
 ) -> NasalOptimizationResult:
     """Fit one context without mutating or writing its baseline artifacts."""
     if not isinstance(context, MultiviewNasalObjectiveContext):
@@ -635,6 +648,26 @@ def fit_multiview_nasal_shape(
         raise ValueError(
             "optimization_config must be a NasalOptimizationConfig"
         )
+    if active_parameter_indices is None:
+        active_indices = np.arange(
+            context.parameter_count,
+            dtype=np.int64,
+        )
+    else:
+        supplied_active = np.asarray(active_parameter_indices)
+        if (
+            supplied_active.ndim != 1
+            or not len(supplied_active)
+            or not np.issubdtype(supplied_active.dtype, np.integer)
+            or np.any(supplied_active < 0)
+            or np.any(supplied_active >= context.parameter_count)
+            or np.any(np.diff(supplied_active) <= 0)
+        ):
+            raise ValueError(
+                "active_parameter_indices must be a sorted unique "
+                "non-empty integer vector inside the parameter range"
+            )
+        active_indices = np.asarray(supplied_active, dtype=np.int64)
 
     zero = np.zeros(context.parameter_count, dtype=np.float64)
     try:
@@ -745,23 +778,43 @@ def fit_multiview_nasal_shape(
             },
         )
 
-    x_scale = np.r_[
+    full_x_scale = np.r_[
         context.flame_mode_standard_deviations,
         np.asarray(
             objective_limits.semantic_prior_standard_deviations,
             dtype=np.float64,
         ),
     ]
+    x_scale = full_x_scale[active_indices]
+    all_parameters_active = np.array_equal(
+        active_indices,
+        np.arange(context.parameter_count, dtype=np.int64),
+    )
+    solver_lower_bounds = (
+        context.parameter_lower_bounds
+        if all_parameters_active
+        else context.parameter_lower_bounds[active_indices]
+    )
+    solver_upper_bounds = (
+        context.parameter_upper_bounds
+        if all_parameters_active
+        else context.parameter_upper_bounds[active_indices]
+    )
     trace = []
     evaluation_count = 0
     best_coefficients = initial.copy()
     best_total_cost = np.inf
 
-    def residual(coefficients):
+    def residual(active_coefficients):
         nonlocal evaluation_count
         nonlocal best_coefficients
         nonlocal best_total_cost
         evaluation_count += 1
+        coefficients = np.array(initial, dtype=np.float64, copy=True)
+        coefficients[active_indices] = np.asarray(
+            active_coefficients,
+            dtype=np.float64,
+        )
         try:
             evaluated = evaluate_multiview_nasal_objective_residuals(
                 coefficients,
@@ -822,16 +875,24 @@ def fit_multiview_nasal_shape(
         "loss": objective_limits.robust_loss,
         "f_scale": float(objective_limits.robust_f_scale),
         "x_scale": tuple(float(value) for value in x_scale),
+        "full_x_scale": tuple(float(value) for value in full_x_scale),
+        "active_parameter_indices": tuple(
+            int(value) for value in active_indices
+        ),
+        "active_parameter_names": tuple(
+            context.parameter_ordering[int(value)]
+            for value in active_indices
+        ),
         **evidence_report,
     }
     try:
         solved = least_squares(
             residual,
-            initial,
+            initial[active_indices],
             jac=solver_limits.jac,
             bounds=(
-                context.parameter_lower_bounds,
-                context.parameter_upper_bounds,
+                solver_lower_bounds,
+                solver_upper_bounds,
             ),
             method=solver_limits.method,
             ftol=float(solver_limits.ftol),
@@ -908,9 +969,17 @@ def fit_multiview_nasal_shape(
             report=report,
         )
 
-    parsed = _parse_solver_result(solved, context)
+    parsed = _parse_solver_result(
+        solved,
+        solver_lower_bounds,
+        solver_upper_bounds,
+    )
     endpoint_is_valid = parsed.x is not None
-    selected = parsed.x if endpoint_is_valid else initial
+    selected = np.array(initial, dtype=np.float64, copy=True)
+    if endpoint_is_valid:
+        selected[active_indices] = parsed.x
+    full_active_mask = np.zeros(context.parameter_count, dtype=np.int64)
+    full_active_mask[active_indices] = parsed.active_mask
     selected_source = (
         "solver_final"
         if endpoint_is_valid
@@ -929,7 +998,7 @@ def fit_multiview_nasal_shape(
             "solver_final_coefficients": (
                 None
                 if parsed.x is None
-                else tuple(float(value) for value in parsed.x)
+                else tuple(float(value) for value in selected)
             ),
             "best_observed_robust_cost": (
                 None
@@ -945,6 +1014,7 @@ def fit_multiview_nasal_shape(
             "diagnostic_parse_errors": parsed.errors,
             "jacobian_rank": parsed.jacobian_rank,
             "parameter_count": context.parameter_count,
+            "active_parameter_count": len(active_indices),
             "final_objective_role": (
                 "solver_endpoint"
                 if endpoint_is_valid
@@ -967,7 +1037,7 @@ def fit_multiview_nasal_shape(
             njev=parsed.njev,
             evaluation_count=evaluation_count,
             optimality=parsed.optimality,
-            active_mask=parsed.active_mask,
+            active_mask=full_active_mask,
             jacobian_rank=parsed.jacobian_rank,
             trace=trace,
             report=report,
@@ -987,7 +1057,7 @@ def fit_multiview_nasal_shape(
             njev=parsed.njev,
             evaluation_count=evaluation_count,
             optimality=parsed.optimality,
-            active_mask=parsed.active_mask,
+            active_mask=full_active_mask,
             jacobian_rank=parsed.jacobian_rank,
             trace=trace,
             report=report,
@@ -995,7 +1065,7 @@ def fit_multiview_nasal_shape(
     if not parsed.success:
         rank_deficient = (
             parsed.jacobian_rank is not None
-            and parsed.jacobian_rank < context.parameter_count
+            and parsed.jacobian_rank < len(active_indices)
         )
         failure_reason = (
             "singular_jacobian" if rank_deficient else "solver_failed"
@@ -1005,7 +1075,7 @@ def fit_multiview_nasal_shape(
             solver_message = (
                 f"{parsed.message} | finite-difference Jacobian rank "
                 f"{parsed.jacobian_rank} for "
-                f"{context.parameter_count} parameters"
+                f"{len(active_indices)} active parameters"
             )
         return _result(
             success=False,
@@ -1018,7 +1088,7 @@ def fit_multiview_nasal_shape(
             njev=parsed.njev,
             evaluation_count=evaluation_count,
             optimality=parsed.optimality,
-            active_mask=parsed.active_mask,
+            active_mask=full_active_mask,
             jacobian_rank=parsed.jacobian_rank,
             trace=trace,
             report=report,
@@ -1034,7 +1104,7 @@ def fit_multiview_nasal_shape(
         njev=parsed.njev,
         evaluation_count=evaluation_count,
         optimality=parsed.optimality,
-        active_mask=parsed.active_mask,
+        active_mask=full_active_mask,
         jacobian_rank=parsed.jacobian_rank,
         trace=trace,
         report=report,
