@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>__TITLE__</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #10151b;
+      color: #eef2f5;
+      font: 14px Arial, sans-serif;
+    }
+    #viewer { position: fixed; inset: 0; }
+    canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+    #toolbar {
+      position: fixed;
+      z-index: 3;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .group, #status {
+      display: flex;
+      gap: 4px;
+      padding: 4px;
+      background: rgba(16, 21, 27, 0.94);
+      border: 1px solid #40505c;
+      border-radius: 6px;
+      pointer-events: auto;
+    }
+    button {
+      min-height: 34px;
+      padding: 6px 11px;
+      color: #dce5ea;
+      background: transparent;
+      border: 0;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover, button.active { color: #10151b; background: #d8e8f1; }
+    button:focus-visible { outline: 2px solid #79b8ff; outline-offset: 1px; }
+    #status {
+      min-height: 34px;
+      box-sizing: border-box;
+      align-items: center;
+      margin-left: auto;
+      padding: 7px 10px;
+      color: #c8d3da;
+    }
+    #status.error { color: #ffb0b0; border-color: #a95151; }
+    .label {
+      position: fixed;
+      z-index: 2;
+      top: 66px;
+      max-width: calc(50vw - 40px);
+      padding: 8px 11px;
+      overflow-wrap: anywhere;
+      background: rgba(16, 21, 27, 0.92);
+      border: 1px solid #40505c;
+      border-radius: 5px;
+      pointer-events: none;
+    }
+    #baseline-label { left: 14px; }
+    #candidate-label { left: calc(50% + 14px); }
+    #divider {
+      position: fixed;
+      z-index: 2;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 1px;
+      background: #5b6973;
+      pointer-events: none;
+    }
+    @media (max-width: 820px) {
+      #status { order: 3; width: 100%; margin-left: 0; }
+      .label { top: 108px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="viewer"></div>
+  <div id="toolbar">
+    <div class="group" aria-label="Rendering mode">
+      <button type="button" data-mode="texture" class="active">Texture</button>
+      <button type="button" data-mode="normals">Geometry</button>
+      <button type="button" data-mode="wire">Wireframe</button>
+    </div>
+    <div class="group" aria-label="Camera view">
+      <button type="button" data-view="front" class="active">Front</button>
+      <button type="button" data-view="left">Subject-left</button>
+      <button type="button" data-view="right">Subject-right</button>
+    </div>
+    <div id="status" role="status" aria-live="polite">Loading two embedded models...</div>
+  </div>
+  <div id="baseline-label" class="label">__BASELINE_LABEL__</div>
+  <div id="candidate-label" class="label">__CANDIDATE_LABEL__</div>
+  <div id="divider"></div>
+
+  <script type="module">
+    import * as THREE from '__THREE_MODULE__';
+    import { OrbitControls } from '__ORBIT_CONTROLS__';
+    import { GLTFLoader } from '__GLTF_LOADER__';
+
+    const host = document.getElementById('viewer');
+    const status = document.getElementById('status');
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x10151b);
+    const camera = new THREE.PerspectiveCamera(
+      38,
+      0.5 * innerWidth / innerHeight,
+      0.0001,
+      100,
+    );
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      preserveDrawingBuffer: true,
+    });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setScissorTest(true);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    host.appendChild(renderer.domElement);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x34404a, 1.8));
+    const key = new THREE.DirectionalLight(0xffffff, 2.0);
+    key.position.set(1, 1, 2);
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0xd9e9f0, 0.8);
+    fill.position.set(-2, 0.5, 1);
+    scene.add(fill);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.enablePan = false;
+    const normalsMaterial = new THREE.MeshNormalMaterial({
+      side: THREE.DoubleSide,
+    });
+    const wireMaterial = new THREE.MeshBasicMaterial({
+      color: 0xc9e4ef,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.48,
+    });
+    const models = {};
+    const query = new URLSearchParams(location.search);
+    let activeMode = ['texture', 'normals', 'wire'].includes(query.get('mode'))
+      ? query.get('mode')
+      : 'texture';
+    let activeView = ['front', 'left', 'right'].includes(query.get('view'))
+      ? query.get('view')
+      : 'front';
+    let distance = 1;
+    window.viewerReady = false;
+    window.viewerError = null;
+
+    const embeddedModels = {
+      baseline: '__BASELINE_BASE64__',
+      candidate: '__CANDIDATE_BASE64__',
+    };
+
+    function decodeBase64(base64Data) {
+      const binary = atob(base64Data);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return bytes.buffer;
+    }
+
+    function loadModel(name, base64Data) {
+      return new Promise((resolve, reject) => {
+        const loader = new GLTFLoader();
+        loader.parse(
+          decodeBase64(base64Data),
+          '',
+          (gltf) => {
+            const root = gltf.scene;
+            root.visible = false;
+            root.traverse((object) => {
+              if (!object.isMesh) return;
+              object.geometry.deleteAttribute('normal');
+              object.geometry.computeVertexNormals();
+              object.userData.textureMaterial = object.material;
+              object.frustumCulled = false;
+            });
+            scene.add(root);
+            models[name] = root;
+            resolve(root);
+          },
+          reject,
+        );
+      });
+    }
+
+    function setMode(mode) {
+      activeMode = mode;
+      Object.values(models).forEach((root) => root.traverse((object) => {
+        if (!object.isMesh) return;
+        if (mode === 'texture') object.material = object.userData.textureMaterial;
+        if (mode === 'normals') object.material = normalsMaterial;
+        if (mode === 'wire') object.material = wireMaterial;
+      }));
+      document.querySelectorAll('[data-mode]').forEach((button) => {
+        button.classList.toggle('active', button.dataset.mode === mode);
+      });
+      status.textContent = mode === 'texture'
+        ? 'Same GLB materials; baseline on the left, candidate on the right.'
+        : 'Texture hidden: comparing geometry only.';
+    }
+
+    function setView(view) {
+      activeView = view;
+      const positions = {
+        front: [0, 0, distance],
+        left: [-distance, 0, 0],
+        right: [distance, 0, 0],
+      };
+      camera.position.set(...positions[view]);
+      camera.lookAt(controls.target);
+      controls.update();
+      document.querySelectorAll('[data-view]').forEach((button) => {
+        button.classList.toggle('active', button.dataset.view === view);
+      });
+    }
+
+    function renderHalf(name, left, width, height) {
+      Object.entries(models).forEach(([modelName, root]) => {
+        root.visible = modelName === name;
+      });
+      renderer.setViewport(left, 0, width, height);
+      renderer.setScissor(left, 0, width, height);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.render(scene, camera);
+    }
+
+    async function start() {
+      await Promise.all([
+        loadModel('baseline', embeddedModels.baseline),
+        loadModel('candidate', embeddedModels.candidate),
+      ]);
+      const box = new THREE.Box3();
+      Object.values(models).forEach((root) => box.expandByObject(root));
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      Object.values(models).forEach((root) => root.position.sub(center));
+      const maxDim = Math.max(size.x, size.y, size.z);
+      distance = maxDim
+        / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))
+        * 1.36;
+      controls.target.set(0, 0, 0);
+      setMode(activeMode);
+      setView(activeView);
+      document.body.dataset.ready = 'true';
+      window.viewerError = null;
+      window.viewerReady = true;
+    }
+
+    document.querySelectorAll('[data-mode]').forEach((button) => {
+      button.addEventListener('click', () => setMode(button.dataset.mode));
+    });
+    document.querySelectorAll('[data-view]').forEach((button) => {
+      button.addEventListener('click', () => setView(button.dataset.view));
+    });
+    addEventListener('resize', () => renderer.setSize(innerWidth, innerHeight));
+    renderer.setAnimationLoop(() => {
+      controls.update();
+      if (!models.baseline || !models.candidate) return;
+      const leftWidth = Math.floor(innerWidth / 2);
+      renderHalf('baseline', 0, leftWidth, innerHeight);
+      renderHalf('candidate', leftWidth, innerWidth - leftWidth, innerHeight);
+    });
+
+    start().catch((error) => {
+      const message = error instanceof Error && error.message
+        ? error.message
+        : String(error);
+      status.textContent = `Error: ${message}`;
+      status.classList.add('error');
+      document.body.dataset.ready = 'error';
+      window.viewerReady = false;
+      window.viewerError = message;
+      console.error(error);
+    });
+  </script>
+</body>
+</html>

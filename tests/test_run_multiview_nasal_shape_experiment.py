@@ -533,6 +533,9 @@ def _write_textured_glb(
                 ]
             }
         ]
+        payload["nodes"] = [{"mesh": 0}]
+        payload["scenes"] = [{"nodes": [0]}]
+        payload["scene"] = 0
     payload["buffers"] = [{"byteLength": len(binary)}]
     json_chunk = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     json_chunk += b" " * ((-len(json_chunk)) % 4)
@@ -632,7 +635,7 @@ def test_embedded_textured_glb_validation_rejects_broken_references_and_images(
         runner._validate_embedded_textured_glb(path)
 
 
-def test_default_viewer_is_self_contained_without_historical_template(
+def test_default_viewer_uses_threejs_parity_without_historical_template(
     tmp_path: Path,
 ) -> None:
     baseline = tmp_path / "baseline.glb"
@@ -651,26 +654,36 @@ def test_default_viewer_is_self_contained_without_historical_template(
     text = viewer.read_text(encoding="utf-8")
     assert base64.b64encode(b"baseline-model").decode("ascii") in text
     assert base64.b64encode(b"candidate-model").decode("ascii") in text
-    assert "embeddedGlbs" in text
+    assert "embeddedModels" in text
     assert "https://" not in text
+    assert '<script type="module">' in text
+    assert "three.module.js" in text
+    assert "controls/OrbitControls.js" in text
+    assert "loaders/GLTFLoader.js" in text
+    assert "new THREE.PerspectiveCamera(" in text
+    assert "\n      38," in text
+    assert "renderer.outputColorSpace = THREE.SRGBColorSpace" in text
+    assert "new THREE.HemisphereLight" in text
+    assert text.count("new THREE.DirectionalLight") == 2
+    assert "new OrbitControls(camera, renderer.domElement)" in text
+    assert "new GLTFLoader()" in text
+    assert "gl_Position = vec4" not in text
+    assert "Math.max(.55,Math.min(2.2" not in text
     assert 'data-view="front"' in text
     assert 'data-view="left"' in text
     assert 'data-view="right"' in text
-    assert text.count('role="status"') == 2
-    assert 'id="baseline-status"' in text
-    assert 'id="candidate-status"' in text
-    assert text.count("Loading embedded model...") >= 2
-    assert ".viewer-status[hidden]" in text
+    assert 'role="status"' in text
+    assert 'id="status"' in text
+    assert "Loading two embedded models..." in text
     assert "window.viewerReady = false" in text
     assert "window.viewerReady = true" in text
     assert "window.viewerError = null" in text
     assert "window.viewerError = message" in text
     assert "await Promise.all([" in text
-    assert "setCanvasStatus(id, `Error: ${detail}`, true)" in text
-    assert "hideCanvasStatus" in text
+    assert "status.textContent = `Error: ${message}`" in text
 
 
-def test_default_viewer_parses_gltf_alpha_modes_and_configures_blending(
+def test_default_viewer_delegates_gltf_materials_to_threejs_loader(
     tmp_path: Path,
 ) -> None:
     baseline = _write_textured_glb(
@@ -699,16 +712,11 @@ def test_default_viewer_parses_gltf_alpha_modes_and_configures_blending(
     )
 
     text = viewer.read_text(encoding="utf-8")
-    assert '["OPAQUE", "MASK", "BLEND"]' in text
-    assert "material.alphaMode" in text
-    assert "material.alphaCutoff" in text
-    assert "uAlphaMode == 1" in text
-    assert "uAlphaMode == 2" in text
-    assert "discard" in text
-    assert "gl.enable(gl.BLEND)" in text
-    assert "gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)" in text
-    assert "gl.depthMask(!blended)" in text
-    assert "gl.depthMask(true)" in text
+    assert "new GLTFLoader()" in text
+    assert "loader.parse(" in text
+    assert "pbrMetallicRoughness" not in text
+    assert "uAlphaMode" not in text
+    assert "gl.blendFunc" not in text
 
 
 def _unused_local_port() -> int:
@@ -729,6 +737,7 @@ async def _capture_viewer_when_ready(
             str(chrome),
             "--headless=new",
             "--no-sandbox",
+            "--allow-file-access-from-files",
             "--enable-unsafe-swiftshader",
             "--use-angle=swiftshader",
             "--remote-allow-origins=*",
@@ -895,7 +904,7 @@ def test_default_viewer_discards_transparent_blend_pixels_in_headless_chrome(
     )
     assert screenshot.is_file() and screenshot.stat().st_size > 0
     rendered = Image.open(screenshot).convert("RGB")
-    background = (15, 20, 28)
+    background = (16, 21, 27)
     assert rendered.getpixel((300, 450)) != background
     assert rendered.getpixel((900, 450)) == background
     candidate_region = rendered.crop((700, 180, 1100, 700))
@@ -936,7 +945,7 @@ def test_runner_happy_path_writes_outputs_and_preserves_source(
     ]["representation_note"]
     assert (output / "meshes" / "face_same_texture.glb").is_file()
     assert (output / "nasal_shape_compare.html").is_file()
-    assert "embeddedGlbs" in (
+    assert "embeddedModels" in (
         output / "nasal_shape_compare.html"
     ).read_text(encoding="utf-8")
     assert (output / "debug" / "nasal_geometry" / "index.html").is_file()

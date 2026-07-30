@@ -46,6 +46,9 @@ from src.reports.nasal_observation_io import load_nasal_observation_bundle
 from src.reports.nasal_observation_report import read_image_file
 
 
+ROOT = Path(__file__).resolve().parent
+
+
 @dataclass(frozen=True)
 class BaselineState:
     shape_parameters: np.ndarray
@@ -1419,6 +1422,80 @@ start().catch(error=>{{
     return output
 
 
+def _write_threejs_compare_viewer(
+    *,
+    baseline_glb: Path,
+    candidate_glb: Path,
+    output: Path,
+    dataset_label: str,
+) -> Path:
+    template = (
+        ROOT
+        / "frontend"
+        / "templates"
+        / "nasal_ab_compare_viewer.html"
+    )
+    if not template.is_file():
+        raise FileNotFoundError(f"Three.js viewer template not found: {template}")
+    replacements = {
+        "__TITLE__": html.escape(
+            f"{dataset_label} | Baseline vs unified nasal shape",
+            quote=True,
+        ),
+        "__BASELINE_LABEL__": html.escape(
+            f"{dataset_label} | Baseline: protected expression depth v3",
+            quote=True,
+        ),
+        "__CANDIDATE_LABEL__": html.escape(
+            f"{dataset_label} | New: unified multiview nasal shape",
+            quote=True,
+        ),
+        "__BASELINE_BASE64__": base64.b64encode(
+            baseline_glb.read_bytes()
+        ).decode("ascii"),
+        "__CANDIDATE_BASE64__": base64.b64encode(
+            candidate_glb.read_bytes()
+        ).decode("ascii"),
+        "__THREE_MODULE__": (
+            ROOT / "frontend" / "vendor" / "three.module.js"
+        ).resolve().as_uri(),
+        "__ORBIT_CONTROLS__": (
+            ROOT
+            / "frontend"
+            / "vendor"
+            / "three"
+            / "controls"
+            / "OrbitControls.js"
+        ).resolve().as_uri(),
+        "__GLTF_LOADER__": (
+            ROOT
+            / "frontend"
+            / "vendor"
+            / "three"
+            / "loaders"
+            / "GLTFLoader.js"
+        ).resolve().as_uri(),
+    }
+    page = template.read_text(encoding="utf-8")
+    for token, value in replacements.items():
+        if token not in page:
+            raise RuntimeError(f"Three.js viewer template is missing {token}")
+        page = page.replace(token, value)
+    leftovers = [
+        token
+        for token in replacements
+        if token in page
+    ]
+    if leftovers:
+        raise RuntimeError(
+            "Three.js viewer template contains unresolved placeholders: "
+            + ", ".join(leftovers)
+        )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(page, encoding="utf-8")
+    return output
+
+
 def _write_viewer(
     *,
     template: Path | None,
@@ -1428,7 +1505,7 @@ def _write_viewer(
     dataset_label: str,
 ) -> Path:
     if template is None:
-        viewer = _write_lightweight_compare_viewer(
+        viewer = _write_threejs_compare_viewer(
             baseline_glb=baseline_glb,
             candidate_glb=candidate_glb,
             output=output,
@@ -1459,9 +1536,9 @@ def _write_viewer(
     )
     if template is None:
         required += (
-            "embeddedGlbs",
-            '"baseline":"',
-            '"candidate":"',
+            "embeddedModels",
+            "baseline: '",
+            "candidate: '",
             'role="status"',
             "window.viewerReady",
             "window.viewerError",
