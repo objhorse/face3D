@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
+from typing import Any
 
 import cv2
 import numpy as np
@@ -16,6 +18,9 @@ class SamplingWarp:
     control_residual_before_px: float
     control_residual_after_px: float
     max_displacement_px: float
+    displacement_p95_px: float = 0.0
+    min_jacobian: float = 1.0
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def apply(self, points: np.ndarray, image_shape: tuple[int, int]) -> np.ndarray:
         """Map model projection pixels to registered source-image sample pixels."""
@@ -127,6 +132,219 @@ def build_sampling_warp(
         warp.control_residual_before_px,
         after,
         warp.max_displacement_px,
+        float(np.percentile(np.linalg.norm(warp.displacement_grid, axis=2), 95)),
+        displacement_field_metrics(warp.displacement_grid, warp.canvas_shape)["min_jacobian"],
+        {"mode": "legacy_global_rbf"},
+    )
+
+
+def displacement_field_metrics(
+    displacement_grid: np.ndarray,
+    canvas_shape: tuple[int, int],
+) -> dict[str, float]:
+    field = np.asarray(displacement_grid, dtype=np.float64)
+    if field.ndim != 3 or field.shape[2] != 2:
+        raise ValueError("displacement grid must have shape (H, W, 2)")
+    canvas_h, canvas_w = map(int, canvas_shape[:2])
+    step_y = (canvas_h - 1) / max(field.shape[0] - 1, 1)
+    step_x = (canvas_w - 1) / max(field.shape[1] - 1, 1)
+    dux_dy, dux_dx = np.gradient(field[:, :, 0], step_y, step_x)
+    duy_dy, duy_dx = np.gradient(field[:, :, 1], step_y, step_x)
+    jacobian = (1.0 + dux_dx) * (1.0 + duy_dy) - dux_dy * duy_dx
+    magnitude = np.linalg.norm(field, axis=2)
+    return {
+        "min_jacobian": float(np.min(jacobian)),
+        "jacobian_p05": float(np.percentile(jacobian, 5)),
+        "displacement_p95_px": float(np.percentile(magnitude, 95)),
+        "max_displacement_px": float(np.max(magnitude)),
+    }
+
+
+def _bounded_similarity_matrix(
+    model_points: np.ndarray,
+    observed_points: np.ndarray,
+    *,
+    max_translation_px: float,
+    max_rotation_degrees: float,
+    max_scale_delta: float,
+) -> tuple[np.ndarray, dict[str, float]]:
+    model = np.asarray(model_points, dtype=np.float32)
+    observed = np.asarray(observed_points, dtype=np.float32)
+    finite = np.isfinite(model).all(axis=1) & np.isfinite(observed).all(axis=1)
+    model = model[finite]
+    observed = observed[finite]
+    if len(model) < 3:
+        raise ValueError("at least three global similarity controls are required")
+    estimate, _inliers = cv2.estimateAffinePartial2D(
+        model,
+        observed,
+        method=cv2.LMEDS,
+    )
+    if estimate is None:
+        estimate = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    linear = np.asarray(estimate[:, :2], dtype=np.float64)
+    scale = float(math.sqrt(max(np.linalg.det(linear), 1e-12)))
+    angle = float(math.atan2(linear[1, 0], linear[0, 0]))
+    max_angle = math.radians(float(max_rotation_degrees))
+    bounded_scale = float(np.clip(scale, 1.0 - max_scale_delta, 1.0 + max_scale_delta))
+    bounded_angle = float(np.clip(angle, -max_angle, max_angle))
+    cosine = math.cos(bounded_angle)
+    sine = math.sin(bounded_angle)
+    bounded_linear = bounded_scale * np.array(
+        [[cosine, -sine], [sine, cosine]], dtype=np.float64
+    )
+    model_center = model.mean(axis=0).astype(np.float64)
+    observed_center = observed.mean(axis=0).astype(np.float64)
+    translation = observed_center - bounded_linear @ model_center
+    translation_norm = float(np.linalg.norm(translation))
+    if translation_norm > float(max_translation_px):
+        translation *= float(max_translation_px) / max(translation_norm, 1e-6)
+    matrix = np.column_stack((bounded_linear, translation)).astype(np.float32)
+    return matrix, {
+        "estimated_scale": scale,
+        "bounded_scale": bounded_scale,
+        "estimated_rotation_degrees": math.degrees(angle),
+        "bounded_rotation_degrees": math.degrees(bounded_angle),
+        "translation_x_px": float(translation[0]),
+        "translation_y_px": float(translation[1]),
+    }
+
+
+def _matrix_displacement_grid(
+    matrix: np.ndarray,
+    canvas_shape: tuple[int, int],
+    grid_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    height, width = map(int, canvas_shape[:2])
+    grid_h = int(grid_size)
+    grid_w = int(round(grid_size * width / max(height, 1)))
+    xs = np.linspace(0, width - 1, grid_w, dtype=np.float32)
+    ys = np.linspace(0, height - 1, grid_h, dtype=np.float32)
+    gx, gy = np.meshgrid(xs, ys)
+    points = np.stack((gx, gy), axis=2)
+    transformed = points @ matrix[:, :2].T + matrix[:, 2]
+    return (transformed - points).astype(np.float32), gx, gy
+
+
+def build_layered_feature_warp(
+    global_model_points: np.ndarray,
+    global_observed_points: np.ndarray,
+    local_model_points: np.ndarray,
+    local_observed_points: np.ndarray,
+    canvas_shape: tuple[int, int],
+    *,
+    grid_size: int = 96,
+    smoothing: float = 8.0,
+    max_translation_px: float = 8.0,
+    max_rotation_degrees: float = 1.0,
+    max_scale_delta: float = 0.015,
+    local_max_displacement_px: float = 16.0,
+    min_jacobian: float = 0.35,
+) -> SamplingWarp:
+    """Fit a bounded global transform plus a nose-confined local sampling field."""
+    height, width = map(int, canvas_shape[:2])
+    matrix, similarity_report = _bounded_similarity_matrix(
+        global_model_points,
+        global_observed_points,
+        max_translation_px=max_translation_px,
+        max_rotation_degrees=max_rotation_degrees,
+        max_scale_delta=max_scale_delta,
+    )
+    global_grid, gx, gy = _matrix_displacement_grid(matrix, (height, width), grid_size)
+    model = np.asarray(local_model_points, dtype=np.float32)
+    observed = np.asarray(local_observed_points, dtype=np.float32)
+    finite = np.isfinite(model).all(axis=1) & np.isfinite(observed).all(axis=1)
+    model = model[finite]
+    observed = observed[finite]
+    if len(model) < 4:
+        raise ValueError("at least four local semantic controls are required")
+    globally_warped = model @ matrix[:, :2].T + matrix[:, 2]
+    residual = observed - globally_warped
+    residual_magnitude = np.linalg.norm(residual, axis=1)
+    residual_scale = np.minimum(
+        1.0,
+        float(local_max_displacement_px) / np.maximum(residual_magnitude, 1e-6),
+    )
+    residual = residual * residual_scale[:, None]
+
+    x_span = max(float(np.ptp(model[:, 0])), 10.0)
+    y_span = max(float(np.ptp(model[:, 1])), 10.0)
+    center = model.mean(axis=0)
+    radius_x = x_span * 0.75 + 12.0
+    radius_y = y_span * 0.85 + 12.0
+    anchor_angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
+    anchors = np.stack(
+        (
+            center[0] + radius_x * 1.35 * np.cos(anchor_angles),
+            center[1] + radius_y * 1.35 * np.sin(anchor_angles),
+        ),
+        axis=1,
+    ).astype(np.float32)
+    interpolator = RBFInterpolator(
+        np.vstack((model, anchors)),
+        np.vstack((residual, np.zeros_like(anchors))),
+        kernel="thin_plate_spline",
+        smoothing=float(smoothing),
+    )
+    query = np.stack((gx.ravel(), gy.ravel()), axis=1)
+    local_grid = interpolator(query).reshape(gx.shape[0], gx.shape[1], 2)
+    radius = np.sqrt(
+        ((gx - center[0]) / radius_x) ** 2
+        + ((gy - center[1]) / radius_y) ** 2
+    )
+    influence = np.clip((1.35 - radius) / 0.45, 0.0, 1.0)
+    influence = influence * influence * (3.0 - 2.0 * influence)
+    local_grid *= influence[:, :, None]
+    local_magnitude = np.linalg.norm(local_grid, axis=2)
+    local_scale = np.minimum(
+        1.0,
+        float(local_max_displacement_px) / np.maximum(local_magnitude, 1e-6),
+    )
+    local_grid *= local_scale[:, :, None]
+    local_grid = local_grid.astype(np.float32)
+    full_metrics = displacement_field_metrics(global_grid + local_grid, (height, width))
+    local_scale_applied = 0.0
+    combined = global_grid
+    metrics = displacement_field_metrics(combined, (height, width))
+    for factor in np.linspace(1.0, 0.0, 21):
+        candidate = global_grid + float(factor) * local_grid
+        candidate_metrics = displacement_field_metrics(candidate, (height, width))
+        if candidate_metrics["min_jacobian"] >= float(min_jacobian):
+            combined = candidate
+            metrics = candidate_metrics
+            local_scale_applied = float(factor)
+            break
+    fallback = local_scale_applied <= 1e-6
+
+    before = float(np.linalg.norm(observed - model, axis=1).mean())
+    provisional = SamplingWarp(
+        displacement_grid=combined.astype(np.float32),
+        canvas_shape=(height, width),
+        control_residual_before_px=before,
+        control_residual_after_px=0.0,
+        max_displacement_px=metrics["max_displacement_px"],
+        displacement_p95_px=metrics["displacement_p95_px"],
+        min_jacobian=metrics["min_jacobian"],
+        diagnostics={
+            "mode": "bounded_similarity_plus_local_feature",
+            "local_fallback": bool(fallback),
+            "local_scale_applied": local_scale_applied,
+            "full_local_min_jacobian": full_metrics["min_jacobian"],
+            **similarity_report,
+        },
+    )
+    after = float(
+        np.linalg.norm(provisional.apply(model, (height, width)) - observed, axis=1).mean()
+    )
+    return SamplingWarp(
+        displacement_grid=provisional.displacement_grid,
+        canvas_shape=provisional.canvas_shape,
+        control_residual_before_px=before,
+        control_residual_after_px=after,
+        max_displacement_px=provisional.max_displacement_px,
+        displacement_p95_px=provisional.displacement_p95_px,
+        min_jacobian=provisional.min_jacobian,
+        diagnostics=provisional.diagnostics,
     )
 
 

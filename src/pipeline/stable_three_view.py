@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Optional
@@ -59,6 +60,20 @@ def run_stable_three_view_pipeline(
     from src import config as cfg
     from src.module0_intrinsics import get_intrinsics
     from src.module1_preprocess import preprocess_all_views
+
+    seed = int(getattr(cfg, "STABLE_RANDOM_SEED", 20260718))
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    except Exception:
+        logger.warning("Unable to apply deterministic Torch settings", exc_info=True)
 
     session_output_dir.mkdir(parents=True, exist_ok=True)
     mesh_dir = session_output_dir / "meshes"
@@ -134,6 +149,11 @@ def run_stable_three_view_pipeline(
             "geometry": fit_meta["quality"]["geometry"],
             "gate": fit_meta["quality"]["gate"],
             "identity": fit_meta["quality"].get("identity", {}),
+            "controlled_identity": (
+                fit_meta.get("parameters", {})
+                .get("optimized_parameters", {})
+                .get("controlled_identity_deformation", {})
+            ),
             "shape_refinement": (
                 fit_meta.get("parameters", {})
                 .get("optimized_shape", {})
@@ -167,6 +187,10 @@ def run_stable_three_view_pipeline(
             "quality_json": _relative_or_absolute(report_dir / "quality.json", cfg.ROOT),
             "report_html": _relative_or_absolute(report_dir / "index.html", cfg.ROOT),
             "semantic_regions": _relative_or_absolute(mesh_dir / "stable_semantic_regions.json", cfg.ROOT),
+            "controlled_identity_report": _relative_or_absolute(
+                debug_dir / "controlled_identity_deformation" / "summary.json",
+                cfg.ROOT,
+            ),
         },
         "mesh_quality_summary": quality,
         "texture_confidence_summary": texture_meta["confidence"],

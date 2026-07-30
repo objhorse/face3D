@@ -17,6 +17,79 @@ from src.geometry.mesh_quality import (
 from src.geometry.template_fit import temporary_config_overrides
 
 ProgressFn = Callable[[str, int, str], None]
+STRICT_FEATURE_LABELS = frozenset({2, 3, 4, 5, 6, 10})
+MP468_TO_68 = np.asarray(
+    [
+        162, 234, 93, 58, 172, 136, 149, 148, 152, 377, 378, 365, 397, 288,
+        323, 454, 389, 71, 63, 105, 66, 107, 336, 296, 334, 293, 301,
+        168, 197, 5, 4, 75, 97, 2, 326, 305,
+        33, 160, 158, 133, 153, 144,
+        362, 385, 387, 263, 373, 380,
+        61, 39, 37, 0, 267, 269, 291, 405, 314, 17, 84, 181,
+        78, 82, 13, 312, 308, 317, 14, 87,
+    ],
+    dtype=np.int32,
+)
+
+
+def _feature_mask_from_landmarks(
+    landmarks: np.ndarray,
+    image_shape: tuple[int, int],
+) -> Optional[np.ndarray]:
+    points = np.asarray(landmarks, dtype=np.float32)
+    if points.ndim != 2 or points.shape[0] <= int(MP468_TO_68.max()) or points.shape[1] < 2:
+        return None
+
+    import cv2
+
+    points_68 = points[MP468_TO_68, :2]
+    if not np.isfinite(points_68).all():
+        return None
+    height, width = image_shape
+    feature_mask = np.zeros((height, width), dtype=np.uint8)
+    for start, stop in ((17, 22), (22, 27), (27, 36), (36, 42), (42, 48)):
+        region = np.rint(points_68[start:stop]).astype(np.int32)
+        hull = cv2.convexHull(region)
+        if len(hull) >= 3:
+            cv2.fillConvexPoly(feature_mask, hull, 255)
+
+    feature_width = float(np.ptp(points_68[17:60, 0]))
+    margin = max(3, int(round(feature_width * 0.018)))
+    kernel_size = margin * 2 + 1
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+    return cv2.dilate(feature_mask, kernel)
+
+
+def _build_strict_feature_masks(
+    preprocessed_views: Optional[Dict[str, dict]],
+) -> Dict[str, np.ndarray]:
+    """Build unwarped semantic masks for central facial features."""
+    if not preprocessed_views:
+        return {}
+
+    masks: Dict[str, np.ndarray] = {}
+    labels_to_keep = tuple(sorted(STRICT_FEATURE_LABELS))
+    for view, data in preprocessed_views.items():
+        labels = data.get("parser_labels")
+        if labels is not None:
+            masks[view] = (
+                np.isin(np.asarray(labels), labels_to_keep).astype(np.uint8) * 255
+            )
+            continue
+        landmarks = data.get("landmarks")
+        image = data.get("image")
+        if landmarks is None or image is None:
+            continue
+        fallback = _feature_mask_from_landmarks(
+            landmarks,
+            np.asarray(image).shape[:2],
+        )
+        if fallback is not None:
+            masks[view] = fallback
+    return masks
 
 
 def _image_summary(path: Path, valid_mask_path: Optional[Path] = None) -> Dict[str, Any]:
@@ -148,6 +221,8 @@ def run_stable_texture_pipeline(
         raise ValueError(
             "sampling_mode must be 'legacy_registered' or 'strict_projective'"
         )
+    if sampling_mode == "strict_projective":
+        feature_masks = _build_strict_feature_masks(preprocessed_views)
     if (
         sampling_mode == "legacy_registered"
         and preprocessed_views is not None

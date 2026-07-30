@@ -1,4 +1,4 @@
-"""Rebake frozen baseline geometry with strict unwarped projective texture."""
+"""Rebake frozen geometry with strict projective semantic texture ownership."""
 
 from __future__ import annotations
 
@@ -147,7 +147,7 @@ def main() -> None:
         vendor_root=ROOT / "frontend" / "vendor",
         title=f"{dataset_name}: same geometry texture comparison",
         left_label="Baseline: registered texture",
-        right_label="A2: strict projective texture",
+        right_label="A3: strict projective + semantic ownership",
     )
     logger.info("Strict GLB: %s", strict_glb)
     logger.info("A/B viewer: %s", viewer)

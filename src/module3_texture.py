@@ -911,6 +911,37 @@ def _feather_view_weight(weight: np.ndarray, radius_px: float = 72.0) -> np.ndar
     return values * feather
 
 
+def _apply_front_feature_ownership(
+    texture: np.ndarray,
+    valid_y: np.ndarray,
+    valid_x: np.ndarray,
+    protected_features: np.ndarray,
+    front_present: Optional[np.ndarray],
+    front_colors: Optional[np.ndarray],
+) -> Tuple[np.ndarray, dict]:
+    """Restore exact front samples in protected facial-feature UV pixels."""
+    result = np.asarray(texture, dtype=np.float32).copy()
+    protected = np.asarray(protected_features, dtype=bool)
+    if front_present is None or front_colors is None:
+        return result, {
+            "protected_pixels": int(protected.sum()),
+            "front_owned_pixels": 0,
+            "front_ownership_ratio": 0.0,
+        }
+    owned = protected & np.asarray(front_present, dtype=bool)
+    if np.any(owned):
+        result[np.asarray(valid_y)[owned], np.asarray(valid_x)[owned]] = np.asarray(front_colors)[owned]
+    protected_count = int(protected.sum())
+    owned_count = int(owned.sum())
+    return result, {
+        "protected_pixels": protected_count,
+        "front_owned_pixels": owned_count,
+        "front_ownership_ratio": (
+            float(owned_count / protected_count) if protected_count else 1.0
+        ),
+    }
+
+
 def _local_overlap_color_correction(
     colors: np.ndarray,
     indices: np.ndarray,
@@ -1431,7 +1462,6 @@ def bake_texture(
             py = np.clip(pixel_xy[:, 1].astype(np.int32), 0, feature_mask.shape[0] - 1)
             protected = feature_mask[py, px] > 0
         protected_feature_full[front_sample["idx"][protected]] = True
-        front_sample["weights"][protected] *= 4.0
         if diagnostics is not None:
             diagnostics["protected_feature_uv_pixels"] = int(protected.sum())
 
@@ -1442,9 +1472,6 @@ def bake_texture(
         vp_idx = sample["idx"]
         colors = sample["colors"]
         sample_weights = sample["weights"]
-        if view_name != "front":
-            sample_weights = sample_weights.copy()
-            sample_weights[protected_feature_full[vp_idx]] = 0.0
 
         local_transform = None
         if view_name != "front" and front_present is not None:
@@ -1483,6 +1510,11 @@ def bake_texture(
             matched_colors = _match_color_stats(colors, color_stats.get(view_name), ref_stats)
 
         if view_name != "front" and front_present is not None:
+            correction_protection = (
+                np.zeros_like(protected_feature_full)
+                if strict_projective
+                else protected_feature_full
+            )
             matched_colors, local_color_report = _local_overlap_color_correction(
                 matched_colors,
                 vp_idx,
@@ -1490,7 +1522,7 @@ def bake_texture(
                 front_colors_full,
                 valid_y,
                 valid_x,
-                protected_feature_full,
+                correction_protection,
                 (H, W),
             )
             if diagnostics is not None:
@@ -1555,6 +1587,17 @@ def bake_texture(
                 "observed": source_weight > 0.0,
             }
         )
+
+    texture, ownership_report = _apply_front_feature_ownership(
+        texture,
+        valid_y,
+        valid_x,
+        protected_feature_full,
+        front_present,
+        front_colors_full,
+    )
+    if diagnostics is not None:
+        diagnostics["front_feature_ownership"] = ownership_report
 
     # 对无颜色的有效区域做 inpainting 填充（遮挡区域）
     texture_uint8 = texture.clip(0, 255).astype(np.uint8)

@@ -259,3 +259,195 @@ def constrain_expression_depth(
         "coefficient_delta_l2": float(np.linalg.norm(delta)),
         "coefficient_delta_max": float(np.max(np.abs(delta))),
     }
+
+
+def _region_delta_statistics(
+    displacement: np.ndarray,
+    regions: Mapping[str, Sequence[int]],
+) -> dict[str, dict[str, float]]:
+    result: dict[str, dict[str, float]] = {}
+    for name in ("nose", "mouth", "chin", "eyes"):
+        indices = _region_indices(regions, name, len(displacement))
+        values_mm = displacement[indices] * 1000.0
+        magnitude = np.linalg.norm(values_mm, axis=1)
+        result[name] = {
+            "xyz_mean_mm": float(np.mean(magnitude)),
+            "xyz_p95_mm": float(np.percentile(magnitude, 95.0)),
+            "depth_absolute_mean_mm": float(np.mean(np.abs(values_mm[:, 2]))),
+            "depth_absolute_p95_mm": float(
+                np.percentile(np.abs(values_mm[:, 2]), 95.0)
+            ),
+        }
+    return result
+
+
+def constrain_expression_mouth_depth_protected(
+    expression_basis: Any,
+    parameters: Any,
+    regions: Mapping[str, Sequence[int]],
+    *,
+    thresholds: ExpressionDepthThresholds | None = None,
+    forward_axis: int = 2,
+    forward_sign: float = 1.0,
+    unit_scale: float = 1000.0,
+    protected_semantic_weight: float = 8.0,
+    mouth_tangent_weight: float = 2.0,
+    global_outside_weight: float = 1.0,
+) -> dict[str, Any]:
+    """Constrain mouth depth while minimizing geometry changes elsewhere."""
+    from scipy.optimize import LinearConstraint, minimize
+
+    limits = thresholds or ExpressionDepthThresholds()
+    basis = _basis_array(expression_basis)
+    original = _parameters_array(parameters, basis.shape[2])
+    n_vertices, _xyz, n_parameters = basis.shape
+    mouth = _region_indices(regions, "mouth", n_vertices)
+    protected = np.unique(
+        np.concatenate(
+            [
+                _region_indices(regions, name, n_vertices)
+                for name in ("nose", "chin", "eyes")
+            ]
+        )
+    )
+    outside = np.setdiff1d(
+        np.arange(n_vertices, dtype=np.int64),
+        mouth,
+        assume_unique=False,
+    )
+    tangent_axes = [axis for axis in (0, 1, 2) if axis != int(forward_axis)]
+
+    metric = np.zeros((n_parameters, n_parameters), dtype=np.float64)
+
+    def add_metric(matrix: np.ndarray, weight: float) -> None:
+        nonlocal metric
+        flattened = np.asarray(matrix, dtype=np.float64).reshape(-1, n_parameters)
+        if len(flattened):
+            metric += float(weight) * (flattened.T @ flattened)
+
+    add_metric(basis[outside], global_outside_weight)
+    add_metric(basis[protected], protected_semantic_weight)
+    add_metric(basis[mouth][:, tangent_axes, :], mouth_tangent_weight)
+    mean_diagonal = float(np.trace(metric)) / max(n_parameters, 1)
+    metric += np.eye(n_parameters, dtype=np.float64) * max(
+        mean_diagonal * 1e-4,
+        1e-12,
+    )
+
+    scale = float(forward_sign) * float(unit_scale)
+    mouth_influence = basis[mouth, forward_axis, :] * scale
+    constraint_matrix = np.vstack(
+        (np.mean(mouth_influence, axis=0), mouth_influence)
+    )
+    upper_bound = np.concatenate(
+        (
+            np.asarray(
+                [
+                    limits.max_mouth_forward_mean_mm
+                    - float(limits.tolerance_mm)
+                ],
+                dtype=np.float64,
+            ),
+            np.full(
+                len(mouth),
+                float(limits.max_mouth_forward_p95_mm)
+                - float(limits.tolerance_mm),
+                dtype=np.float64,
+            ),
+        )
+    )
+    mouth_only_limits = ExpressionDepthThresholds(
+        max_mouth_forward_mean_mm=limits.max_mouth_forward_mean_mm,
+        max_mouth_forward_p95_mm=limits.max_mouth_forward_p95_mm,
+        max_nose_abs_mean_mm=float("inf"),
+        max_chin_abs_mean_mm=float("inf"),
+        max_projection_iterations=limits.max_projection_iterations,
+        tolerance_mm=limits.tolerance_mm,
+    )
+    original_report = expression_depth_diagnostics(
+        basis,
+        original,
+        regions,
+        thresholds=mouth_only_limits,
+        forward_axis=forward_axis,
+        forward_sign=forward_sign,
+        unit_scale=unit_scale,
+    )
+    if original_report["passed"]:
+        zero_delta = np.zeros((n_vertices, 3), dtype=np.float64)
+        return {
+            "changed": False,
+            "parameters": original.astype(np.float32),
+            "original": original_report,
+            "selected": original_report,
+            "optimization": {
+                "success": True,
+                "message": "original expression already satisfies mouth depth",
+                "iterations": 0,
+            },
+            "protected_geometry_delta": _region_delta_statistics(
+                zero_delta, regions
+            ),
+            "coefficient_delta_l2": 0.0,
+            "coefficient_delta_max": 0.0,
+        }
+
+    def objective(values: np.ndarray) -> float:
+        delta = values - original
+        return 0.5 * float(delta @ metric @ delta)
+
+    def gradient(values: np.ndarray) -> np.ndarray:
+        return metric @ (values - original)
+
+    constraint = LinearConstraint(
+        constraint_matrix,
+        np.full(len(upper_bound), -np.inf, dtype=np.float64),
+        upper_bound,
+    )
+    optimization = minimize(
+        objective,
+        original.copy(),
+        jac=gradient,
+        constraints=(constraint,),
+        method="SLSQP",
+        options={
+            "maxiter": 500,
+            "ftol": 1e-12,
+            "disp": False,
+        },
+    )
+    selected = np.asarray(optimization.x, dtype=np.float64)
+    selected_report = expression_depth_diagnostics(
+        basis,
+        selected,
+        regions,
+        thresholds=mouth_only_limits,
+        forward_axis=forward_axis,
+        forward_sign=forward_sign,
+        unit_scale=unit_scale,
+    )
+    if not optimization.success or not selected_report["passed"]:
+        raise RuntimeError(
+            "protected mouth-depth optimization failed: "
+            f"{optimization.message}; issues={selected_report['issues']}"
+        )
+
+    delta = selected - original
+    geometry_delta = expression_displacement(basis, delta)
+    return {
+        "changed": bool(np.any(np.abs(delta) > 1e-8)),
+        "parameters": selected.astype(np.float32),
+        "original": original_report,
+        "selected": selected_report,
+        "optimization": {
+            "success": bool(optimization.success),
+            "message": str(optimization.message),
+            "iterations": int(optimization.nit),
+            "objective": float(optimization.fun),
+        },
+        "protected_geometry_delta": _region_delta_statistics(
+            geometry_delta, regions
+        ),
+        "coefficient_delta_l2": float(np.linalg.norm(delta)),
+        "coefficient_delta_max": float(np.max(np.abs(delta))),
+    }

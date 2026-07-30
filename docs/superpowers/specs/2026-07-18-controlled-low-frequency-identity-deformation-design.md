@@ -47,8 +47,10 @@ explicitly rejected for this experiment.
 
 ## Architecture
 
-Add `src/geometry/controlled_identity_deformation.py` as an isolated geometry unit.
-It receives the low-resolution fitted mesh, fixed faces, calibrated view data,
+Refactor the existing legacy `src/geometry/controlled_identity_deformation.py` into
+an isolated stable geometry unit. The old 220-node translation graph remains legacy
+and is not used by the stable stage. The new API receives the low-resolution fitted
+mesh, fixed faces, calibrated view data,
 interior landmark observations, and silhouette targets. It returns a candidate mesh,
 the shared identity displacement field, optimized control coefficients, and a
 structured audit report.

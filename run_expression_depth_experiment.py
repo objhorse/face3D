@@ -71,6 +71,10 @@ def _write_embedded_compare_viewer(
     baseline_glb: Path,
     candidate_glb: Path,
     output_path: Path,
+    *,
+    baseline_label: str = "Baseline: original expression",
+    candidate_label: str = "Candidate: protected mouth-depth expression",
+    title: str = "Expression profile depth A/B",
 ) -> Path:
     if not template_path.exists():
         raise FileNotFoundError(f"viewer template not found: {template_path}")
@@ -92,15 +96,15 @@ def _write_embedded_compare_viewer(
         elif 'id="baseline-label"' in line:
             lines[index] = (
                 f'{indent}<div id="baseline-label" class="label">'
-                "Baseline: original expression</div>"
+                f"{baseline_label}</div>"
             )
         elif 'id="candidate-label"' in line:
             lines[index] = (
                 f'{indent}<div id="candidate-label" class="label">'
-                "Candidate: depth-safe expression</div>"
+                f"{candidate_label}</div>"
             )
         elif "<title>" in line:
-            lines[index] = f"{indent}<title>Expression profile depth A/B</title>"
+            lines[index] = f"{indent}<title>{title}</title>"
     if found != {"baseline", "candidate"}:
         raise RuntimeError(f"viewer template is missing embedded model slots: {template_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,7 +141,7 @@ def _export_depth_safe_geometry(
     import trimesh
 
     from src.geometry.expression_depth import (
-        constrain_expression_depth,
+        constrain_expression_mouth_depth_protected,
         expression_regions_from_landmarks,
     )
     from src.module2_geometry import (
@@ -168,7 +172,7 @@ def _export_depth_safe_geometry(
         .numpy()
         .reshape(flame.n_verts, 3, flame.n_exp)
     )
-    result = constrain_expression_depth(
+    result = constrain_expression_mouth_depth_protected(
         basis,
         expression,
         regions,

@@ -2,7 +2,11 @@ import unittest
 
 import numpy as np
 
-from src.appearance.texture_registration import build_sampling_warp
+from src.appearance.texture_registration import (
+    build_layered_feature_warp,
+    build_sampling_warp,
+    displacement_field_metrics,
+)
 
 
 class TextureRegistrationTests(unittest.TestCase):
@@ -36,6 +40,105 @@ class TextureRegistrationTests(unittest.TestCase):
         observed[-1] += 80.0
         warp = build_sampling_warp(model, observed, (100, 100), smoothing=1.0)
         self.assertLessEqual(warp.max_displacement_px, 28.01)
+
+    def test_layered_warp_bounds_global_similarity(self):
+        global_model = np.array(
+            [[20, 20], [80, 20], [20, 80], [80, 80], [50, 50], [35, 50]],
+            dtype=np.float32,
+        )
+        global_observed = global_model + np.array([30.0, -20.0], dtype=np.float32)
+        local_model = np.array(
+            [[40, 55], [45, 60], [50, 62], [55, 60], [60, 55], [50, 52]],
+            dtype=np.float32,
+        )
+        local_observed = local_model.copy()
+
+        warp = build_layered_feature_warp(
+            global_model,
+            global_observed,
+            local_model,
+            local_observed,
+            (100, 100),
+            max_translation_px=8.0,
+            max_rotation_degrees=1.0,
+            max_scale_delta=0.015,
+        )
+
+        center = warp.apply(np.array([[50, 50]], dtype=np.float32), (100, 100))[0]
+        self.assertLessEqual(abs(center[0] - 50), 8.1)
+        self.assertLessEqual(abs(center[1] - 50), 8.1)
+        self.assertLessEqual(float(np.linalg.norm(center - [50, 50])), 8.1)
+        self.assertLessEqual(
+            float(
+                np.hypot(
+                    warp.diagnostics["translation_x_px"],
+                    warp.diagnostics["translation_y_px"],
+                )
+            ),
+            8.01,
+        )
+
+    def test_layered_warp_local_field_is_confined_and_improves_nose_controls(self):
+        global_model = np.array(
+            [[20, 20], [80, 20], [20, 80], [80, 80], [50, 35], [50, 75]],
+            dtype=np.float32,
+        )
+        local_model = np.array(
+            [[40, 55], [44, 60], [50, 63], [56, 60], [60, 55], [50, 52]],
+            dtype=np.float32,
+        )
+        local_observed = local_model + np.array([4.0, 2.0], dtype=np.float32)
+
+        warp = build_layered_feature_warp(
+            global_model,
+            global_model,
+            local_model,
+            local_observed,
+            (100, 100),
+            local_max_displacement_px=10.0,
+        )
+
+        before = np.linalg.norm(local_model - local_observed, axis=1).mean()
+        after = np.linalg.norm(warp.apply(local_model, (100, 100)) - local_observed, axis=1).mean()
+        self.assertLess(after, before * 0.5)
+        outside = warp.apply(np.array([[5, 5], [95, 95]], dtype=np.float32), (100, 100))
+        np.testing.assert_allclose(outside, np.array([[5, 5], [95, 95]]), atol=0.4)
+
+    def test_displacement_metrics_report_nonfolding_identity(self):
+        field = np.zeros((32, 32, 2), dtype=np.float32)
+        metrics = displacement_field_metrics(field, (100, 100))
+        self.assertAlmostEqual(metrics["min_jacobian"], 1.0, places=5)
+        self.assertAlmostEqual(metrics["displacement_p95_px"], 0.0, places=5)
+
+    def test_layered_warp_scales_local_field_instead_of_dropping_it(self):
+        global_model = np.array(
+            [[10, 10], [90, 10], [10, 90], [90, 90], [50, 20], [50, 80]],
+            dtype=np.float32,
+        )
+        local_model = np.array(
+            [[38, 48], [42, 55], [48, 60], [52, 60], [58, 55], [62, 48]],
+            dtype=np.float32,
+        )
+        local_observed = local_model.copy()
+        local_observed[:3, 0] += 18.0
+        local_observed[3:, 0] -= 18.0
+
+        warp = build_layered_feature_warp(
+            global_model,
+            global_model,
+            local_model,
+            local_observed,
+            (100, 100),
+            local_max_displacement_px=18.0,
+            min_jacobian=0.35,
+        )
+
+        self.assertGreaterEqual(warp.min_jacobian, 0.35)
+        self.assertGreaterEqual(warp.diagnostics["local_scale_applied"], 0.0)
+        self.assertLessEqual(warp.diagnostics["local_scale_applied"], 1.0)
+        if warp.diagnostics["local_scale_applied"] > 0.0:
+            moved = np.linalg.norm(warp.apply(local_model, (100, 100)) - local_model, axis=1)
+            self.assertGreater(float(moved.max()), 0.1)
 
 
 if __name__ == "__main__":

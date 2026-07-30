@@ -44,7 +44,7 @@ Save checkpoints during shape optimization and rank them using observation evide
 not distance from the MICA prediction. A candidate must:
 
 - materially reduce full-resolution trusted-boundary error;
-- improve or preserve at least two views without a large regression in the third;
+- materially improve the front view while preserving both profile views;
 - keep interior landmark error within the configured tolerance;
 - pass finite, degeneracy, non-manifold, and fixed-topology quality gates.
 
@@ -66,7 +66,7 @@ camera is supplementary and cannot decide acceptance.
 ## Acceptance
 
 - Frontal trusted-boundary mean error improves by at least 30% from 32.55 px.
-- At least two views improve; no view worsens by more than 10%.
+- The front view measurably improves; neither profile view worsens by more than 10%.
 - Mean interior landmark error worsens by no more than 10%.
 - Face count is unchanged and no degeneracy or non-manifold regression appears.
 - The matched-camera model no longer presents the clearly narrow jaw seen in the

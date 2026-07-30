@@ -6,6 +6,7 @@ import pytest
 from src.geometry.expression_depth import (
     ExpressionDepthThresholds,
     constrain_expression_depth,
+    constrain_expression_mouth_depth_protected,
     expression_depth_diagnostics,
     expression_regions_from_landmarks,
 )
@@ -82,3 +83,29 @@ def test_non_finite_expression_is_rejected():
     basis = np.zeros((9, 3, 1), dtype=np.float64)
     with pytest.raises(ValueError, match="non-finite"):
         constrain_expression_depth(basis, np.array([np.nan]), _regions())
+
+
+def test_protected_constraint_prefers_mouth_mode_that_preserves_eyes():
+    basis = np.zeros((9, 3, 2), dtype=np.float64)
+    basis[[2, 3, 4], 2, 0] = 0.001
+    basis[[2, 3, 4], 2, 1] = 0.001
+    basis[[7, 8], 0, 0] = 0.004
+    original = np.array([1.0, 1.0])
+
+    result = constrain_expression_mouth_depth_protected(
+        basis,
+        original,
+        _regions(),
+    )
+
+    assert result["selected"]["passed"] is True
+    assert result["parameters"][0] == pytest.approx(original[0], abs=0.03)
+    assert result["parameters"][1] < 0.0
+    assert (
+        result["protected_geometry_delta"]["eyes"]["xyz_mean_mm"]
+        < 0.15
+    )
+    assert (
+        result["selected"]["regions"]["mouth"]["forward_mean_mm"]
+        <= 0.5 + 1e-4
+    )

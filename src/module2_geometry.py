@@ -30,12 +30,15 @@ from scipy.spatial.transform import Rotation
 
 from src.coordinates import image_uv_to_obj_uv
 from src.geometry.differentiable_silhouette import (
+    IDENTITY_SILHOUETTE_REGIONS,
     build_silhouette_target,
     create_cuda_raster_context,
     evaluate_geometry_candidate,
     make_interior_landmark_weights,
+    regional_signed_distance_boundary_loss,
     render_soft_silhouette,
     save_silhouette_debug,
+    signed_distance_boundary_loss,
     silhouette_metrics,
     weighted_silhouette_loss,
 )
@@ -57,6 +60,18 @@ from src.geometry.expression_fidelity import (
     feature_gap_diagnostics,
     mediapipe_expression_state,
     paired_vertical_gap_loss,
+)
+from src.geometry.controlled_identity_deformation import (
+    LowFrequencyAcceptanceThresholds,
+    LowFrequencyBasisConfig,
+    LowFrequencyOptimizationConfig,
+    LowFrequencySafetyThresholds,
+    build_low_frequency_identity_basis,
+    evaluate_low_frequency_observations,
+    evaluate_low_frequency_safety,
+    optimize_low_frequency_identity,
+    restrict_low_frequency_identity_basis,
+    select_low_frequency_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -4383,6 +4398,8 @@ def _shape_only_fine_tune(
     enable_silhouette: bool = False,
     silhouette_resolution: int = 256,
     silhouette_weight: float = 0.25,
+    silhouette_sdf_weight: float = 2.0,
+    silhouette_sdf_side_scale: float = 0.5,
     silhouette_dice_weight: float = 1.0,
     silhouette_l1_weight: float = 0.5,
     min_silhouette_improve_pct: float = 0.10,
@@ -4391,6 +4408,8 @@ def _shape_only_fine_tune(
     max_silhouette_overlap_drop: float = 0.005,
     max_interior_mean_worsen_pct: float = 0.15,
     max_interior_view_worsen_pct: float = 0.25,
+    min_relative_boundary_improve: float = 0.0,
+    min_front_relative_boundary_improve: float = 0.0,
     identity_thresholds: Optional[IdentityDriftThresholds] = None,
 ) -> Tuple[np.ndarray, dict]:
     """Fine-tune only shared shape while keeping each view's pose/expression fixed."""
@@ -4503,6 +4522,7 @@ def _shape_only_fine_tune(
 
     silhouette_targets = {}
     silhouette_tensors = {}
+    silhouette_sdf_tensors = {}
     silhouette_context = None
     silhouette_faces = flame.faces.to(device=device, dtype=torch.int32).contiguous()
     if enable_silhouette:
@@ -4521,6 +4541,7 @@ def _shape_only_fine_tune(
                 )
                 silhouette_targets[name] = target
                 silhouette_tensors[name] = target.tensors(device)
+                silhouette_sdf_tensors[name] = target.sdf_tensors(device)
         except Exception as exc:
             report["reason"] = f"silhouette initialization failed: {exc}"
             report["silhouette_error"] = repr(exc)
@@ -4637,6 +4658,20 @@ def _shape_only_fine_tune(
                 )
                 if torch.isfinite(mask_loss):
                     total_loss = total_loss + float(silhouette_weight) * mask_loss
+                signed_distance, sdf_support = silhouette_sdf_tensors[name]
+                sdf_loss = signed_distance_boundary_loss(
+                    prediction,
+                    signed_distance,
+                    sdf_support,
+                )
+                if torch.isfinite(sdf_loss):
+                    sdf_view_scale = (
+                        1.0 if name == "front" else float(silhouette_sdf_side_scale)
+                    )
+                    total_loss = (
+                        total_loss
+                        + float(silhouette_sdf_weight) * sdf_view_scale * sdf_loss
+                    )
 
         delta = shape_param - shape_anchor
         total_loss = total_loss + float(delta_weight) * (delta ** 2).mean()
@@ -4656,6 +4691,7 @@ def _shape_only_fine_tune(
             })
 
     shape_final = shape_param.detach().cpu().numpy().astype(np.float32)
+    np.save(out_dir / "shape_final_candidate.npy", shape_final)
 
     def evaluate_shape(shape_np: np.ndarray, image_prefix: str, save_debug: bool = True) -> dict:
         records = []
@@ -4812,6 +4848,8 @@ def _shape_only_fine_tune(
         }
 
     before = evaluate_shape(np.asarray(shape_init, dtype=np.float32), "before")
+    final_candidate = evaluate_shape(shape_final, "candidate_final")
+    report["final_candidate"] = final_candidate
     selected_step = 0
     checkpoint_trials = []
     accepted_trials = []
@@ -4842,21 +4880,18 @@ def _shape_only_fine_tune(
                 max_overlap_drop=float(max_silhouette_overlap_drop),
                 max_interior_mean_worsen_pct=float(max_interior_mean_worsen_pct),
                 max_interior_view_worsen_pct=float(max_interior_view_worsen_pct),
-            )
-            measurement_supported = bool(
-                checkpoint_decision["metrics"]["trusted_boundary_improve_pct_points"]
-                >= silhouette_observation_tolerance
+                min_relative_boundary_improve=float(min_relative_boundary_improve),
+                min_front_relative_boundary_improve=float(
+                    min_front_relative_boundary_improve
+                ),
             )
             accepted = bool(
                 checkpoint_decision["accepted"]
                 and identity_gate["passed"]
-                and measurement_supported
             )
             failed_gates = list(checkpoint_decision["failed_gates"])
             if not identity_gate["passed"]:
                 failed_gates.append("identity_preservation")
-            if not measurement_supported:
-                failed_gates.append("trusted_boundary_below_render_resolution")
             trial = {
                 "attempt": checkpoint["step"],
                 "step": checkpoint["step"],
@@ -4884,6 +4919,7 @@ def _shape_only_fine_tune(
     else:
         shape_after = np.asarray(shape_init, dtype=np.float32)
     after = evaluate_shape(shape_after, "after")
+    np.save(out_dir / "shape_selected.npy", shape_after)
     report["before"] = before
     report["after"] = after
     report["checkpoint_selection"] = {
@@ -4920,6 +4956,10 @@ def _shape_only_fine_tune(
             max_overlap_drop=float(max_silhouette_overlap_drop),
             max_interior_mean_worsen_pct=float(max_interior_mean_worsen_pct),
             max_interior_view_worsen_pct=float(max_interior_view_worsen_pct),
+            min_relative_boundary_improve=float(min_relative_boundary_improve),
+            min_front_relative_boundary_improve=float(
+                min_front_relative_boundary_improve
+            ),
         )
         decision.setdefault("gates", {})["identity_preservation"] = bool(
             identity_gate["passed"]
@@ -4981,6 +5021,496 @@ def _shape_only_fine_tune(
 # ══════════════════════════════════════════════════════════════════════════════
 # Depth-Anything-V2 深度置换
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _controlled_low_frequency_identity_tune(
+    *,
+    baseline_final_vertices: np.ndarray,
+    baseline_neutral_vertices: np.ndarray,
+    per_view_vertices: Dict[str, np.ndarray],
+    faces: np.ndarray,
+    per_view_results: Dict[str, dict],
+    view_data: Dict[str, dict],
+    preprocessed_views: Dict[str, dict],
+    intrinsics: Dict[str, np.ndarray],
+    lmk_vertex_indices: np.ndarray,
+    lmk_tri_vidx: Optional[np.ndarray],
+    lmk_bary_coords: Optional[np.ndarray],
+    debug_dir: Path,
+    device: str,
+    settings: Optional[dict] = None,
+) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """Fit a shared 16-parameter identity field with fixed cameras and expression."""
+    cfg = dict(settings or {})
+    out_dir = debug_dir / "controlled_identity_deformation"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    baseline_final = np.asarray(baseline_final_vertices, dtype=np.float32)
+    baseline_neutral = np.asarray(baseline_neutral_vertices, dtype=np.float32)
+    faces_np = np.asarray(faces, dtype=np.int64)
+    report = {
+        "enabled": True,
+        "accepted": False,
+        "reason": "",
+        "parameterization": "semantic_low_frequency_16",
+    }
+
+    def landmarks_from_vertices(vertices_np: np.ndarray) -> np.ndarray:
+        if lmk_tri_vidx is not None and lmk_bary_coords is not None:
+            tri = np.asarray(vertices_np)[np.asarray(lmk_tri_vidx, dtype=np.int64)]
+            return np.sum(tri * np.asarray(lmk_bary_coords, dtype=np.float32)[:, :, None], axis=1)
+        return np.asarray(vertices_np)[np.asarray(lmk_vertex_indices, dtype=np.int64)]
+
+    neutral_landmarks = landmarks_from_vertices(baseline_neutral)
+    basis = build_low_frequency_identity_basis(
+        baseline_neutral,
+        faces_np,
+        neutral_landmarks,
+        config=LowFrequencyBasisConfig(
+            width_sigma=float(cfg.get("width_sigma", 0.24)),
+            protection_core_ratio=float(cfg.get("protection_core_ratio", 0.035)),
+            protection_outer_ratio=float(cfg.get("protection_outer_ratio", 0.12)),
+            width_displacement_ratio=float(cfg.get("width_displacement_ratio", 0.040)),
+            depth_displacement_ratio=float(cfg.get("depth_displacement_ratio", 0.025)),
+            chin_displacement_ratio=float(cfg.get("chin_displacement_ratio", 0.030)),
+            max_vertex_displacement_ratio=float(cfg.get("max_vertex_displacement_ratio", 0.060)),
+        ),
+    )
+    basis, active_parameter_names = restrict_low_frequency_identity_basis(
+        basis,
+        allowed_prefixes=("temple_", "cheekbone_", "cheek_"),
+    )
+    report["basis"] = {
+        "parameter_count": len(basis.names),
+        "parameter_names": list(basis.names),
+        "symmetry_pairs": [list(pair) for pair in basis.symmetry_pairs],
+        "protected_vertex_count": int(np.count_nonzero(basis.protected_mask)),
+        "editable_vertex_count": int(np.count_nonzero(basis.editable_mask)),
+        "observation_source": "full_flame_outer_silhouette",
+        "identity_region_names": list(IDENTITY_SILHOUETTE_REGIONS),
+        "active_parameter_names": list(active_parameter_names),
+        "face_width": float(basis.face_width),
+        "face_height": float(basis.face_height),
+        "max_vertex_displacement": float(basis.max_vertex_displacement),
+    }
+
+    view_names = [
+        name
+        for name in ("front", "left", "right")
+        if name in per_view_vertices
+        and name in per_view_results
+        and name in view_data
+        and name in intrinsics
+    ]
+    if len(view_names) < 3:
+        report["reason"] = f"requires front, left, and right views; got {view_names}"
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return baseline_final, baseline_neutral, report
+
+    silhouette_targets = {}
+    silhouette_tensors = {}
+    silhouette_regional_sdf_tensors = {}
+    observation_faces_np = faces_np
+    report["basis"]["observation_face_count"] = int(len(observation_faces_np))
+    report["basis"]["full_face_count"] = int(len(faces_np))
+    try:
+        silhouette_context = create_cuda_raster_context(device)
+        for name in view_names:
+            mask = preprocessed_views[name].get("shape_mask")
+            if mask is None:
+                mask = preprocessed_views[name].get("face_mask")
+            target = build_silhouette_target(
+                mask,
+                view_name=name,
+                resolution=int(cfg.get("render_resolution", 256)),
+            )
+            silhouette_targets[name] = target
+            silhouette_tensors[name] = target.tensors(device)
+            signed_distance, region_supports = target.regional_sdf_tensors(device)
+            silhouette_regional_sdf_tensors[name] = (
+                signed_distance,
+                {
+                    region: support
+                    for region, support in region_supports.items()
+                    if region in IDENTITY_SILHOUETTE_REGIONS
+                },
+            )
+    except Exception as exc:
+        report["reason"] = f"silhouette initialization failed: {exc}"
+        report["error"] = repr(exc)
+        with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return baseline_final, baseline_neutral, report
+
+    dev = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+    baseline_neutral_t = torch.tensor(baseline_neutral, dtype=torch.float32, device=dev)
+    per_view_t = {
+        name: torch.tensor(per_view_vertices[name], dtype=torch.float32, device=dev)
+        for name in view_names
+    }
+    Ks = {
+        name: torch.tensor(intrinsics[name], dtype=torch.float32, device=dev)
+        for name in view_names
+    }
+    Rs = {
+        name: torch.tensor(per_view_results[name]["R"], dtype=torch.float32, device=dev)
+        for name in view_names
+    }
+    ts = {
+        name: torch.tensor(per_view_results[name]["t"], dtype=torch.float32, device=dev)
+        for name in view_names
+    }
+    targets_2d = {
+        name: torch.tensor(view_data[name]["lmk_2d"], dtype=torch.float32, device=dev)
+        for name in view_names
+    }
+    observation_faces_t = torch.tensor(
+        observation_faces_np, dtype=torch.int32, device=dev
+    ).contiguous()
+    if lmk_tri_vidx is not None and lmk_bary_coords is not None:
+        lmk_tri_t = torch.tensor(lmk_tri_vidx, dtype=torch.long, device=dev)
+        lmk_bary_t = torch.tensor(lmk_bary_coords, dtype=torch.float32, device=dev)
+
+        def torch_landmarks(projected: torch.Tensor) -> torch.Tensor:
+            return (projected[lmk_tri_t] * lmk_bary_t[:, :, None]).sum(dim=1)
+    else:
+        lmk_idx_t = torch.tensor(lmk_vertex_indices, dtype=torch.long, device=dev)
+
+        def torch_landmarks(projected: torch.Tensor) -> torch.Tensor:
+            return projected[lmk_idx_t]
+
+    stable_indices = torch.tensor(
+        np.concatenate([LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX]),
+        dtype=torch.long,
+        device=dev,
+    )
+    mask_weight = float(cfg.get("mask_weight", 0.0))
+    sdf_weight = float(cfg.get("sdf_weight", 3.0))
+    sdf_side_scale = float(cfg.get("sdf_side_scale", 0.65))
+    landmark_weight = float(cfg.get("landmark_weight", 0.25))
+
+    def observation_loss(candidate_neutral: torch.Tensor) -> torch.Tensor:
+        displacement = candidate_neutral - baseline_neutral_t
+        total = torch.zeros((), dtype=torch.float32, device=dev)
+        for name in view_names:
+            candidate_view = per_view_t[name] + displacement
+            prediction = render_soft_silhouette(
+                vertices=candidate_view,
+                faces=observation_faces_t,
+                K=Ks[name],
+                R=Rs[name],
+                t=ts[name],
+                image_shape=silhouette_targets[name].source_shape,
+                render_shape=silhouette_targets[name].render_shape,
+                context=silhouette_context,
+            )
+            target_mask, reliability = silhouette_tensors[name]
+            mask_loss = weighted_silhouette_loss(
+                prediction,
+                target_mask,
+                reliability,
+                dice_weight=1.0,
+                l1_weight=0.5,
+            )
+            signed_distance, region_supports = silhouette_regional_sdf_tensors[name]
+            sdf_loss = regional_signed_distance_boundary_loss(
+                prediction,
+                signed_distance,
+                region_supports,
+            )
+            projected = project_vertices(candidate_view, Ks[name], Rs[name], ts[name])
+            projected_lmk = torch_landmarks(projected)
+            face_width_px = float(silhouette_targets[name].metadata["face_width_source_px"])
+            landmark_delta = (
+                projected_lmk[stable_indices] - targets_2d[name][stable_indices]
+            ) / max(face_width_px, 1.0)
+            landmark_loss = F.smooth_l1_loss(
+                landmark_delta,
+                torch.zeros_like(landmark_delta),
+                beta=0.01,
+            )
+            side_scale = 1.0 if name == "front" else sdf_side_scale
+            total = total + mask_weight * mask_loss + sdf_weight * side_scale * sdf_loss
+            total = total + landmark_weight * landmark_loss
+        return total / float(len(view_names))
+
+    optimization = optimize_low_frequency_identity(
+        baseline_neutral,
+        faces_np,
+        basis,
+        observation_loss,
+        config=LowFrequencyOptimizationConfig(
+            max_iterations=int(cfg.get("max_iterations", 120)),
+            learning_rate=float(cfg.get("learning_rate", 0.05)),
+            checkpoint_interval=int(cfg.get("checkpoint_interval", 5)),
+            observation_weight=float(cfg.get("observation_weight", 1.0)),
+            coefficient_weight=float(cfg.get("coefficient_weight", 0.005)),
+            symmetry_weight=float(cfg.get("symmetry_weight", 0.02)),
+            edge_weight=float(cfg.get("edge_weight", 0.20)),
+            laplacian_weight=float(cfg.get("laplacian_weight", 0.50)),
+            gradient_clip_norm=float(cfg.get("gradient_clip_norm", 1.0)),
+        ),
+        device=str(dev),
+    )
+
+    def evaluate_displacement(
+        displacement_np: np.ndarray,
+        prefix: str,
+        *,
+        save_debug: bool,
+    ) -> dict:
+        records = []
+        for name in view_names:
+            candidate_view = np.asarray(per_view_vertices[name], dtype=np.float32) + displacement_np
+            projected_lmk, errors = _landmark_reprojection_details(
+                vertices=candidate_view,
+                K=intrinsics[name],
+                R=per_view_results[name]["R"],
+                t=per_view_results[name]["t"],
+                target_landmarks=view_data[name]["lmk_2d"],
+                lmk_vertex_indices=lmk_vertex_indices,
+                lmk_tri_vidx=lmk_tri_vidx,
+                lmk_bary_coords=lmk_bary_coords,
+            )
+            with torch.no_grad():
+                candidate_t = per_view_t[name] + torch.tensor(
+                    displacement_np, dtype=torch.float32, device=dev
+                )
+                prediction_t = render_soft_silhouette(
+                    vertices=candidate_t,
+                    faces=observation_faces_t,
+                    K=Ks[name],
+                    R=Rs[name],
+                    t=ts[name],
+                    image_shape=silhouette_targets[name].source_shape,
+                    render_shape=silhouette_targets[name].render_shape,
+                    context=silhouette_context,
+                )
+            prediction_np = prediction_t.detach().cpu().numpy()
+            silhouette_record = silhouette_metrics(
+                prediction_np, silhouette_targets[name]
+            )
+            if save_debug:
+                _save_landmark_reprojection_debug(
+                    vertices=candidate_view,
+                    K=intrinsics[name],
+                    R=per_view_results[name]["R"],
+                    t=per_view_results[name]["t"],
+                    image=preprocessed_views[name]["image"],
+                    target_landmarks=view_data[name]["lmk_2d"],
+                    lmk_vertex_indices=lmk_vertex_indices,
+                    out_path=out_dir / f"{name}_{prefix}_reprojection.png",
+                    lmk_tri_vidx=lmk_tri_vidx,
+                    lmk_bary_coords=lmk_bary_coords,
+                )
+                save_silhouette_debug(
+                    str(out_dir / f"{name}_{prefix}_silhouette.png"),
+                    preprocessed_views[name]["image"],
+                    prediction_np,
+                    silhouette_targets[name],
+                )
+            records.append(
+                {
+                    "view": name,
+                    "interior_mean_px": _landmark_subset_stats(
+                        errors, np.arange(17, 68, dtype=np.int64)
+                    )["mean_px"],
+                    "stable_mean_px": _landmark_subset_stats(
+                        errors, np.concatenate([LMK_NOSE_IDX, LMK_EYE_IDX, LMK_MOUTH_IDX])
+                    )["mean_px"],
+                    "silhouette": silhouette_record,
+                }
+            )
+        return {"records": records}
+
+    baseline_metrics = evaluate_displacement(
+        np.zeros_like(baseline_neutral), "baseline", save_debug=True
+    )
+    baseline_quality = compute_mesh_quality(
+        baseline_neutral, faces_np, label="controlled_identity_baseline"
+    )
+    safety_thresholds = LowFrequencySafetyThresholds(
+        max_vertex_displacement_ratio=float(cfg.get("max_vertex_displacement_ratio", 0.060)),
+        max_mean_displacement_ratio=float(cfg.get("max_mean_displacement_ratio", 0.025)),
+        max_protected_displacement_ratio=float(cfg.get("max_protected_displacement_ratio", 0.001)),
+        max_new_normal_flips=int(cfg.get("max_new_normal_flips", 0)),
+    )
+    acceptance_thresholds = LowFrequencyAcceptanceThresholds(
+        min_front_boundary_improvement_ratio=float(cfg.get("min_front_boundary_improvement_ratio", 0.30)),
+        max_front_region_worsen_ratio=float(cfg.get("max_front_region_worsen_ratio", 0.10)),
+        max_profile_boundary_worsen_ratio=float(cfg.get("max_profile_boundary_worsen_ratio", 0.10)),
+        max_interior_landmark_worsen_ratio=float(cfg.get("max_interior_landmark_worsen_ratio", 0.10)),
+        max_overlap_drop=float(cfg.get("max_overlap_drop", 0.01)),
+    )
+
+    def checkpoint_evaluator(checkpoint: dict) -> dict:
+        displacement_np = np.asarray(checkpoint["displacement"], dtype=np.float32)
+        candidate_neutral = baseline_neutral + displacement_np
+        candidate_metrics = evaluate_displacement(
+            displacement_np, f"step_{checkpoint['step']}", save_debug=False
+        )
+        safety = evaluate_low_frequency_safety(
+            baseline_neutral,
+            candidate_neutral,
+            faces_np,
+            basis,
+            thresholds=safety_thresholds,
+        )
+        candidate_quality = compute_mesh_quality(
+            candidate_neutral,
+            faces_np,
+            label=f"controlled_identity_step_{checkpoint['step']}",
+        )
+        quality_gate = make_quality_gate(
+            baseline=baseline_quality,
+            candidate=candidate_quality,
+            thresholds=MeshQualityThresholds(
+                min_face_ratio=1.0,
+                max_new_degenerate_faces=0,
+                max_new_nonmanifold_edges=0,
+                max_new_boundary_edges=0,
+            ),
+            region_name="controlled_identity",
+        )
+        decision = evaluate_low_frequency_observations(
+            baseline_metrics["records"],
+            candidate_metrics["records"],
+            safety_gate=safety,
+            mesh_quality_gate=quality_gate,
+            thresholds=acceptance_thresholds,
+        )
+        decision["candidate_records"] = candidate_metrics["records"]
+        return decision
+
+    _selected_neutral, selected_trial, trials = select_low_frequency_checkpoint(
+        baseline_neutral,
+        optimization["checkpoints"],
+        checkpoint_evaluator,
+    )
+    if selected_trial is None:
+        selected_displacement = np.zeros_like(baseline_neutral)
+        selected_coefficients = np.zeros(len(basis.names), dtype=np.float32)
+        selected_step = 0
+    else:
+        selected_displacement = np.asarray(
+            selected_trial["checkpoint"]["displacement"], dtype=np.float32
+        )
+        selected_coefficients = np.asarray(
+            selected_trial["checkpoint"]["coefficients"], dtype=np.float32
+        )
+        selected_step = int(selected_trial["step"])
+
+    final_checkpoint = optimization["checkpoints"][-1]
+    final_candidate_displacement = np.asarray(
+        final_checkpoint["displacement"], dtype=np.float32
+    )
+    final_candidate_coefficients = np.asarray(
+        final_checkpoint["coefficients"], dtype=np.float32
+    )
+    final_candidate_metrics = evaluate_displacement(
+        final_candidate_displacement, "candidate_final", save_debug=True
+    )
+    selected_metrics = evaluate_displacement(
+        selected_displacement, "selected", save_debug=True
+    )
+    selected_final = baseline_final + selected_displacement
+    selected_neutral = baseline_neutral + selected_displacement
+
+    np.save(out_dir / "candidate_final_displacement.npy", final_candidate_displacement)
+    np.save(out_dir / "candidate_final_coefficients.npy", final_candidate_coefficients)
+    np.save(out_dir / "selected_displacement.npy", selected_displacement)
+    np.save(out_dir / "selected_coefficients.npy", selected_coefficients)
+    with open(out_dir / "coefficients.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "selected_step": selected_step,
+                "names": list(basis.names),
+                "selected_values": selected_coefficients.tolist(),
+                "candidate_final_values": final_candidate_coefficients.tolist(),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    try:
+        import trimesh as _controlled_trimesh
+
+        _controlled_trimesh.Trimesh(
+            vertices=baseline_final, faces=faces_np, process=False
+        ).export(str(out_dir / "baseline_geometry.glb"))
+        _controlled_trimesh.Trimesh(
+            vertices=baseline_final + final_candidate_displacement,
+            faces=faces_np,
+            process=False,
+        ).export(str(out_dir / "candidate_final_geometry.glb"))
+        _controlled_trimesh.Trimesh(
+            vertices=selected_final, faces=faces_np, process=False
+        ).export(str(out_dir / "selected_geometry.glb"))
+    except Exception as exc:
+        report["geometry_export_error"] = repr(exc)
+
+    front_name = "front"
+    front_vertices = np.asarray(per_view_vertices[front_name], dtype=np.float32)
+    v_cam = (
+        per_view_results[front_name]["R"] @ front_vertices.T
+        + per_view_results[front_name]["t"][:, None]
+    ).T
+    z = np.clip(v_cam[:, 2], 1e-6, None)
+    hom = (intrinsics[front_name] @ v_cam.T).T
+    projected = np.stack([hom[:, 0] / z, hom[:, 1] / z], axis=1)
+    support_strength = np.linalg.norm(basis.vectors, axis=2).max(axis=0)
+    support_strength /= max(float(support_strength.max()), 1e-12)
+    support_image = preprocessed_views[front_name]["image"].copy()
+    colors = cv2.applyColorMap(
+        np.clip(np.round(support_strength * 255.0), 0, 255).astype(np.uint8)[:, None],
+        cv2.COLORMAP_TURBO,
+    )[:, 0]
+    order = np.argsort(v_cam[:, 2])[::-1]
+    h, w = support_image.shape[:2]
+    for index in order:
+        x, y = np.round(projected[index]).astype(int)
+        if 0 <= x < w and 0 <= y < h and support_strength[index] > 0.02:
+            cv2.circle(
+                support_image,
+                (x, y),
+                1,
+                tuple(int(value) for value in colors[index]),
+                -1,
+                lineType=cv2.LINE_AA,
+            )
+    cv2.imwrite(str(out_dir / "basis_support.png"), support_image)
+
+    selected_summary = None
+    if selected_trial is not None:
+        selected_summary = {
+            key: value for key, value in selected_trial.items() if key != "checkpoint"
+        }
+    report.update(
+        {
+            "accepted": selected_trial is not None,
+            "reason": (
+                "accepted controlled low-frequency identity candidate"
+                if selected_trial is not None
+                else "no checkpoint passed controlled identity gates; exact baseline retained"
+            ),
+            "selected_step": selected_step,
+            "selected": selected_summary,
+            "trials": trials,
+            "history": optimization["history"],
+            "baseline": baseline_metrics,
+            "candidate_final": final_candidate_metrics,
+            "after": selected_metrics,
+        }
+    )
+    with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    logger.info(
+        "Controlled low-frequency identity: accepted=%s, selected_step=%d",
+        report["accepted"],
+        selected_step,
+    )
+    return selected_final, selected_neutral, report
+
 
 def _pose_refine_cameras(
     flame: FLAMEModel,
@@ -6453,6 +6983,10 @@ def run_geometry_reconstruction(
             enable_silhouette=_cfg_bool("ENABLE_DIFFERENTIABLE_SILHOUETTE", False),
             silhouette_resolution=int(_cfg_float("SILHOUETTE_RENDER_RESOLUTION", 256)),
             silhouette_weight=_cfg_float("SILHOUETTE_LOSS_WEIGHT", 0.25),
+            silhouette_sdf_weight=_cfg_float("SILHOUETTE_SDF_WEIGHT", 2.0),
+            silhouette_sdf_side_scale=_cfg_float(
+                "SILHOUETTE_SDF_SIDE_SCALE", 0.5
+            ),
             silhouette_dice_weight=_cfg_float("SILHOUETTE_DICE_WEIGHT", 1.0),
             silhouette_l1_weight=_cfg_float("SILHOUETTE_L1_WEIGHT", 0.5),
             min_silhouette_improve_pct=_cfg_float(
@@ -6472,6 +7006,12 @@ def run_geometry_reconstruction(
             ),
             max_interior_view_worsen_pct=_cfg_float(
                 "SILHOUETTE_MAX_INTERIOR_VIEW_WORSEN_PCT", 0.25
+            ),
+            min_relative_boundary_improve=_cfg_float(
+                "SILHOUETTE_MIN_RELATIVE_BOUNDARY_IMPROVE", 0.15
+            ),
+            min_front_relative_boundary_improve=_cfg_float(
+                "SILHOUETTE_MIN_FRONT_RELATIVE_BOUNDARY_IMPROVE", 0.30
             ),
             identity_thresholds=identity_thresholds,
         )
@@ -6645,6 +7185,90 @@ def run_geometry_reconstruction(
             torch.tensor(shape_opt, device=device),
             torch.zeros(n_exp, device=device, dtype=torch.float32),
         ).cpu().numpy()
+
+    controlled_identity_report = {"enabled": False, "accepted": False}
+    if _cfg_bool("STABLE_ENABLE_CONTROLLED_IDENTITY", False):
+        logger.info("Controlled low-frequency identity optimization...")
+        try:
+            with torch.no_grad():
+                controlled_view_vertices = {
+                    name: flame(
+                        torch.tensor(shape_opt, device=device, dtype=torch.float32),
+                        torch.tensor(result["exp"], device=device, dtype=torch.float32),
+                    ).cpu().numpy()
+                    for name, result in per_view_results.items()
+                }
+            verts_final, verts_neutral, controlled_identity_report = (
+                _controlled_low_frequency_identity_tune(
+                    baseline_final_vertices=verts_final,
+                    baseline_neutral_vertices=verts_neutral,
+                    per_view_vertices=controlled_view_vertices,
+                    faces=flame_faces_np,
+                    per_view_results=per_view_results,
+                    view_data=view_data,
+                    preprocessed_views=preprocessed_views,
+                    intrinsics=intrinsics,
+                    lmk_vertex_indices=lmk_vertex_indices,
+                    lmk_tri_vidx=lmk_tri_vidx,
+                    lmk_bary_coords=(
+                        lmk_data["bary_coords"] if lmk_data is not None else None
+                    ),
+                    debug_dir=debug_dir,
+                    device=device,
+                    settings={
+                        "max_iterations": int(_cfg_float("CONTROLLED_IDENTITY_MAX_ITER", 120)),
+                        "learning_rate": _cfg_float("CONTROLLED_IDENTITY_LR", 0.05),
+                        "checkpoint_interval": int(_cfg_float("CONTROLLED_IDENTITY_CHECKPOINT_INTERVAL", 5)),
+                        "render_resolution": int(_cfg_float("CONTROLLED_IDENTITY_RENDER_RESOLUTION", 256)),
+                        "mask_weight": _cfg_float("CONTROLLED_IDENTITY_MASK_WEIGHT", 0.0),
+                        "sdf_weight": _cfg_float("CONTROLLED_IDENTITY_SDF_WEIGHT", 3.0),
+                        "sdf_side_scale": _cfg_float("CONTROLLED_IDENTITY_SDF_SIDE_SCALE", 0.65),
+                        "landmark_weight": _cfg_float("CONTROLLED_IDENTITY_LANDMARK_WEIGHT", 0.25),
+                        "observation_weight": _cfg_float("CONTROLLED_IDENTITY_OBSERVATION_WEIGHT", 1.0),
+                        "coefficient_weight": _cfg_float("CONTROLLED_IDENTITY_COEFFICIENT_WEIGHT", 0.005),
+                        "symmetry_weight": _cfg_float("CONTROLLED_IDENTITY_SYMMETRY_WEIGHT", 0.02),
+                        "edge_weight": _cfg_float("CONTROLLED_IDENTITY_EDGE_WEIGHT", 0.20),
+                        "laplacian_weight": _cfg_float("CONTROLLED_IDENTITY_LAPLACIAN_WEIGHT", 0.50),
+                        "width_sigma": _cfg_float("CONTROLLED_IDENTITY_WIDTH_SIGMA", 0.24),
+                        "protection_core_ratio": _cfg_float("CONTROLLED_IDENTITY_PROTECTION_CORE_RATIO", 0.035),
+                        "protection_outer_ratio": _cfg_float("CONTROLLED_IDENTITY_PROTECTION_OUTER_RATIO", 0.12),
+                        "width_displacement_ratio": _cfg_float("CONTROLLED_IDENTITY_WIDTH_DISPLACEMENT_RATIO", 0.040),
+                        "depth_displacement_ratio": _cfg_float("CONTROLLED_IDENTITY_DEPTH_DISPLACEMENT_RATIO", 0.025),
+                        "chin_displacement_ratio": _cfg_float("CONTROLLED_IDENTITY_CHIN_DISPLACEMENT_RATIO", 0.030),
+                        "max_vertex_displacement_ratio": _cfg_float("CONTROLLED_IDENTITY_MAX_VERTEX_DISPLACEMENT_RATIO", 0.060),
+                        "max_mean_displacement_ratio": _cfg_float("CONTROLLED_IDENTITY_MAX_MEAN_DISPLACEMENT_RATIO", 0.025),
+                        "max_protected_displacement_ratio": _cfg_float("CONTROLLED_IDENTITY_MAX_PROTECTED_DISPLACEMENT_RATIO", 0.001),
+                        "max_new_normal_flips": int(_cfg_float("CONTROLLED_IDENTITY_MAX_NEW_NORMAL_FLIPS", 0)),
+                        "min_front_boundary_improvement_ratio": _cfg_float("CONTROLLED_IDENTITY_MIN_FRONT_BOUNDARY_IMPROVEMENT_RATIO", 0.30),
+                        "max_front_region_worsen_ratio": _cfg_float("CONTROLLED_IDENTITY_MAX_FRONT_REGION_WORSEN_RATIO", 0.10),
+                        "max_profile_boundary_worsen_ratio": _cfg_float("CONTROLLED_IDENTITY_MAX_PROFILE_BOUNDARY_WORSEN_RATIO", 0.10),
+                        "max_interior_landmark_worsen_ratio": _cfg_float("CONTROLLED_IDENTITY_MAX_INTERIOR_LANDMARK_WORSEN_RATIO", 0.10),
+                        "max_overlap_drop": _cfg_float("CONTROLLED_IDENTITY_MAX_OVERLAP_DROP", 0.01),
+                    },
+                )
+            )
+        except Exception as exc:
+            logger.exception("Controlled low-frequency identity stage failed; baseline retained")
+            controlled_identity_report = {
+                "enabled": True,
+                "accepted": False,
+                "reason": "stage error; exact baseline retained",
+                "error": repr(exc),
+            }
+            controlled_dir = debug_dir / "controlled_identity_deformation"
+            controlled_dir.mkdir(parents=True, exist_ok=True)
+            with open(controlled_dir / "summary.json", "w", encoding="utf-8") as f:
+                json.dump(controlled_identity_report, f, ensure_ascii=False, indent=2)
+
+    optimized_parameters_path = debug_dir / "optimized_parameters.json"
+    try:
+        with open(optimized_parameters_path, "r", encoding="utf-8") as f:
+            optimized_parameters_payload = json.load(f)
+    except Exception:
+        optimized_parameters_payload = {}
+    optimized_parameters_payload["controlled_identity_deformation"] = controlled_identity_report
+    with open(optimized_parameters_path, "w", encoding="utf-8") as f:
+        json.dump(optimized_parameters_payload, f, ensure_ascii=False, indent=2)
 
     # ── 步骤2：Loop Subdivision（增加几何密度，在置换前细分提高精度）────────
     import trimesh as _trimesh

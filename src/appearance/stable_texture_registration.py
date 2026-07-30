@@ -8,10 +8,13 @@ from typing import Any, Dict
 
 import cv2
 import numpy as np
-from scipy.spatial import cKDTree
 
 from src.appearance.photometric_normalization import normalize_skin_chroma
-from src.appearance.texture_registration import build_sampling_warp, draw_registration_overlay
+from src.appearance.semantic_feature_registration import build_nose_controls
+from src.appearance.texture_registration import (
+    build_layered_feature_warp,
+    draw_registration_overlay,
+)
 
 
 def _project_vertices(vertices: np.ndarray, camera: dict) -> np.ndarray:
@@ -31,48 +34,6 @@ def _landmark_projection(
 ) -> np.ndarray:
     projected = _project_vertices(vertices, camera)
     return (projected[np.asarray(landmark_triangles)] * barycentric[:, :, None]).sum(axis=1)
-
-
-def _nose_boundary_controls(
-    projected_landmarks: np.ndarray,
-    nose_mask: np.ndarray,
-    view: str,
-    max_distance_px: float = 28.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Match projected nose samples to the observed semantic nose boundary."""
-    binary = (np.asarray(nose_mask) > 0).astype(np.uint8)
-    ys = np.where(binary > 0)[0]
-    if len(ys) == 0:
-        return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
-    boundary = cv2.morphologyEx(binary, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > 0
-    lower_fraction = 0.42 if view == "front" else 0.12
-    cutoff = float(ys.min() + lower_fraction * (ys.max() - ys.min()))
-    boundary[: max(0, int(cutoff)), :] = False
-    by, bx = np.where(boundary)
-    observed = np.stack((bx, by), axis=1).astype(np.float32)
-    if len(observed) < 6:
-        return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
-
-    nose = np.asarray(projected_landmarks[27:36], dtype=np.float32)
-    dense = [nose]
-    for start, end in ((27, 30), (31, 32), (32, 33), (33, 34), (34, 35)):
-        alpha = np.linspace(0.0, 1.0, 5, dtype=np.float32)[:, None]
-        dense.append(
-            projected_landmarks[start][None, :] * (1.0 - alpha)
-            + projected_landmarks[end][None, :] * alpha
-        )
-    model = np.vstack(dense).astype(np.float32)
-    model = model[model[:, 1] >= cutoff - 12.0]
-    if len(model) == 0:
-        return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
-    distance, nearest = cKDTree(observed).query(model, k=1)
-    keep = np.asarray(distance) <= float(max_distance_px)
-    model = model[keep]
-    matched = observed[np.asarray(nearest)[keep]]
-    if len(model) > 24:
-        take = np.linspace(0, len(model) - 1, 24).astype(np.int64)
-        model, matched = model[take], matched[take]
-    return model.astype(np.float32), matched.astype(np.float32)
 
 
 def prepare_stable_texture_registration(
@@ -148,23 +109,31 @@ def prepare_stable_texture_registration(
         )
         model_controls = projected_68[stable_indices]
         observed_controls = observed_68[stable_indices]
-        nasal_model, nasal_observed = _nose_boundary_controls(
-            projected_68, data.get("nose_mask"), view
+        nasal = build_nose_controls(
+            projected_68,
+            observed_68,
+            data.get("nose_mask"),
+            view=view,
+            image=data["image"] if view == "front" else None,
         )
-        if len(nasal_model):
-            model_controls = np.vstack((model_controls, nasal_model))
-            observed_controls = np.vstack((observed_controls, nasal_observed))
-        warp = build_sampling_warp(
+        warp = build_layered_feature_warp(
             model_controls,
             observed_controls,
+            nasal.model_points,
+            nasal.observed_points,
             data["image"].shape[:2],
-            smoothing=24.0,
-            max_control_displacement_px=28.0,
-            max_field_displacement_px=24.0,
+            smoothing=8.0,
+            max_translation_px=8.0,
+            max_rotation_degrees=1.0,
+            max_scale_delta=0.015,
+            local_max_displacement_px=16.0,
+            min_jacobian=0.35,
         )
         warps[view] = warp
+        overlay_model = np.vstack((model_controls, nasal.model_points))
+        overlay_observed = np.vstack((observed_controls, nasal.observed_points))
         overlay = draw_registration_overlay(
-            data["image"], model_controls, observed_controls, warp
+            data["image"], overlay_model, overlay_observed, warp
         )
         cv2.imwrite(
             str(registration_dir / f"{view}_registration_overlay.jpg"),
@@ -177,17 +146,33 @@ def prepare_stable_texture_registration(
         )
         cv2.imwrite(str(registration_dir / f"{view}_displacement.png"), heat)
         view_report[view] = {
-            "controls": int(len(model_controls)),
-            "nasal_semantic_controls": int(len(nasal_model)),
+            "global_controls": int(len(model_controls)),
+            "nasal_semantic_controls": int(len(nasal.model_points)),
+            "nasal_confidence": float(nasal.confidence),
+            "nasal_diagnostics": nasal.diagnostics,
+            "nasal_correspondences": [
+                {
+                    "group": group,
+                    "model": [float(value) for value in model],
+                    "observed": [float(value) for value in observed],
+                }
+                for group, model, observed in zip(
+                    nasal.groups, nasal.model_points, nasal.observed_points
+                )
+            ],
             "residual_before_px": warp.control_residual_before_px,
             "residual_after_px": warp.control_residual_after_px,
             "max_displacement_px": warp.max_displacement_px,
+            "displacement_p95_px": warp.displacement_p95_px,
+            "min_jacobian": warp.min_jacobian,
+            "warp_diagnostics": warp.diagnostics,
         }
 
     report = {
         "views": view_report,
         "photometric_normalization": photometric_report,
-        "nose_control_source": "semantic_nose_mask_boundary",
+        "nose_control_source": "ordered_semantic_lower_boundary",
+        "registration_mode": "bounded_similarity_plus_local_nose",
         "geometry_changed": False,
     }
     (debug_dir / "registration_inputs.json").write_text(

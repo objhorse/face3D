@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from src.module3_texture import (
+    _apply_front_feature_ownership,
     _feather_view_weight,
     _multiband_blend,
     _small_connected_regions,
@@ -52,6 +53,32 @@ class TextureBlendingTests(unittest.TestCase):
         self.assertEqual(float(feathered[0, 0]), 0.0)
         self.assertLess(float(feathered[17, 64]), 0.1)
         self.assertGreater(float(feathered[64, 64]), 0.95)
+
+    def test_front_feature_ownership_overrides_multiband_leakage(self):
+        texture = np.full((4, 4, 3), 20.0, dtype=np.float32)
+        valid_y, valid_x = np.mgrid[:4, :4]
+        valid_y = valid_y.ravel()
+        valid_x = valid_x.ravel()
+        protected = np.zeros(16, dtype=bool)
+        protected[[5, 6, 9, 10]] = True
+        front_present = np.ones(16, dtype=bool)
+        front_colors = np.full((16, 3), [180.0, 120.0, 90.0], dtype=np.float32)
+
+        owned, report = _apply_front_feature_ownership(
+            texture,
+            valid_y,
+            valid_x,
+            protected,
+            front_present,
+            front_colors,
+        )
+
+        np.testing.assert_array_equal(
+            owned[1:3, 1:3],
+            np.full((2, 2, 3), [180.0, 120.0, 90.0], dtype=np.float32),
+        )
+        self.assertEqual(report["front_owned_pixels"], 4)
+        self.assertEqual(report["front_ownership_ratio"], 1.0)
 
 
 if __name__ == "__main__":

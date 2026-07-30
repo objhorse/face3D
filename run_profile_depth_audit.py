@@ -27,6 +27,9 @@ from src.geometry.profile_triangulation import (
     TriangulationThresholds,
     load_profile_rig,
 )
+from src.geometry.semantic_epipolar_refinement import (
+    SemanticRefinementThresholds,
+)
 from src.initializers.face_alignment_initializer import get_fa_per_view
 from src.module1_preprocess import detect_landmarks_mediapipe
 from src.module2_geometry import FLAMEModel
@@ -68,6 +71,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-stereo-rms-px", type=float, default=10.0)
     parser.add_argument("--max-semantic-correction-px", type=float, default=40.0)
+    parser.add_argument(
+        "--dense-match-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional joint-rig output containing accepted LoFTR NPZ files. "
+            "When supplied, side semantic indices are replaced by local "
+            "image-evidence mappings from the front semantic anchors."
+        ),
+    )
     parser.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda"),
@@ -320,6 +333,7 @@ def _write_observation_artifacts(
             f"<td>{html.escape(name)}</td>"
             f"<td>{'PASS' if point_report['passed'] else 'REJECT'}</td>"
             f"<td>{triangle['reprojection_p90_px']:.2f}</td>"
+            f"<td>{point_report['observation_view_count']}</td>"
             f"<td>{consensus['correction_p90_px']:.2f}</td>"
             f"<td>{triangle['max_pair_delta_m'] * 1000.0:.2f}</td>"
             f"<td>{html.escape(', '.join(point_report['issues']) or 'none')}</td>"
@@ -332,6 +346,16 @@ def _write_observation_artifacts(
         f"<img src='reprojection_{view}.png' alt='{view} rig reprojection'></section>"
         for view in ("left", "front", "right")
     )
+    refinement = observation_report.get("image_refinement")
+    method_note = (
+        "The semantic 3D point comes from a robust local depth surface fitted "
+        "to exact LoFTR triangulations around the front semantic pixel. The "
+        "displayed reprojection is constructed from that 3D point and is not "
+        "an independent accuracy score; depth-surface residual and cross-side "
+        "depth agreement are the independent gates."
+        if refinement is not None
+        else "Side observations are raw detector semantic indices."
+    )
     document = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Profile Depth Observation Audit</title><style>
@@ -343,8 +367,9 @@ table{{border-collapse:collapse;width:100%;font-size:14px}} th,td{{padding:9px;b
 .pass{{color:#65d693}} .fail{{color:#ff8a8a}}
 </style></head><body><main><h1>Profile Depth Observation Audit</h1>
 <p class="{'pass' if gate['passed'] else 'fail'}">Gate: {'PASS' if gate['passed'] else 'REJECT'}; valid points: {gate['valid_point_count']} / {gate['minimum_valid_points']}.</p>
-<p>Green: MediaPipe seed. Purple: independent 68-point detector. Cyan: undistorted seed. Red: fixed-rig consensus. The connecting line is the correction the rig would require.</p>
-<table><thead><tr><th>Point</th><th>Status</th><th>Raw reprojection P90 (px)</th><th>Required correction P90 (px)</th><th>Pair delta (mm)</th><th>Issues</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+<p>{html.escape(method_note)}</p>
+<p>Green: MediaPipe seed. Purple: independent 68-point detector. Cyan: selected observation. Red: fixed-rig reprojection. The connecting line is the remaining correction.</p>
+<table><thead><tr><th>Point</th><th>Status</th><th>Reprojection P90 (px)</th><th>Views</th><th>Remaining correction P90 (px)</th><th>Pair delta (mm)</th><th>Issues</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 {figures}</main></body></html>"""
     (output_dir / "index.html").write_text(document, encoding="utf-8")
 
@@ -357,6 +382,7 @@ def audit_semantic_observations(
     max_stereo_rms_px: float,
     max_semantic_correction_px: float,
     output_dir: Path,
+    dense_match_dir: Path | None = None,
 ) -> dict[str, Any]:
     rig = load_profile_rig(
         calibration,
@@ -376,11 +402,20 @@ def audit_semantic_observations(
         actual_device,
         max_size=1280,
     )
+    dense_matches = None
+    if dense_match_dir is not None:
+        dense_matches = _load_dense_matches(
+            dense_match_dir.resolve(),
+            captures.resolve().name,
+            rig,
+        )
     report = collect_profile_observations(
         mediapipe_landmarks,
         face_alignment_landmarks,
         rig,
         {view: image.shape for view, image in images.items()},
+        dense_matches_by_view=dense_matches,
+        semantic_refinement_thresholds=SemanticRefinementThresholds(),
         images_by_view=images,
         observation_thresholds=ObservationThresholds(
             max_consensus_correction_px=max_semantic_correction_px,
@@ -395,10 +430,41 @@ def audit_semantic_observations(
     return report
 
 
+def _load_dense_matches(
+    dense_match_dir: Path,
+    dataset: str,
+    rig,
+) -> dict[str, dict[str, np.ndarray]]:
+    front_camera = rig.cameras_by_view["front"]
+    matches: dict[str, dict[str, np.ndarray]] = {}
+    for side_view in ("left", "right"):
+        side_camera = rig.cameras_by_view[side_view]
+        pair = f"{front_camera.name}_{side_camera.name}"
+        path = dense_match_dir / f"{dataset}_{pair}_accepted_matches.npz"
+        if not path.exists():
+            raise FileNotFoundError(f"missing dense semantic match file: {path}")
+        with np.load(path, allow_pickle=False) as payload:
+            work_size = tuple(int(value) for value in payload["work_size"])
+            if work_size != (640, 480):
+                raise ValueError(f"unsupported dense match work size in {path}: {work_size}")
+            matches[side_view] = {
+                "points_front_work": np.asarray(
+                    payload["points_front_work"], dtype=np.float64
+                ),
+                "points_side_work": np.asarray(
+                    payload["points_side_work"], dtype=np.float64
+                ),
+                "confidence": np.asarray(payload["confidence"], dtype=np.float64),
+            }
+    return matches
+
+
 def main() -> None:
     args = _parse_args()
     if (args.captures is None) != (args.calibration is None):
         raise ValueError("--captures and --calibration must be supplied together")
+    if args.dense_match_dir is not None and args.captures is None:
+        raise ValueError("--dense-match-dir requires --captures and --calibration")
     reconstruction = args.reconstruction.resolve()
     output_path = args.output
     if output_path is None:
@@ -422,6 +488,7 @@ def main() -> None:
             max_stereo_rms_px=args.max_stereo_rms_px,
             max_semantic_correction_px=args.max_semantic_correction_px,
             output_dir=output_path.parent,
+            dense_match_dir=args.dense_match_dir,
         )
         report["semantic_observations"] = observation_report
         with (output_path.parent / "profile_depth_quality.json").open(

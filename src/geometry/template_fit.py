@@ -203,6 +203,9 @@ def run_stable_template_fit(
     identity_quality = {
         "joint": optimized_shape.get("joint_identity_anchor", {}),
         "final": optimized_params.get("identity_preservation", {}),
+        "controlled_low_frequency": optimized_params.get(
+            "controlled_identity_deformation", {}
+        ),
     }
     fit_meta = {
         "pipeline": "stable_three_view",

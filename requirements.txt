@@ -9,7 +9,7 @@
 # tqdm>=4.0
 
 # 需要安装
-mediapipe>=0.10.14
+mediapipe==0.10.21
 face-alignment>=1.4.1
 einops>=0.7.0
 PyYAML>=6.0

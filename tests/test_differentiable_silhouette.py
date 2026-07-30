@@ -9,7 +9,10 @@ from src.geometry.differentiable_silhouette import (
     evaluate_geometry_candidate,
     make_interior_landmark_weights,
     render_soft_silhouette,
+    regional_signed_distance_boundary_loss,
+    signed_distance_boundary_loss,
     silhouette_metrics,
+    soft_silhouette_boundary,
     weighted_silhouette_loss,
 )
 
@@ -86,6 +89,62 @@ def test_front_target_trusts_both_cheek_boundaries():
     assert float(reliability[18:23].max()) < 0.3
 
 
+def test_front_sdf_support_reaches_inward_model_boundary_without_covering_features():
+    mask = np.zeros((128, 128), dtype=np.uint8)
+    yy, xx = np.indices(mask.shape)
+    mask[((xx - 64.0) / 38.0) ** 2 + ((yy - 68.0) / 48.0) ** 2 <= 1.0] = 255
+
+    target = build_silhouette_target(mask, view_name="front", resolution=128)
+    trusted = target.trusted_curve_np > 0
+
+    assert np.max(np.abs(target.signed_distance_np[trusted])) < 1e-6
+    assert float(target.sdf_support_np[68, 42]) > 0.8
+    assert float(target.sdf_support_np[68, 64]) < 0.2
+    assert float(target.signed_distance_np[68, 64]) < 0.0
+    assert float(target.signed_distance_np[68, 8]) > 0.0
+
+
+def test_side_sdf_support_excludes_far_hair_boundary():
+    mask = np.zeros((128, 128), dtype=np.uint8)
+    for y in range(20, 111):
+        left = 54 - int(8 * np.sin((y - 20) / 90.0 * np.pi))
+        mask[y, left:118] = 255
+
+    target = build_silhouette_target(mask, view_name="left", resolution=128)
+
+    assert float(target.sdf_support_np[64, 58]) > 0.8
+    assert float(target.sdf_support_np[64, 112]) < 0.2
+
+
+def test_sdf_boundary_loss_pushes_a_too_narrow_soft_face_outward():
+    mask = np.zeros((96, 96), dtype=np.uint8)
+    mask[18:82, 18:78] = 255
+    target = build_silhouette_target(mask, view_name="front", resolution=96)
+    signed_distance, support = target.sdf_tensors("cpu")
+
+    half_width = torch.tensor(20.0, requires_grad=True)
+    yy, xx = torch.meshgrid(
+        torch.arange(96, dtype=torch.float32),
+        torch.arange(96, dtype=torch.float32),
+        indexing="ij",
+    )
+    horizontal = torch.sigmoid((half_width - torch.abs(xx - 47.5)) / 0.8)
+    vertical = torch.sigmoid((31.5 - torch.abs(yy - 49.5)) / 0.8)
+    prediction = horizontal * vertical
+    boundary = soft_silhouette_boundary(prediction)
+    loss = signed_distance_boundary_loss(
+        prediction,
+        signed_distance,
+        support,
+        boundary=boundary,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert half_width.grad is not None
+    assert float(half_width.grad) < 0.0
+
+
 def test_trusted_boundary_metric_is_normalized_by_face_width():
     mask = np.zeros((128, 128), dtype=np.uint8)
     yy, xx = np.indices(mask.shape)
@@ -101,6 +160,29 @@ def test_trusted_boundary_metric_is_normalized_by_face_width():
     assert metric_128["trusted_boundary_face_width_pct"] == pytest.approx(
         metric_256["trusted_boundary_face_width_pct"], abs=0.2
     )
+
+
+def test_front_regions_report_signed_width_without_cross_region_aggregation():
+    target_mask = np.zeros((128, 128), dtype=np.uint8)
+    yy, xx = np.indices(target_mask.shape)
+    target_mask[((xx - 64.0) / 38.0) ** 2 + ((yy - 68.0) / 49.0) ** 2 <= 1.0] = 255
+    prediction = np.zeros_like(target_mask, dtype=np.float32)
+    prediction[((xx - 64.0) / 31.0) ** 2 + ((yy - 68.0) / 49.0) ** 2 <= 1.0] = 1.0
+    target = build_silhouette_target(target_mask, view_name="front", resolution=128)
+
+    metrics = silhouette_metrics(prediction, target)
+    signed_distance, region_supports = target.regional_sdf_tensors("cpu")
+    loss = regional_signed_distance_boundary_loss(
+        torch.tensor(prediction),
+        signed_distance,
+        region_supports,
+    )
+
+    assert set(metrics["regions"]) >= {"forehead", "temple", "cheekbone", "cheek", "jaw", "chin"}
+    assert metrics["regions"]["cheek"]["signed_width_error_px"] < 0.0
+    assert metrics["regional_balanced_boundary_mean_px"] > 0.0
+    assert metrics["identity_balanced_boundary_mean_px"] > 0.0
+    assert torch.isfinite(loss)
 
 
 def test_side_far_boundary_does_not_change_trusted_contour_metric():
@@ -163,7 +245,7 @@ def test_candidate_gate_rejects_large_single_view_worsening():
     assert "view_consistency" in decision["failed_gates"]
 
 
-def test_candidate_gate_treats_subpixel_view_change_as_preserved():
+def test_candidate_gate_requires_two_measurably_improved_views():
     views = ("left", "front", "right")
     before = [
         _candidate_record(view, 10.0, render_tol=0.8) for view in views
@@ -177,9 +259,29 @@ def test_candidate_gate_treats_subpixel_view_change_as_preserved():
     decision = evaluate_geometry_candidate(
         before, after, mesh_quality_gate={"passed": True}
     )
-    assert decision["accepted"]
+    assert not decision["accepted"]
+    assert "view_consistency" in decision["failed_gates"]
     assert decision["metrics"]["improved_views"] == 1
     assert decision["metrics"]["preserved_views"] == 3
+
+
+def test_candidate_gate_accepts_two_improved_and_one_subpixel_preserved_view():
+    before = [
+        _candidate_record(view, 10.0, render_tol=0.8)
+        for view in ("left", "front", "right")
+    ]
+    after = [
+        _candidate_record("left", 8.0, render_tol=0.8),
+        _candidate_record("front", 8.0, render_tol=0.8),
+        _candidate_record("right", 10.45, render_tol=0.8),
+    ]
+
+    decision = evaluate_geometry_candidate(
+        before, after, mesh_quality_gate={"passed": True}
+    )
+
+    assert decision["accepted"]
+    assert decision["metrics"]["improved_views"] == 2
 
 
 def test_candidate_gate_rejects_interior_landmark_damage():
@@ -205,6 +307,41 @@ def test_candidate_gate_rejects_mesh_quality_failure():
     )
     assert not decision["accepted"]
     assert "mesh_quality" in decision["failed_gates"]
+
+
+def test_candidate_gate_requires_material_relative_boundary_improvement():
+    views = ("left", "front", "right")
+    before = [_candidate_record(view, 10.0) for view in views]
+    after = [_candidate_record(view, 8.5) for view in views]
+
+    decision = evaluate_geometry_candidate(
+        before,
+        after,
+        mesh_quality_gate={"passed": True},
+        min_relative_boundary_improve=0.30,
+    )
+
+    assert not decision["accepted"]
+    assert "relative_boundary_improved" in decision["failed_gates"]
+
+
+def test_candidate_gate_requires_front_boundary_recovery():
+    before = [_candidate_record(view, 10.0) for view in ("left", "front", "right")]
+    after = [
+        _candidate_record("left", 5.0),
+        _candidate_record("front", 8.0),
+        _candidate_record("right", 5.0),
+    ]
+
+    decision = evaluate_geometry_candidate(
+        before,
+        after,
+        mesh_quality_gate={"passed": True},
+        min_front_relative_boundary_improve=0.30,
+    )
+
+    assert not decision["accepted"]
+    assert "front_relative_boundary_improved" in decision["failed_gates"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

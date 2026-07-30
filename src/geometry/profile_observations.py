@@ -18,6 +18,10 @@ from src.geometry.profile_triangulation import (
     project_reference_point,
     triangulate_profile_point,
 )
+from src.geometry.semantic_epipolar_refinement import (
+    SemanticRefinementThresholds,
+    build_image_consistent_semantic_observations,
+)
 
 
 SEMANTIC_DEFINITIONS: dict[str, dict[str, tuple[int, ...]]] = {
@@ -151,6 +155,10 @@ def evaluate_semantic_profile_observations(
     image_shapes_by_view: Mapping[str, tuple[int, ...]],
     *,
     images_by_view: Mapping[str, np.ndarray] | None = None,
+    observations_undistorted_by_view: Mapping[
+        str, Mapping[str, Any]
+    ] | None = None,
+    image_refinement: Mapping[str, Any] | None = None,
     observation_thresholds: ObservationThresholds | None = None,
     triangulation_thresholds: TriangulationThresholds | None = None,
 ) -> dict[str, Any]:
@@ -199,10 +207,21 @@ def evaluate_semantic_profile_observations(
                 ),
             }
 
+    if observations_undistorted_by_view is not None:
+        undistorted_mp = {
+            view: {
+                name: np.asarray(point, dtype=np.float64).reshape(2)
+                for name, point in points.items()
+            }
+            for view, points in observations_undistorted_by_view.items()
+        }
     semantic_names = sorted(
-        set.intersection(
-            *(set(points) for points in undistorted_mp.values())
-        ) if undistorted_mp else set()
+        {
+            name
+            for points in undistorted_mp.values()
+            for name in points
+            if sum(name in candidate for candidate in undistorted_mp.values()) >= 2
+        }
     )
     point_reports: dict[str, dict[str, Any]] = {}
     accepted_points: dict[str, np.ndarray] = {}
@@ -230,9 +249,15 @@ def evaluate_semantic_profile_observations(
         }
         correction_values = np.asarray(list(corrections.values()), dtype=np.float64)
         correction_p90 = float(np.percentile(correction_values, 90.0))
+        confidence_views = (
+            ("front",)
+            if image_refinement is not None and "front" in observations
+            else tuple(observations)
+        )
         detector_confidences = [
             float(detector_details[view][name]["detector_confidence"])
-            for view in observations
+            for view in confidence_views
+            if view in detector_details and name in detector_details[view]
         ]
         mean_detector_confidence = float(np.mean(detector_confidences))
         local_consensus = correction_p90 <= limits.max_consensus_correction_px
@@ -266,6 +291,23 @@ def evaluate_semantic_profile_observations(
                 "within_local_roi": local_consensus,
             },
             "mean_detector_confidence": mean_detector_confidence,
+            "observation_view_count": len(observations),
+            "three_view_validated": len(observations) == 3,
+            "observation_sources": {
+                view: (
+                    "mediapipe_front_anchor"
+                    if image_refinement is not None and view == "front"
+                    else str(image_refinement.get("method", "image_refinement"))
+                    if image_refinement is not None
+                    else "mediapipe_semantic_index"
+                )
+                for view in observations
+            },
+            "image_refinement": (
+                None
+                if image_refinement is None
+                else image_refinement.get("points", {}).get(name, {})
+            ),
         }
 
     valid_names = sorted(accepted_points)
@@ -276,13 +318,21 @@ def evaluate_semantic_profile_observations(
     if not has_lip:
         missing_required.append("upper_or_lower_lip")
     quality_issues = []
+    quality_warnings = []
     if len(valid_names) < limits.min_valid_points:
         quality_issues.append("insufficient_valid_semantic_points")
     if missing_required:
         quality_issues.append("required_semantic_points_missing")
+    two_view_only = sorted(
+        name
+        for name in accepted_points
+        if not point_reports[name]["three_view_validated"]
+    )
+    if two_view_only:
+        quality_warnings.append("accepted_points_without_three_view_validation")
 
     return {
-        "observation_version": 1,
+        "observation_version": 2 if image_refinement is not None else 1,
         "audit_only": True,
         "semantic_definitions": {
             name: {
@@ -305,6 +355,7 @@ def evaluate_semantic_profile_observations(
             for name, point in accepted_points.items()
         },
         "observed_profile_depth": _profile_depth_metrics(accepted_points),
+        "image_refinement": image_refinement,
         "quality_gate": {
             "passed": not quality_issues,
             "issues": quality_issues,
@@ -312,6 +363,8 @@ def evaluate_semantic_profile_observations(
             "valid_point_count": len(valid_names),
             "minimum_valid_points": int(limits.min_valid_points),
             "missing_required": missing_required,
+            "warnings": quality_warnings,
+            "two_view_only_points": two_view_only,
         },
         "thresholds": {
             "max_detector_disagreement_ratio": float(
@@ -337,6 +390,8 @@ def collect_profile_observations(
     face_alignment_landmarks_by_view: Mapping[str, Any],
     rig: ProfileRig,
     image_shapes_by_view: Mapping[str, tuple[int, ...]],
+    dense_matches_by_view: Mapping[str, Mapping[str, Any]] | None = None,
+    semantic_refinement_thresholds: SemanticRefinementThresholds | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     mediapipe_semantic = {
@@ -349,11 +404,24 @@ def collect_profile_observations(
         for view, points in face_alignment_landmarks_by_view.items()
         if points is not None
     }
+    refinement_kwargs: dict[str, Any] = {}
+    if dense_matches_by_view is not None:
+        observations, refinement = build_image_consistent_semantic_observations(
+            mediapipe_semantic,
+            dense_matches_by_view,
+            rig,
+            thresholds=semantic_refinement_thresholds,
+        )
+        refinement_kwargs = {
+            "observations_undistorted_by_view": observations,
+            "image_refinement": refinement,
+        }
     return evaluate_semantic_profile_observations(
         mediapipe_semantic,
         face_alignment_semantic,
         rig,
         image_shapes_by_view,
+        **refinement_kwargs,
         **kwargs,
     )
 

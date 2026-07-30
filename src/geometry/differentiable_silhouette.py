@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple, Union
+from typing import Dict, Iterable, Mapping, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -18,6 +18,9 @@ class SilhouetteTarget:
     reliability_np: np.ndarray
     trusted_curve_np: np.ndarray
     trusted_band_np: np.ndarray
+    signed_distance_np: np.ndarray
+    sdf_support_np: np.ndarray
+    region_supports_np: Dict[str, np.ndarray]
     source_shape: Tuple[int, int]
     render_shape: Tuple[int, int]
     metadata: Dict[str, object]
@@ -26,6 +29,37 @@ class SilhouetteTarget:
         target = torch.tensor(self.target_np, device=device, dtype=torch.float32)
         reliability = torch.tensor(self.reliability_np, device=device, dtype=torch.float32)
         return target, reliability
+
+    def sdf_tensors(self, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        signed_distance = torch.tensor(
+            self.signed_distance_np, device=device, dtype=torch.float32
+        )
+        support = torch.tensor(self.sdf_support_np, device=device, dtype=torch.float32)
+        return signed_distance, support
+
+    def regional_sdf_tensors(
+        self, device: str
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        signed_distance = torch.tensor(
+            self.signed_distance_np, device=device, dtype=torch.float32
+        )
+        supports = {
+            name: torch.tensor(values, device=device, dtype=torch.float32)
+            for name, values in self.region_supports_np.items()
+        }
+        return signed_distance, supports
+
+
+_VERTICAL_REGIONS = (
+    ("forehead", 0.10, 0.22),
+    ("temple", 0.22, 0.36),
+    ("cheekbone", 0.36, 0.50),
+    ("cheek", 0.50, 0.66),
+    ("jaw", 0.66, 0.86),
+    ("chin", 0.86, 1.01),
+)
+
+IDENTITY_SILHOUETTE_REGIONS = ("forehead", "temple", "cheekbone", "cheek")
 
 
 def _render_shape(image_shape: Tuple[int, int], resolution: Resolution) -> Tuple[int, int]:
@@ -46,6 +80,90 @@ def _largest_binary_component(mask: np.ndarray) -> np.ndarray:
     areas = stats[1:, cv2.CC_STAT_AREA]
     label = int(np.argmax(areas)) + 1
     return np.asarray(labels == label, dtype=np.uint8)
+
+
+def _signed_distance_field(binary: np.ndarray, face_width: int) -> np.ndarray:
+    inside = cv2.distanceTransform(binary.astype(np.uint8), cv2.DIST_L2, 5)
+    outside = cv2.distanceTransform((1 - binary).astype(np.uint8), cv2.DIST_L2, 5)
+    signed = (outside - inside) / float(max(int(face_width), 1))
+    boundary = cv2.morphologyEx(
+        binary.astype(np.uint8),
+        cv2.MORPH_GRADIENT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    signed[boundary > 0] = 0.0
+    return signed.astype(np.float32)
+
+
+def _build_sdf_support(
+    binary: np.ndarray,
+    view_name: str,
+    curve_y0: int,
+    y1: int,
+    profile_x_by_row: Dict[int, int],
+) -> np.ndarray:
+    height, width = binary.shape
+    ys, xs = np.nonzero(binary)
+    x0, x1 = int(xs.min()), int(xs.max())
+    bbox_width = max(1, x1 - x0 + 1)
+    outer_margin = max(2, int(round(0.08 * bbox_width)))
+    support = np.zeros((height, width), dtype=np.float32)
+    normalized_name = str(view_name).lower()
+    jaw_start = curve_y0 + int(round(0.64 * max(1, y1 - curve_y0 + 1)))
+
+    for y in range(curve_y0, y1 + 1):
+        row_x = np.flatnonzero(binary[y])
+        if row_x.size < 2:
+            continue
+        left, right = int(row_x[0]), int(row_x[-1])
+        row_width = max(1, right - left + 1)
+        if normalized_name == "front":
+            inward = max(3, int(round(0.28 * row_width)))
+            support[y, max(0, left - outer_margin) : min(width, left + inward + 1)] = 1.0
+            support[y, max(0, right - inward) : min(width, right + outer_margin + 1)] = 1.0
+            if y >= jaw_start:
+                support[y, max(0, left - outer_margin) : min(width, right + outer_margin + 1)] = 1.0
+            continue
+
+        profile_x = profile_x_by_row.get(y)
+        if profile_x is None:
+            continue
+        inward = max(3, int(round(0.38 * row_width)))
+        center_x = (width - 1) * 0.5
+        if profile_x <= center_x:
+            start = max(0, profile_x - outer_margin)
+            end = min(width, profile_x + inward + 1)
+        else:
+            start = max(0, profile_x - inward)
+            end = min(width, profile_x + outer_margin + 1)
+        support[y, start:end] = 1.0
+
+    # A small vertical dilation keeps gradients available between sampled mask rows.
+    support = cv2.dilate(
+        np.uint8(support > 0),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5)),
+    ).astype(np.float32)
+    support[: max(0, curve_y0 - 1)] = 0.0
+    return support
+
+
+def _build_region_supports(
+    sdf_support: np.ndarray,
+    y0: int,
+    y1: int,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, list[int]]]:
+    height, _width = sdf_support.shape
+    span = max(1, int(y1) - int(y0) + 1)
+    supports: Dict[str, np.ndarray] = {}
+    ranges: Dict[str, list[int]] = {}
+    for name, start_fraction, end_fraction in _VERTICAL_REGIONS:
+        start = max(0, int(round(y0 + start_fraction * span)))
+        end = min(height, int(round(y0 + end_fraction * span)))
+        region = np.zeros_like(sdf_support, dtype=np.float32)
+        region[start:end] = sdf_support[start:end]
+        supports[name] = region
+        ranges[name] = [int(start), int(max(start, end - 1))]
+    return supports, ranges
 
 
 def build_silhouette_target(
@@ -140,21 +258,35 @@ def build_silhouette_target(
         reliability[y0:top_guard_end], float(context_weight)
     )
     reliability = np.clip(reliability, 0.0, 1.0).astype(np.float32)
+    face_width_render_px = int(x1 - x0 + 1)
+    signed_distance = _signed_distance_field(binary, face_width_render_px)
+    sdf_support = _build_sdf_support(
+        binary,
+        normalized_name,
+        curve_y0,
+        y1,
+        profile_x_by_row,
+    )
+    region_supports, region_ranges = _build_region_supports(sdf_support, y0, y1)
 
     metadata: Dict[str, object] = {
         "view": normalized_name,
         "bbox_xyxy": [x0, y0, x1, y1],
-        "face_width_render_px": int(x1 - x0 + 1),
+        "face_width_render_px": face_width_render_px,
         "face_width_source_px": float((x1 - x0 + 1) * source_shape[1] / render_shape[1]),
         "curve_rows": int(curve_rows),
         "reliable_fraction": float(np.mean(reliability >= 0.5)),
         "context_fraction": float(np.mean(reliability > 0.0)),
+        "region_row_ranges": region_ranges,
     }
     return SilhouetteTarget(
         target_np=binary.astype(np.float32),
         reliability_np=reliability,
         trusted_curve_np=trusted.astype(np.float32),
         trusted_band_np=trusted_band.astype(np.float32),
+        signed_distance_np=signed_distance,
+        sdf_support_np=sdf_support,
+        region_supports_np=region_supports,
         source_shape=source_shape,
         render_shape=render_shape,
         metadata=metadata,
@@ -256,6 +388,64 @@ def weighted_silhouette_loss(
     return float(dice_weight) * dice + float(l1_weight) * l1
 
 
+def soft_silhouette_boundary(prediction: torch.Tensor) -> torch.Tensor:
+    if prediction.ndim != 2:
+        raise ValueError("prediction must have shape (H, W)")
+    image = prediction[None, None]
+    padded = F.pad(image, (1, 1, 1, 1), mode="replicate")
+    sobel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=prediction.device,
+        dtype=prediction.dtype,
+    )[None, None]
+    sobel_y = sobel_x.transpose(-1, -2)
+    grad_x = F.conv2d(padded, sobel_x)
+    grad_y = F.conv2d(padded, sobel_y)
+    magnitude = torch.sqrt(grad_x.square() + grad_y.square() + 1e-12)[0, 0]
+    scale = magnitude.detach().amax().clamp_min(1e-6)
+    return (magnitude / scale).clamp(0.0, 1.0)
+
+
+def signed_distance_boundary_loss(
+    prediction: torch.Tensor,
+    signed_distance: torch.Tensor,
+    support: torch.Tensor,
+    *,
+    boundary: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if prediction.shape != signed_distance.shape or prediction.shape != support.shape:
+        raise ValueError("prediction, signed_distance, and support must share a shape")
+    boundary_weight = soft_silhouette_boundary(prediction) if boundary is None else boundary
+    weights = boundary_weight * support
+    return (weights * signed_distance.abs()).sum() / weights.sum().clamp_min(1e-6)
+
+
+def regional_signed_distance_boundary_loss(
+    prediction: torch.Tensor,
+    signed_distance: torch.Tensor,
+    region_supports: Mapping[str, torch.Tensor],
+    *,
+    boundary: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Average SDF contour loss per semantic vertical region."""
+    if prediction.shape != signed_distance.shape:
+        raise ValueError("prediction and signed_distance must share a shape")
+    boundary_weight = soft_silhouette_boundary(prediction) if boundary is None else boundary
+    losses = []
+    for support in region_supports.values():
+        if support.shape != prediction.shape:
+            raise ValueError("every region support must match prediction shape")
+        if not bool(torch.count_nonzero(support).item()):
+            continue
+        weights = boundary_weight * support
+        losses.append(
+            (weights * signed_distance.abs()).sum() / weights.sum().clamp_min(1e-6)
+        )
+    if not losses:
+        return torch.zeros((), dtype=prediction.dtype, device=prediction.device)
+    return torch.stack(losses).mean()
+
+
 def _binary_boundary(mask: np.ndarray) -> np.ndarray:
     binary = np.asarray(mask > 0, dtype=np.uint8)
     return cv2.morphologyEx(
@@ -268,7 +458,7 @@ def _binary_boundary(mask: np.ndarray) -> np.ndarray:
 def silhouette_metrics(
     prediction: np.ndarray,
     target: SilhouetteTarget,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     pred = np.asarray(prediction >= 0.5, dtype=np.uint8)
     truth = np.asarray(target.target_np >= 0.5, dtype=np.uint8)
     reliability = np.asarray(target.reliability_np, dtype=np.float32)
@@ -309,6 +499,70 @@ def silhouette_metrics(
     render_pixel_face_width_pct = 100.0 / max(
         float(target.metadata["face_width_render_px"]), 1.0
     )
+    regions: Dict[str, Dict[str, float]] = {}
+    finite_region_boundaries = []
+    if np.any(pred_boundary) and np.any(target_points):
+        distance_to_pred = cv2.distanceTransform(
+            (~pred_boundary).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        distance_to_target = cv2.distanceTransform(
+            (~target_points).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        for name, support in target.region_supports_np.items():
+            region_rows = np.any(np.asarray(support) > 0, axis=1)
+            region_mask = np.repeat(region_rows[:, None], pred.shape[1], axis=1)
+            region_target = target_points & region_mask
+            region_prediction = pred_boundary & trusted_band & region_mask
+            if np.any(region_target) and np.any(region_prediction):
+                target_distance = float(distance_to_pred[region_target].mean())
+                prediction_distance = float(
+                    distance_to_target[region_prediction].mean()
+                )
+                region_boundary_render_px = 0.5 * (
+                    target_distance + prediction_distance
+                )
+                region_boundary_source_px = region_boundary_render_px * 0.5 * (
+                    scale_x + scale_y
+                )
+            else:
+                region_boundary_source_px = float("inf")
+
+            signed_width_values = []
+            if str(target.metadata.get("view", "")) == "front":
+                for row in np.flatnonzero(region_rows):
+                    target_x = np.flatnonzero(truth[row])
+                    prediction_x = np.flatnonzero(pred[row])
+                    if target_x.size >= 2 and prediction_x.size >= 2:
+                        target_width = int(target_x[-1] - target_x[0] + 1)
+                        prediction_width = int(prediction_x[-1] - prediction_x[0] + 1)
+                        signed_width_values.append(prediction_width - target_width)
+            signed_width_error = (
+                float(np.median(signed_width_values) * scale_x)
+                if signed_width_values
+                else float("nan")
+            )
+            regions[name] = {
+                "boundary_mean_px": float(region_boundary_source_px),
+                "signed_width_error_px": signed_width_error,
+                "row_count": int(np.count_nonzero(region_rows)),
+            }
+            if np.isfinite(region_boundary_source_px):
+                finite_region_boundaries.append(region_boundary_source_px)
+    regional_balanced_boundary = (
+        float(np.mean(finite_region_boundaries))
+        if finite_region_boundaries
+        else float("inf")
+    )
+    identity_boundaries = [
+        regions[name]["boundary_mean_px"]
+        for name in IDENTITY_SILHOUETTE_REGIONS
+        if name in regions and np.isfinite(regions[name]["boundary_mean_px"])
+    ]
+    identity_balanced_boundary = (
+        float(np.mean(identity_boundaries))
+        if identity_boundaries
+        else float("inf")
+    )
     return {
         "weighted_iou": float(weighted_iou),
         "weighted_dice": float(weighted_dice),
@@ -323,6 +577,10 @@ def silhouette_metrics(
         "render_pixel_face_width_pct": float(render_pixel_face_width_pct),
         "predicted_area_ratio": float(pred.mean()),
         "target_area_ratio": float(truth.mean()),
+        "regional_balanced_boundary_mean_px": regional_balanced_boundary,
+        "identity_balanced_boundary_mean_px": identity_balanced_boundary,
+        "identity_region_names": list(IDENTITY_SILHOUETTE_REGIONS),
+        "regions": regions,
     }
 
 
@@ -337,6 +595,8 @@ def evaluate_geometry_candidate(
     max_overlap_drop: float = 0.005,
     max_interior_mean_worsen_pct: float = 0.15,
     max_interior_view_worsen_pct: float = 0.25,
+    min_relative_boundary_improve: float = 0.0,
+    min_front_relative_boundary_improve: float = 0.0,
 ) -> Dict[str, object]:
     """Apply independent geometry gates without constructing a mixed score."""
     before_by_view = {str(record["view"]): record for record in before_records}
@@ -364,11 +624,17 @@ def evaluate_geometry_candidate(
             float(after_silhouette.get("render_pixel_face_width_pct", 0.0)),
         )
         boundary_improve = before_boundary - after_boundary
+        relative_boundary_improve = boundary_improve / max(before_boundary, 1e-6)
+        relative_measurement_tolerance = measurement_tolerance / max(
+            before_boundary, 1e-6
+        )
         per_view.append({
             "view": view,
             "before_boundary_pct": before_boundary,
             "after_boundary_pct": after_boundary,
             "boundary_improve_pct_points": boundary_improve,
+            "relative_boundary_improve": relative_boundary_improve,
+            "relative_measurement_tolerance": relative_measurement_tolerance,
             "measurement_tolerance_pct_points": measurement_tolerance,
             "measurably_improved": boundary_improve > measurement_tolerance,
             "preserved_within_resolution": boundary_improve >= -measurement_tolerance,
@@ -384,6 +650,12 @@ def evaluate_geometry_candidate(
     if per_view:
         boundary_improve = float(np.mean([
             item["boundary_improve_pct_points"] for item in per_view
+        ]))
+        relative_boundary_improve = float(np.mean([
+            item["relative_boundary_improve"] for item in per_view
+        ]))
+        relative_measurement_tolerance = float(np.mean([
+            item["relative_measurement_tolerance"] for item in per_view
         ]))
         improved_views = int(sum(
             item["measurably_improved"] for item in per_view
@@ -417,6 +689,8 @@ def evaluate_geometry_candidate(
         ))
     else:
         boundary_improve = float("-inf")
+        relative_boundary_improve = float("-inf")
+        relative_measurement_tolerance = 0.0
         improved_views = 0
         preserved_views = 0
         max_view_worsen = float("inf")
@@ -426,12 +700,35 @@ def evaluate_geometry_candidate(
         interior_max_view_worsen = float("inf")
 
     mesh_passed = bool((mesh_quality_gate or {"passed": True}).get("passed", False))
+    front_relative_boundary_improve = next(
+        (
+            float(item["relative_boundary_improve"])
+            for item in per_view
+            if item["view"] == "front"
+        ),
+        float("-inf"),
+    )
+    front_relative_measurement_tolerance = next(
+        (
+            float(item["relative_measurement_tolerance"])
+            for item in per_view
+            if item["view"] == "front"
+        ),
+        0.0,
+    )
     gates = {
         "enough_valid_views": valid_views >= 2,
         "trusted_boundary_improved": boundary_improve >= float(min_boundary_improve_pct),
+        "relative_boundary_improved": (
+            relative_boundary_improve >= float(min_relative_boundary_improve)
+        ),
+        "front_relative_boundary_improved": (
+            front_relative_boundary_improve
+            >= float(min_front_relative_boundary_improve)
+        ),
         "view_consistency": (
-            improved_views >= 1
-            and preserved_views >= int(min_improved_views)
+            improved_views >= int(min_improved_views)
+            and preserved_views == valid_views
             and max_view_excess_worsen <= 1e-9
         ),
         "trusted_overlap_preserved": overlap_drop <= float(max_overlap_drop),
@@ -452,6 +749,12 @@ def evaluate_geometry_candidate(
         "metrics": {
             "valid_views": valid_views,
             "trusted_boundary_improve_pct_points": boundary_improve,
+            "relative_boundary_improve": relative_boundary_improve,
+            "relative_measurement_tolerance": relative_measurement_tolerance,
+            "front_relative_boundary_improve": front_relative_boundary_improve,
+            "front_relative_measurement_tolerance": (
+                front_relative_measurement_tolerance
+            ),
             "improved_views": improved_views,
             "preserved_views": preserved_views,
             "max_view_worsen_pct_points": max_view_worsen,
@@ -462,11 +765,15 @@ def evaluate_geometry_candidate(
         },
         "thresholds": {
             "min_boundary_improve_pct": float(min_boundary_improve_pct),
+            "min_relative_boundary_improve": float(min_relative_boundary_improve),
+            "min_front_relative_boundary_improve": float(
+                min_front_relative_boundary_improve
+            ),
             "min_improved_views": int(min_improved_views),
             "max_view_worsen_pct": float(max_view_worsen_pct),
             "view_consistency_rule": (
-                "one measurable improvement and min_improved_views preserved "
-                "within max(configured tolerance, one render pixel)"
+                "min_improved_views measurably improved and every valid view "
+                "preserved within max(configured tolerance, one render pixel)"
             ),
             "max_overlap_drop": float(max_overlap_drop),
             "max_interior_mean_worsen_pct": float(max_interior_mean_worsen_pct),
