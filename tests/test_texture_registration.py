@@ -3,7 +3,9 @@ import unittest
 import numpy as np
 
 from src.appearance.texture_registration import (
+    LocalFeatureSpec,
     build_layered_feature_warp,
+    build_multi_feature_warp,
     build_sampling_warp,
     displacement_field_metrics,
 )
@@ -139,6 +141,72 @@ class TextureRegistrationTests(unittest.TestCase):
         if warp.diagnostics["local_scale_applied"] > 0.0:
             moved = np.linalg.norm(warp.apply(local_model, (100, 100)) - local_model, axis=1)
             self.assertGreater(float(moved.max()), 0.1)
+
+    def test_multi_feature_warp_aligns_eyes_independently(self):
+        global_model = np.array(
+            [[20, 20], [80, 20], [20, 80], [80, 80], [50, 25], [50, 75]],
+            dtype=np.float32,
+        )
+        right_eye = np.array(
+            [[20, 38], [24, 36], [29, 36], [34, 38], [29, 39], [24, 39]],
+            dtype=np.float32,
+        )
+        left_eye = np.array(
+            [[66, 38], [71, 36], [76, 36], [80, 38], [76, 39], [71, 39]],
+            dtype=np.float32,
+        )
+        right_observed = right_eye + np.array([0.0, 5.0], dtype=np.float32)
+        right_observed[[0, 3], 0] += np.array([-2.0, 2.0], dtype=np.float32)
+        left_observed = left_eye + np.array([0.0, 3.0], dtype=np.float32)
+
+        warp = build_multi_feature_warp(
+            global_model,
+            global_model,
+            (
+                LocalFeatureSpec(
+                    "subject_right_eye",
+                    right_eye,
+                    right_observed,
+                    radius_x_scale=1.2,
+                    radius_y_scale=2.2,
+                ),
+                LocalFeatureSpec(
+                    "subject_left_eye",
+                    left_eye,
+                    left_observed,
+                    radius_x_scale=1.2,
+                    radius_y_scale=2.2,
+                ),
+            ),
+            (100, 100),
+            local_max_displacement_px=10.0,
+            min_jacobian=0.35,
+        )
+
+        right_after = warp.apply(right_eye, (100, 100))
+        left_after = warp.apply(left_eye, (100, 100))
+        self.assertLess(
+            np.linalg.norm(right_after - right_observed, axis=1).mean(),
+            1.0,
+        )
+        self.assertLess(
+            np.linalg.norm(left_after - left_observed, axis=1).mean(),
+            1.0,
+        )
+        outside = warp.apply(
+            np.array([[5, 5], [95, 95], [50, 90]], dtype=np.float32),
+            (100, 100),
+        )
+        np.testing.assert_allclose(
+            outside,
+            np.array([[5, 5], [95, 95], [50, 90]], dtype=np.float32),
+            atol=0.4,
+        )
+        self.assertGreaterEqual(warp.min_jacobian, 0.35)
+        self.assertEqual(
+            set(warp.diagnostics["features"]),
+            {"subject_right_eye", "subject_left_eye"},
+        )
 
 
 if __name__ == "__main__":

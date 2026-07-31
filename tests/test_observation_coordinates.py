@@ -8,12 +8,42 @@ from src.cross_view_geometry import Camera
 from src.geometry.observation_coordinates import (
     ObservationCoordinates,
     canvas_points_to_original,
+    intrinsics_to_letterbox_canvas,
     normalize_image_to_work,
     normalize_mask_to_work,
     original_points_to_canvas,
     original_points_to_work,
     work_points_to_original,
 )
+
+
+def test_intrinsics_map_from_rectangular_work_frame_to_square_letterbox():
+    source_size = (640, 480)
+    canvas_shape = (1024, 1024)
+    intrinsics = np.array(
+        [
+            [445.0, 0.0, 303.0],
+            [0.0, 444.0, 211.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    mapped = intrinsics_to_letterbox_canvas(
+        intrinsics,
+        source_size,
+        canvas_shape,
+    )
+
+    assert mapped == pytest.approx(
+        np.array(
+            [
+                [712.0, 0.0, 484.8],
+                [0.0, 710.4, 465.6],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+    )
 
 
 def _camera(

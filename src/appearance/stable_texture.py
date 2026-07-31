@@ -200,6 +200,9 @@ def run_stable_texture_pipeline(
     baseline_quality: Optional[Dict[str, Any]] = None,
     progress: Optional[ProgressFn] = None,
     sampling_mode: Optional[str] = None,
+    enable_local_eye_registration: bool = False,
+    enable_ordered_nasal_registration: bool = False,
+    model_reference_images: Optional[Dict[str, np.ndarray]] = None,
 ) -> Dict[str, Any]:
     output_texture_dir.mkdir(parents=True, exist_ok=True)
     output_mesh_dir.mkdir(parents=True, exist_ok=True)
@@ -236,6 +239,11 @@ def run_stable_texture_pipeline(
             hires_images=hires_images,
             cfg=cfg,
             debug_dir=output_texture_dir.parent / "debug" / "stable_texture_registration",
+            enable_local_eye_registration=bool(enable_local_eye_registration),
+            enable_ordered_nasal_registration=bool(
+                enable_ordered_nasal_registration
+            ),
+            model_reference_images=model_reference_images,
         )
         texture_hires = registration["hires_images"]
         sampling_warps = registration["sampling_warps"]
@@ -315,6 +323,7 @@ def run_stable_texture_pipeline(
     summary = {
         "mode": "no_delete",
         "sampling_mode": sampling_mode,
+        "local_eye_registration": bool(enable_local_eye_registration),
         "delete_invisible_faces": False,
         "glb_path": str(glb_path),
         "stable_glb_path": str(stable_glb),

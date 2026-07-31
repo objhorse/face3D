@@ -141,6 +141,30 @@ def letterbox_parameters(
     )
 
 
+def intrinsics_to_letterbox_canvas(
+    intrinsics: Any,
+    source_size: tuple[int, int],
+    canvas_shape: tuple[int, int],
+) -> np.ndarray:
+    """Map camera intrinsics from source pixels into a letterbox canvas."""
+    matrix = np.asarray(intrinsics, dtype=np.float64).reshape(3, 3)
+    if not np.isfinite(matrix).all():
+        raise ValueError("camera intrinsics must be finite")
+    scale, x_offset, y_offset, _width, _height = letterbox_parameters(
+        source_size,
+        canvas_shape,
+    )
+    transform = np.array(
+        [
+            [scale, 0.0, float(x_offset)],
+            [0.0, scale, float(y_offset)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return transform @ matrix
+
+
 def canvas_points_to_original(
     points: Any,
     image_size: tuple[int, int],

@@ -87,9 +87,13 @@ Limitations:
 
 ## Observation Layer
 
-### Actual mesh boundary
+### Actual mesh eyelid curves
 
-The optimizer must not treat FLAME 68 eye landmarks as the geometric eye opening. It must extract the ordered upper and lower eyelid boundary chains from the fixed mesh topology and project those vertices directly.
+The face mesh has no topological eye-hole boundary. The optimizer must therefore
+represent the visible eye closure using ordered upper and lower semantic surface
+curves embedded in the fixed mesh topology. The curves are initialized by the
+FLAME eye landmarks, densified over the eyelid surface, and projected directly
+from the current candidate mesh.
 
 FLAME and MediaPipe landmarks remain useful for:
 
@@ -133,7 +137,14 @@ The same 3D controls are projected into all three fixed calibrated cameras. Came
 
 ## Geometry Objective
 
-The primary objective uses image-space quantities that retain absolute position:
+For each view, a single stable face frame is estimated from projected and
+observed mid-face anchors outside the eyes. The transform is frozen before eye
+optimization. All eye residuals are then evaluated in that shared frame. This
+retains absolute eye position relative to the face while remaining insensitive
+to a translation of the whole image.
+
+The primary objective uses image-space quantities that retain absolute
+eye-to-face position:
 
 - symmetric distance between the projected mesh boundary and observed eye curve;
 - corner position residual;
@@ -225,7 +236,7 @@ The viewer must allow unrestricted orbit and zoom and must not change framing wh
 ## Acceptance Criteria
 
 - No visible second eyelash or closed-eye line above or below the geometric slit.
-- The projected actual mesh eyelid boundary overlaps the observed eye line in absolute image coordinates.
+- The projected semantic mesh eyelid curves overlap the observed eye line in the shared face image frame.
 - Front-view eye center, roll, and width improve rather than only normalized local curve shape.
 - Pure geometry remains natural from front and side views.
 - Nose, mouth, face contour, ears, and accepted A2 texture outside the eye registration support do not regress.
