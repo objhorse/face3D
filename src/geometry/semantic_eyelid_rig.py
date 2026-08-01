@@ -21,6 +21,7 @@ class SemanticEyelidRig:
     control_names: tuple[str, ...]
     weights: np.ndarray
     active_vertices: np.ndarray
+    protected_vertices: np.ndarray
     core_vertices: np.ndarray
     transition_vertices: np.ndarray
     control_seeds: Mapping[str, np.ndarray]
@@ -34,6 +35,7 @@ class SemanticEyelidRig:
         return {
             "control_names": list(self.control_names),
             "active_vertices": self.active_vertices.astype(int).tolist(),
+            "protected_vertices": self.protected_vertices.astype(int).tolist(),
             "core_vertices": self.core_vertices.astype(int).tolist(),
             "transition_vertices": self.transition_vertices.astype(int).tolist(),
             "control_seeds": {
@@ -129,6 +131,7 @@ def build_semantic_eyelid_rig(
     sigma_rings: float = 3.0,
     smoothing_iterations: int = 40,
     smoothing_retention: float = 0.03,
+    freeze_corner_seeds: bool = False,
 ) -> SemanticEyelidRig:
     vertices_f = np.asarray(vertices, dtype=np.float32)
     faces_i = np.asarray(faces, dtype=np.int64)
@@ -160,6 +163,19 @@ def build_semantic_eyelid_rig(
         iterations=int(smoothing_iterations),
         retention=float(smoothing_retention),
     )
+    corner_names = tuple(
+        name for name in names if name.endswith("_corner")
+    )
+    protected = (
+        np.unique(
+            np.concatenate([control_seeds[name] for name in corner_names])
+        ).astype(np.int64)
+        if corner_names
+        else np.empty(0, dtype=np.int64)
+    )
+    if freeze_corner_seeds and len(protected):
+        weights[protected] = 0.0
+        active = np.flatnonzero(np.any(weights > 0.0, axis=1)).astype(np.int64)
     adjacency = _mesh_adjacency(faces_i, len(vertices_f))
     all_seeds = np.unique(np.concatenate(list(control_seeds.values())))
     distances = _graph_distances(adjacency, all_seeds, int(support_rings))
@@ -179,6 +195,7 @@ def build_semantic_eyelid_rig(
         control_names=tuple(names),
         weights=weights.astype(np.float32),
         active_vertices=active.astype(np.int64),
+        protected_vertices=protected,
         core_vertices=core,
         transition_vertices=transition,
         control_seeds={key: value.astype(np.int64) for key, value in control_seeds.items()},

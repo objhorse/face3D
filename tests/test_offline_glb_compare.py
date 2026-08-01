@@ -27,5 +27,6 @@ def test_offline_compare_viewer_uses_relative_local_assets(tmp_path: Path):
     assert "meshes/baseline.glb" in html
     assert "meshes/strict.glb" in html
     assert "../frontend/vendor/three.module.js" in html
+    assert 'data-view="underside"' in html
     assert "https://" not in html
     assert "__LEFT_MODEL__" not in html

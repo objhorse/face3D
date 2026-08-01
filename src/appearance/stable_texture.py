@@ -203,6 +203,7 @@ def run_stable_texture_pipeline(
     enable_local_eye_registration: bool = False,
     enable_ordered_nasal_registration: bool = False,
     model_reference_images: Optional[Dict[str, np.ndarray]] = None,
+    external_nasal_controls_by_view: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     output_texture_dir.mkdir(parents=True, exist_ok=True)
     output_mesh_dir.mkdir(parents=True, exist_ok=True)
@@ -244,6 +245,7 @@ def run_stable_texture_pipeline(
                 enable_ordered_nasal_registration
             ),
             model_reference_images=model_reference_images,
+            external_nasal_controls_by_view=external_nasal_controls_by_view,
         )
         texture_hires = registration["hires_images"]
         sampling_warps = registration["sampling_warps"]

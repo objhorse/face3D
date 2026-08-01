@@ -93,6 +93,7 @@ def write_offline_glb_compare_viewer(
       <button type="button" data-view="front" class="active">Front</button>
       <button type="button" data-view="left">Left</button>
       <button type="button" data-view="right">Right</button>
+      <button type="button" data-view="underside">Underside</button>
     </div>
     <div class="controls"><button type="button" id="reset">Reset</button></div>
   </header>
@@ -195,6 +196,7 @@ def write_offline_glb_compare_viewer(
         const targetY = portrait ? this.distance * 0.06 : 0;
         if (view === 'left') this.camera.position.set(-d, targetY, 0);
         else if (view === 'right') this.camera.position.set(d, targetY, 0);
+        else if (view === 'underside') this.camera.position.set(0, -d * 0.78, d * 0.62);
         else this.camera.position.set(0, targetY + this.distance * 0.03, d);
         this.camera.lookAt(0, targetY, 0);
         this.controls.target.set(0, targetY, 0);

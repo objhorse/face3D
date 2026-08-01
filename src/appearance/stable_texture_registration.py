@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 import cv2
 import numpy as np
@@ -22,6 +22,23 @@ from src.appearance.texture_registration import (
     build_multi_feature_warp,
     draw_registration_overlay,
 )
+
+
+def _roma_nasal_displacement_limit(
+    external_controls: Any | None,
+    *,
+    default_px: float = 28.0,
+    margin_px: float = 4.0,
+    maximum_px: float = 72.0,
+) -> float:
+    """Allow trusted cross-view disparity without removing fold protection."""
+    if external_controls is None:
+        return float(default_px)
+    metadata = dict(getattr(external_controls, "metadata", {}) or {})
+    observed = float(metadata.get("maximum_selected_displacement_px", default_px))
+    if not np.isfinite(observed):
+        observed = float(default_px)
+    return float(np.clip(max(default_px, observed + margin_px), default_px, maximum_px))
 
 
 def _project_vertices(vertices: np.ndarray, camera: dict) -> np.ndarray:
@@ -95,6 +112,7 @@ def prepare_stable_texture_registration(
     enable_local_eye_registration: bool = False,
     enable_ordered_nasal_registration: bool = False,
     model_reference_images: Dict[str, np.ndarray] | None = None,
+    external_nasal_controls_by_view: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Build per-subject warps, feature masks, and normalized source images."""
     from src.module2_geometry import FLAMEModel, _mediapipe_to_68, load_flame_landmark_mapping
@@ -166,6 +184,42 @@ def prepare_stable_texture_registration(
             view=view,
             image=data["image"] if view == "front" else None,
         )
+        external_controls = (
+            external_nasal_controls_by_view.get(view)
+            if external_nasal_controls_by_view is not None
+            else None
+        )
+        if external_controls is not None:
+            external_model = np.asarray(
+                external_controls.model_points,
+                dtype=np.float32,
+            )
+            external_observed = np.asarray(
+                external_controls.observed_points,
+                dtype=np.float32,
+            )
+            if (
+                external_model.shape == external_observed.shape
+                and external_model.ndim == 2
+                and external_model.shape[1] == 2
+                and len(external_model) >= 4
+            ):
+                diagnostics = dict(nasal.diagnostics)
+                diagnostics["roma_control_count"] = int(len(external_model))
+                diagnostics["roma_control_metadata"] = dict(
+                    external_controls.metadata
+                )
+                nasal = SemanticFeatureControls(
+                    model_points=np.vstack(
+                        (nasal.model_points, external_model)
+                    ).astype(np.float32),
+                    observed_points=np.vstack(
+                        (nasal.observed_points, external_observed)
+                    ).astype(np.float32),
+                    groups=tuple(nasal.groups) + tuple(external_controls.groups),
+                    confidence=max(float(nasal.confidence), 0.9),
+                    diagnostics=diagnostics,
+                )
         if (
             enable_ordered_nasal_registration
             and model_reference_images is not None
@@ -180,11 +234,20 @@ def prepare_stable_texture_registration(
                 nasal,
                 model_nostril,
             )
-        if enable_local_eye_registration:
-            global_indices = np.arange(48, 68, dtype=np.int64)
+        use_multi_feature_warp = bool(
+            enable_local_eye_registration
+            or enable_ordered_nasal_registration
+            or external_controls is not None
+        )
+        if use_multi_feature_warp:
+            global_indices = (
+                np.arange(48, 68, dtype=np.int64)
+                if enable_local_eye_registration
+                else stable_indices
+            )
             model_controls = projected_68[global_indices]
             observed_controls = observed_68[global_indices]
-            local_features = (
+            local_features = [
                 LocalFeatureSpec(
                     "nose",
                     nasal.model_points,
@@ -205,28 +268,35 @@ def prepare_stable_texture_registration(
                     ),
                     groups=nasal.groups,
                     max_displacement_px=(
-                        28.0 if enable_ordered_nasal_registration else None
+                        _roma_nasal_displacement_limit(external_controls)
+                        if enable_ordered_nasal_registration
+                        else None
                     ),
                 ),
-                LocalFeatureSpec(
-                    "subject_right_eye",
-                    projected_68[36:42],
-                    observed_68[36:42],
-                    radius_x_scale=1.25,
-                    radius_y_scale=2.4,
-                ),
-                LocalFeatureSpec(
-                    "subject_left_eye",
-                    projected_68[42:48],
-                    observed_68[42:48],
-                    radius_x_scale=1.25,
-                    radius_y_scale=2.4,
-                ),
-            )
+            ]
+            if enable_local_eye_registration:
+                local_features.extend(
+                    (
+                        LocalFeatureSpec(
+                            "subject_right_eye",
+                            projected_68[36:42],
+                            observed_68[36:42],
+                            radius_x_scale=1.25,
+                            radius_y_scale=2.4,
+                        ),
+                        LocalFeatureSpec(
+                            "subject_left_eye",
+                            projected_68[42:48],
+                            observed_68[42:48],
+                            radius_x_scale=1.25,
+                            radius_y_scale=2.4,
+                        ),
+                    )
+                )
             warp = build_multi_feature_warp(
                 model_controls,
                 observed_controls,
-                local_features,
+                tuple(local_features),
                 data["image"].shape[:2],
                 smoothing=0.35,
                 max_translation_px=8.0,
@@ -238,20 +308,13 @@ def prepare_stable_texture_registration(
                     enable_ordered_nasal_registration
                 ),
             )
-            overlay_model = np.vstack(
-                (
-                    model_controls,
-                    nasal.model_points,
-                    projected_68[36:48],
-                )
-            )
-            overlay_observed = np.vstack(
-                (
-                    observed_controls,
-                    nasal.observed_points,
-                    observed_68[36:48],
-                )
-            )
+            overlay_model_parts = [model_controls, nasal.model_points]
+            overlay_observed_parts = [observed_controls, nasal.observed_points]
+            if enable_local_eye_registration:
+                overlay_model_parts.append(projected_68[36:48])
+                overlay_observed_parts.append(observed_68[36:48])
+            overlay_model = np.vstack(overlay_model_parts)
+            overlay_observed = np.vstack(overlay_observed_parts)
         else:
             model_controls = projected_68[stable_indices]
             observed_controls = observed_68[stable_indices]
@@ -331,6 +394,10 @@ def prepare_stable_texture_registration(
         "ordered_nasal_registration": bool(
             enable_ordered_nasal_registration
         ),
+        "external_nasal_controls": {
+            view: int(len(controls.model_points))
+            for view, controls in (external_nasal_controls_by_view or {}).items()
+        },
         "geometry_changed": False,
     }
     (debug_dir / "registration_inputs.json").write_text(
